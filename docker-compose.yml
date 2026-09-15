@@ -2,6 +2,8 @@ services:
   deepseek4free:
     build: .
     image: blastbeng/deepseek4free:latest
+    # Always build locally; never pull the image from a registry
+    pull_policy: build
     container_name: deepseek4free
     # Lifecycle managed by systemd (docker-compose@.service)
     restart: no
