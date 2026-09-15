@@ -130,7 +130,7 @@ class DeepSeekAPI:
         except Exception as e:
             print(f"\033[93mWarning: Failed to refresh cookies: {e}\033[0m", file=sys.stderr)
 
-    def _make_request(self, method: str, endpoint: str, json_data: Dict[str, Any], pow_required: bool = False) -> Any:
+    def _make_request(self, method: str, endpoint: str, json_data: Dict[str, Any], pow_required: bool = False, no_proxy: bool = False) -> Any:
         url = f"{self.BASE_URL}{endpoint}"
 
         retry_count = 0
@@ -144,7 +144,7 @@ class DeepSeekAPI:
                     pow_response = self.pow_solver.solve_challenge(challenge)
                     headers = self._get_headers(pow_response)
 
-                proxy_kw = _proxies.proxies_kwargs(url=url)
+                proxy_kw = _proxies.proxies_kwargs(url=url, no_proxy=no_proxy)
                 response = requests.request(
                     method=method,
                     url=url,
@@ -175,9 +175,24 @@ class DeepSeekAPI:
                     raise APIError(f"API request failed: {response.text}", response.status_code)
 
                 try:
-                    return response.json()
+                    payload = response.json()
                 except ValueError:
                     raise APIError("Empty or non-JSON response from server", response.status_code)
+
+                # DeepSeek signals business errors inside a 200 body:
+                # {"code": <int != 0>, "msg": "...", "data": null}
+                # Surface the real upstream message as a typed error instead
+                # of letting callers mask it as a response-format problem.
+                if isinstance(payload, dict):
+                    biz_code = payload.get('code')
+                    biz_msg = payload.get('msg') or payload.get('message')
+                    if isinstance(biz_code, int) and biz_code != 0:
+                        detail = f"{biz_msg or 'unknown upstream error'} (code {biz_code})"
+                        if biz_code in (40001, 40003, 40100) or (
+                                biz_msg and 'authorization' in str(biz_msg).lower()):
+                            raise AuthenticationError(f"DeepSeek upstream: {detail}")
+                        raise APIError(f"DeepSeek upstream: {detail}", biz_code)
+                return payload
 
             except requests.exceptions.RequestException as e:
                 _proxies.mark_failure(proxy_kw.get('proxies', {}).get('https'))
@@ -187,24 +202,26 @@ class DeepSeekAPI:
 
         raise APIError("Failed to bypass Cloudflare protection after multiple attempts")
 
-    def _get_pow_challenge(self) -> Dict[str, Any]:
+    def _get_pow_challenge(self, no_proxy: bool = False) -> Dict[str, Any]:
         try:
             response = self._make_request(
                 'POST',
                 '/chat/create_pow_challenge',
-                {'target_path': '/api/v0/chat/completion'}
+                {'target_path': '/api/v0/chat/completion'},
+                no_proxy=no_proxy,
             )
             return response['data']['biz_data']['challenge']
         except (KeyError, TypeError):
             raise APIError("Invalid challenge response format from server")
 
-    def create_chat_session(self) -> str:
+    def create_chat_session(self, no_proxy: bool = False) -> str:
         """Creates a new chat session and returns the session ID"""
         try:
             response = self._make_request(
                 'POST',
                 '/chat_session/create',
-                {'character_id': None}
+                {'character_id': None},
+                no_proxy=no_proxy,
             )
             return response['data']['biz_data']['id']
         except (KeyError, TypeError):
@@ -215,7 +232,8 @@ class DeepSeekAPI:
                     prompt: str,
                     parent_message_id: Optional[str] = None,
                     thinking_enabled: bool = True,
-                    search_enabled: bool = False) -> Generator[Dict[str, Any], None, None]:
+                    search_enabled: bool = False,
+                    no_proxy: bool = False) -> Generator[Dict[str, Any], None, None]:
         """
         Send a message and get streaming response
 
@@ -252,11 +270,12 @@ class DeepSeekAPI:
         try:
             headers = self._get_headers(
                 pow_response=self.pow_solver.solve_challenge(
-                    self._get_pow_challenge()
+                    self._get_pow_challenge(no_proxy=no_proxy)
                 )
             )
 
-            proxy_kw = _proxies.proxies_kwargs(url=f"{self.BASE_URL}/chat/completion")
+            proxy_kw = _proxies.proxies_kwargs(
+                url=f"{self.BASE_URL}/chat/completion", no_proxy=no_proxy)
             response = requests.post(
                 f"{self.BASE_URL}/chat/completion",
                 headers=headers,

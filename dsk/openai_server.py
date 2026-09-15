@@ -6,7 +6,8 @@ Exposes standard OpenAI endpoints so any OpenAI client / agent tooling
 ChatGPT for free, plus a built-in llama.cpp-style playground UI:
 
     GET  /                     playground web UI (also /playground)
-    POST /v1/chat/completions  streaming + non-streaming
+    POST /v1/chat/completions  streaming + non-streaming (vision via image_url parts)
+    POST /v1/images/generations  image generation (capable models only)
     GET  /v1/models
     GET  /health
     GET  /selfheal/status      self-maintenance (selfheal + refresher) status
@@ -36,6 +37,7 @@ See dsk/providers/router.py for the full model-registry configuration.
 Run:  python -m dsk.openai_server
 """
 
+import base64
 import json
 import os
 import queue
@@ -58,6 +60,8 @@ from .providers.base import (
     ProviderError,
     ProviderRateLimitError,
     ProviderUnavailableError,
+    fetch_image_bytes,
+    parse_data_uri,
 )
 from .providers.router import Router
 
@@ -135,6 +139,10 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     # DeepSeek-specific extras (ignored by standard clients)
     search_enabled: Optional[bool] = None
+    # Per-request proxy control (non-standard extension): force a DIRECT
+    # connection for this request — skips Tor and the rotating free-proxy
+    # pool entirely. Useful for fast, low-latency testing.
+    disable_proxy: bool = False
     # OpenAI params accepted for compatibility. Unknown extra fields are
     # silently ignored by pydantic, so exotic clients never get 422s.
     tools: Optional[List[Dict[str, Any]]] = None
@@ -149,6 +157,22 @@ class ChatCompletionRequest(BaseModel):
     n: Optional[int] = None                           # ignored
 
 
+class ImageGenerationRequest(BaseModel):
+    model: str = DEFAULT_MODEL
+    prompt: str
+    # Accepted-for-compat params the web apps cannot honor per-image.
+    n: Optional[int] = 1      # web apps generate a single image per request
+    size: Optional[str] = None
+    quality: Optional[str] = None
+    style: Optional[str] = None
+    response_format: Optional[str] = 'url'  # 'url' | 'b64_json'
+    user: Optional[str] = None
+    # Per-request proxy control (non-standard extension): force a DIRECT
+    # connection for this request — skips Tor and the rotating free-proxy
+    # pool entirely. Useful for fast, low-latency testing.
+    disable_proxy: bool = False
+
+
 def _flatten_content(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -161,6 +185,60 @@ def _flatten_content(content: Any) -> str:
                 parts.append(part)
         return "\n".join(parts)
     return "" if content is None else str(content)
+
+
+def _extract_images(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
+    """Collect OpenAI ``image_url`` content parts from user messages.
+
+    Returns provider-agnostic attachments ``{'mime': str, 'data': bytes}``:
+    ``data:`` URIs are base64-decoded, remote URLs are downloaded. Non-image
+    or unknown-scheme parts are skipped silently so exotic clients never 422.
+    """
+    images: List[Dict[str, Any]] = []
+    for msg in messages:
+        if msg.role != "user" or not isinstance(msg.content, list):
+            continue
+        for part in msg.content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            image_url = part.get("image_url")
+            url = image_url.get("url") if isinstance(image_url, dict) else image_url
+            if not isinstance(url, str) or not url:
+                continue
+            if url.startswith("data:"):
+                mime, data = parse_data_uri(url)
+            elif url.startswith(("http://", "https://")):
+                mime, data = fetch_image_bytes(url)
+            else:
+                continue
+            if not mime.startswith("image/"):
+                mime = "image/png"
+            images.append({"mime": mime, "data": data})
+    return images
+
+
+def _has_image_parts(messages: List[ChatMessage]) -> bool:
+    """Cheap sync check: does any user message carry image_url parts?"""
+    for msg in messages:
+        if msg.role == "user" and isinstance(msg.content, list):
+            for part in msg.content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
+
+
+def _chain_capability(route, key: str) -> Optional[bool]:
+    """Whether any target in the route's fallback chain supports a capability.
+
+    Returns False only when every fallback is known and none has it; None when
+    a fallback target has not been discovered yet (the router decides at
+    serve time, it skips incapable targets)."""
+    fallbacks = [f for f in (route.fallbacks or []) if f != route.model_id]
+    if any(f not in ROUTER.routes for f in fallbacks):
+        return None
+    if getattr(route, key, False):
+        return True
+    return any(getattr(ROUTER.routes[f], key, False) for f in fallbacks)
 
 
 def _build_prompt(messages: List[ChatMessage]) -> str:
@@ -468,6 +546,27 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     search_override = True if body.search_enabled else None
 
     prompt = _build_prompt(body.messages)
+    # Image parts may require downloading remote URLs — keep that off the
+    # event loop (no-op scan when the request carries no image parts).
+    if _has_image_parts(body.messages):
+        images = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _extract_images(body.messages))
+    else:
+        images: List[Dict[str, Any]] = []
+    if images:
+        gate = _chain_capability(route, "vision")
+        if gate is False:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": (f"Model {route.model_id} does not support vision "
+                                    "input and none of its fallbacks do"),
+                        "type": "invalid_request_error",
+                        "code": "model_does_not_support_vision",
+                    }
+                },
+            )
     use_tools = bool(body.tools) and body.tool_choice != "none"
     if use_tools:
         # The protocol block is PREPENDED (not appended): if placed at the end
@@ -497,6 +596,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         auth_key=client_key,
         thinking_override=thinking_override,
         search_override=search_override,
+        images=images or None,
+        no_proxy=body.disable_proxy,
     )
 
     # ---- Streaming ----
@@ -520,6 +621,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         for chunk in chunk_gen:
             if chunk.get("type") == "thinking" and chunk.get("content"):
                 reasoning_parts.append(chunk["content"])
+            elif chunk.get("type") == "image" and chunk.get("content"):
+                content_parts.append(chunk["content"])
             elif chunk.get("type") == "text" and chunk.get("content"):
                 content_parts.append(chunk["content"])
     except ProviderError as e:
@@ -673,6 +776,19 @@ async def _stream_completion(
                 content = chunk.get("content", "") or ""
                 if not content:
                     continue
+                if ctype == "image":
+                    # Generated image (markdown): emitted immediately — URLs
+                    # never contain the tool-call marker, so no holdback.
+                    q.put(_sse({
+                        "id": cid, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": content},
+                            "finish_reason": None,
+                        }],
+                    }))
+                    continue
                 if ctype == "thinking":
                     q.put(_sse({
                         "id": cid, "object": "chat.completion.chunk",
@@ -765,6 +881,86 @@ async def _stream_completion(
                 })
     finally:
         yield "data: [DONE]\n\n"
+
+
+@app.post("/v1/images/generations")
+async def images_generations(body: ImageGenerationRequest, request: Request):
+    """OpenAI image generation: POST /v1/images/generations.
+
+    Routed to an image-gen capable model (per /v1/models ``image_gen`` flag);
+    the resolved route's fallback chain is filtered to capable targets. The
+    provider streams ``image`` chunks; URLs are returned directly or base64-
+    encoded for ``response_format: 'b64_json'``.
+    """
+    client_key = _check_api_key(request)
+    if not (body.prompt or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": "prompt must not be empty",
+                    "type": "invalid_request_error",
+                    "code": "empty_prompt",
+                }
+            },
+        )
+    route = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: ROUTER.resolve(body.model, auth_key=client_key))
+    gate = _chain_capability(route, "image_gen")
+    if gate is False:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": (f"Model {route.model_id} does not support image "
+                                "generation and none of its fallbacks do"),
+                    "type": "invalid_request_error",
+                    "code": "model_does_not_support_image_generation",
+                }
+            },
+        )
+
+    created = int(time.time())
+
+    def _generate():
+        """Collect image URLs from the blocking provider stream (worker thread)."""
+        found: List[str] = []
+        try:
+            for chunk in ROUTER.stream(route, body.prompt, auth_key=client_key,
+                                       image_generation=True,
+                                       no_proxy=body.disable_proxy):
+                if chunk.get("type") == "image" and chunk.get("url"):
+                    found.append(chunk["url"])
+        except ProviderError as e:
+            return e, found
+        return None, found
+
+    error, urls = await asyncio.get_running_loop().run_in_executor(None, _generate)
+    if error is not None:
+        err_type, code, status = _error_status(error)
+        return _error_response(str(error), err_type, code, status)
+    if not urls:
+        return _error_response("the model did not return any image",
+                               "api_error", "no_image_returned", 502)
+
+    response_format = (body.response_format or "url").lower()
+
+    def _encode() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for url in urls:
+            if response_format == "b64_json":
+                _mime, raw = fetch_image_bytes(url)
+                out.append({"b64_json": base64.b64encode(raw).decode()})
+            else:
+                out.append({"url": url})
+        return out
+
+    try:
+        data = await asyncio.get_running_loop().run_in_executor(None, _encode)
+    except ProviderError as e:
+        err_type, code, status = _error_status(e)
+        return _error_response(str(e), err_type, code, status)
+    return {"created": created, "data": data}
 
 
 def main():

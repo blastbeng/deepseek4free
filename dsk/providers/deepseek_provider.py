@@ -92,15 +92,22 @@ class DeepSeekProvider(Provider):
     def stream(self, prompt: str, *, model: str, thinking_enabled: bool = False,
                search_enabled: bool = False, temperature: Optional[float] = None,
                max_tokens: Optional[int] = None,
+               images: Optional[List[Dict[str, Any]]] = None,
+               image_generation: bool = False,
+               no_proxy: bool = False,
                auth_key: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
         # Temperature/max_tokens are not supported by the DeepSeek web API.
+        # images/image_generation are accepted for signature parity but the
+        # DeepSeek web chat is text-only; the router only routes vision/image
+        # workloads to capable providers, so they are ignored here.
         try:
             api = self._get_api(auth_key)
-            session_id = api.create_chat_session()
+            session_id = api.create_chat_session(no_proxy=no_proxy)
             return api.chat_completion(
                 session_id, prompt,
                 thinking_enabled=thinking_enabled,
                 search_enabled=search_enabled,
+                no_proxy=no_proxy,
             )
         except AuthenticationError as e:
             raise ProviderAuthError(str(e))

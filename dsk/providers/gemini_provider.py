@@ -21,6 +21,12 @@ How it works
    full candidate so far; we diff it into deltas. Thinking traces
    (candidate[37]) are emitted as ``thinking`` chunks. Chats run as temporary
    chats so user history is not polluted.
+5. Vision: image attachments are uploaded via the single multipart POST to
+   ``https://content-push.googleapis.com/upload`` (``X-Tenant-Id: bard-storage``
+   header, ``Push-ID`` header) which returns a ``/contrib_service/...`` file
+   path; the path is injected at index 3 of the message content array as
+   ``[[path], filename]``. Generated images are read from the candidate's
+   rich-content block (candidate[12], field 7).
 """
 
 import json
@@ -40,6 +46,7 @@ from .base import (
     ProviderUnavailableError,
     classify_http_error,
     http_post_stream,
+    http_upload_multipart,
 )
 
 try:
@@ -54,6 +61,9 @@ APP_URL = f'{BASE_URL}/app'
 GENERATE_URL = (f'{BASE_URL}/_/BardChatUi/data/assistant.lamda.'
                 'BardFrontendService/StreamGenerate')
 BATCH_EXECUTE_URL = f'{BASE_URL}/_/BardChatUi/data/batchexecute'
+UPLOAD_URL = 'https://content-push.googleapis.com/upload'
+# Stable per-account push id; the web app sends it with every file upload.
+DEFAULT_PUSH_ID = os.getenv('DSF_GEMINI_PUSH_ID', 'feeds/mcudyrk2a4khkz')
 
 GET_USER_STATUS_RPC = 'otAQ7b'
 
@@ -321,6 +331,8 @@ class GeminiWebProvider(Provider):
                 'upstream_model': internal_id,
                 'thinking_enabled': thinking,
                 'search_enabled': False,
+                'vision': True,
+                'image_gen': True,
                 'context_length': GEMINI_CONTEXT_LENGTH,
                 'max_output_tokens': GEMINI_MAX_OUTPUT,
                 'extra': {
@@ -332,9 +344,39 @@ class GeminiWebProvider(Provider):
         return out
 
     # ---------------------------------------------------------------- serving
+    def _upload_image(self, session: Dict[str, Any], mime: str, data: bytes,
+                      index: int, no_proxy: bool = False) -> str:
+        """Upload one image to Google's push endpoint; return the file path.
+
+        The endpoint is a single multipart POST (no resumable dance) that
+        answers with the stored file path, e.g. ``/contrib_service/ttl_1d/...``.
+        """
+        ext = _image_ext(mime)
+        filename = f'image_{index}.{ext}'
+        headers = {k: v for k, v in _BASE_HEADERS.items() if k != 'Content-Type'}
+        headers['X-Tenant-Id'] = 'bard-storage'
+        headers['Push-ID'] = DEFAULT_PUSH_ID
+        try:
+            response = http_upload_multipart(
+                UPLOAD_URL, filename=filename, content_type=mime, data=data,
+                headers=headers, proxies=None, no_proxy=no_proxy)
+        except Exception as e:
+            raise ProviderUnavailableError(f'Gemini image upload failed: {e}') from e
+        if response.status_code != 200:
+            raise ProviderUnavailableError(
+                f'Gemini image upload failed (HTTP {response.status_code}): '
+                f'{str(getattr(response, "text", ""))[:200]}')
+        file_url = (response.text or '').strip()
+        if not file_url:
+            raise ProviderError('Gemini image upload returned an empty file path')
+        return file_url
+
     def stream(self, prompt: str, *, model: str, thinking_enabled: bool = False,
                search_enabled: bool = False, temperature: Optional[float] = None,
                max_tokens: Optional[int] = None,
+               images: Optional[List[Dict[str, Any]]] = None,
+               image_generation: bool = False,
+               no_proxy: bool = False,
                auth_key: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
         session = self._get_session()
         internal_id, model_number, capacity_tail = '', 1, '1'
@@ -347,6 +389,14 @@ class GeminiWebProvider(Provider):
                 break
 
         message_content = [prompt, 0, None, None, None, None, 0]
+        if images:
+            file_data = []
+            for i, image in enumerate(images):
+                file_url = self._upload_image(session, image.get('mime', 'image/png'),
+                                              image.get('data', b''), i,
+                                              no_proxy=no_proxy)
+                file_data.append([[file_url], f'image_{i}.{_image_ext(image.get("mime", "image/png"))}'])
+            message_content[3] = file_data
         # Default chat metadata: new conversation (temporary chat, not saved).
         inner: List[Any] = [None] * 81
         inner[0] = message_content
@@ -418,6 +468,7 @@ class GeminiWebProvider(Provider):
         """Diff Gemini's cumulative frames into unified text/thinking chunks."""
         prev_text = ''
         prev_thought = ''
+        seen_images: set = set()
         emitted = False
         try:
             for line in response.iter_lines():
@@ -447,6 +498,13 @@ class GeminiWebProvider(Provider):
                             emitted = True
                             yield {'content': t_delta, 'type': 'thinking',
                                    'finish_reason': None}
+                        for url in _extract_generated_images(candidate):
+                            if url in seen_images:
+                                continue
+                            seen_images.add(url)
+                            emitted = True
+                            yield {'content': f'![image]({url})', 'type': 'image',
+                                   'url': url, 'finish_reason': None}
         except ProviderError:
             raise
         except Exception as e:
@@ -466,6 +524,49 @@ def _nested(container: Any, path: List[int], default: Any = None) -> Any:
             return default
         current = current[index]
     return default if current in (None, [], {}) else current
+
+
+def _image_ext(mime: str) -> str:
+    """File extension for an image mime type."""
+    return {'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif',
+            'image/webp': 'webp'}.get(mime, (mime.split('/')[-1] or 'png')[:5])
+
+
+def _jspb_field(container: Any, field_number: int) -> Any:
+    """Read a JSPB field: positional slot, or sparse trailing dict keyed by
+    ``field_number + 1`` (high-numbered fields are collected that way).
+    A sparse wrapper dict found in the positional slot itself is unwrapped."""
+    key = str(field_number + 1)
+    if isinstance(container, list):
+        if field_number < len(container):
+            value = container[field_number]
+            if value is not None and not isinstance(value, dict):
+                return value
+            if isinstance(value, dict) and key in value:
+                return value[key]
+        for entry in container:
+            if isinstance(entry, dict) and key in entry:
+                return entry[key]
+    elif isinstance(container, dict):
+        return container.get(key)
+    return None
+
+
+def _extract_generated_images(candidate: Any) -> List[str]:
+    """URLs of images Gemini generated, from the candidate's rich-content
+    block (candidate[12], field 7): each entry exposes its URL at [0, 3, 3].
+    """
+    rich = _nested(candidate, [12])
+    if not rich:
+        return []
+    block = _jspb_field(rich, 7)  # Field.GENERATED_IMAGES
+    entries = _nested(block, [0], []) or []
+    urls: List[str] = []
+    for entry in entries if isinstance(entries, list) else []:
+        url = _nested(entry, [0, 3, 3])
+        if isinstance(url, str) and url.startswith('http'):
+            urls.append(url)
+    return urls
 
 
 def _diff(previous: str, current: str) -> str:

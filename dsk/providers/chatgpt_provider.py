@@ -40,6 +40,8 @@ from .base import (
     classify_http_error,
     http_get,
     http_post_stream,
+    http_put_raw,
+    image_dimensions,
     parse_sse_data,
 )
 
@@ -49,6 +51,7 @@ CHATGPT_BASE_URL = 'https://chatgpt.com'
 CHATGPT_SESSION_URL = f'{CHATGPT_BASE_URL}/api/auth/session'
 CHATGPT_MODELS_URL = f'{CHATGPT_BASE_URL}/backend-api/models'
 CHATGPT_CONVERSATION_URL = f'{CHATGPT_BASE_URL}/backend-api/conversation'
+CHATGPT_FILES_URL = f'{CHATGPT_BASE_URL}/backend-api/files'
 
 # Estimated capability metadata advertised on /v1/models for agent tooling
 # (upstream reports a per-model context size; this is the fallback).
@@ -145,7 +148,8 @@ class ChatGPTProvider(Provider):
                 out[name] = value
         return out
 
-    def _get_access_token(self, refresh: bool = False) -> str:
+    def _get_access_token(self, refresh: bool = False,
+                          no_proxy: bool = False) -> str:
         """Access token: env-provided, or fetched from /api/auth/session with
         the session cookies (cached for TOKEN_TTL)."""
         env_token = _env_token()
@@ -170,7 +174,7 @@ class ChatGPTProvider(Provider):
                 )
             response = http_get(CHATGPT_SESSION_URL,
                                 headers={'User-Agent': _USER_AGENT},
-                                cookies=cookies)
+                                cookies=cookies, no_proxy=no_proxy)
             if response.status_code != 200:
                 try:
                     error_text = response.text or ''
@@ -245,6 +249,8 @@ class ChatGPTProvider(Provider):
                 'upstream_model': slug,
                 'thinking_enabled': _is_thinking_model(entry),
                 'search_enabled': False,
+                'vision': True,
+                'image_gen': True,
                 'context_length': context_length,
                 'max_output_tokens': CHATGPT_MAX_OUTPUT,
                 'extra': {'title': entry.get('title'),
@@ -254,19 +260,121 @@ class ChatGPTProvider(Provider):
             raise ProviderError('ChatGPT /backend-api/models returned no models')
         return models
 
+    def _upload_image(self, token: str, mime: str, data: bytes,
+                      index: int, no_proxy: bool = False) -> Dict[str, Any]:
+        """Upload one image through the web app's 3-step file flow and return
+        an ``image_asset_pointer`` part for the conversation message:
+
+        1. POST /backend-api/files  -> {'file_id', 'upload_url'}
+        2. PUT upload_url (Azure blob) with the raw bytes (expect 201)
+        3. POST /backend-api/files/{id}/uploaded -> registration complete
+        """
+        ext = {'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif',
+               'image/webp': 'webp'}.get(mime, (mime.split('/')[-1] or 'png')[:5])
+        filename = f'image_{index}.{ext}'
+
+        def _json(response: Any, what: str) -> Dict[str, Any]:
+            if response.status_code not in (200, 201):
+                raise classify_http_error(response.status_code,
+                                          str(getattr(response, 'text', ''))[:300],
+                                          getattr(response, 'headers', None))
+            try:
+                body = response.json()
+            except ValueError:
+                raise ProviderError(f'ChatGPT file upload ({what}) returned a non-JSON body')
+            if not isinstance(body, dict):
+                raise ProviderError(f'ChatGPT file upload ({what}) payload is unexpected')
+            return body
+
+        step1 = _json(http_post_stream(
+            CHATGPT_FILES_URL, headers=self._headers(token),
+            json_body={'file_name': filename, 'file_size': len(data),
+                       'use_case': 'multimodal'}, no_proxy=no_proxy), 'create')
+        file_id = str(step1.get('file_id') or '')
+        upload_url = str(step1.get('upload_url') or '')
+        if not file_id or not upload_url:
+            raise ProviderError('ChatGPT file upload did not return file_id/upload_url')
+
+        step2 = http_put_raw(upload_url, data=data, headers={
+            'Content-Type': mime, 'x-ms-blob-type': 'BlockBlob'},
+            no_proxy=no_proxy)
+        if step2.status_code not in (200, 201):
+            raise ProviderUnavailableError(
+                f'ChatGPT blob upload failed (HTTP {step2.status_code})')
+
+        step3 = _json(http_post_stream(
+            f'{CHATGPT_FILES_URL}/{file_id}/uploaded', headers=self._headers(token),
+            json_body={'file_id': file_id}, no_proxy=no_proxy), 'finalize')
+        width, height = image_dimensions(data)
+        meta = step3.get('file_metadata') if isinstance(step3.get('file_metadata'), dict) else {}
+        try:
+            width = int(meta.get('width') or width)
+            height = int(meta.get('height') or height)
+        except (TypeError, ValueError):
+            pass
+        return {
+            'content_type': 'image_asset_pointer',
+            'asset_pointer': f'file-service://{file_id}',
+            'size_bytes': len(data),
+            'width': width,
+            'height': height,
+            'metadata': {'dalle': None, 'gizmo': None},
+        }
+
+    def _download_pointer(self, pointer: str,
+                          no_proxy: bool = False) -> Optional[str]:
+        """Resolve an ``file-service://`` / ``sediment://`` asset pointer to a
+        downloadable URL via /backend-api/files/{id}/download."""
+        file_id = pointer.split('://', 1)[-1]
+        if not file_id:
+            return None
+        try:
+            token = self._get_access_token(no_proxy=no_proxy)
+            response = http_get(
+                f'{CHATGPT_FILES_URL}/{file_id}/download', headers=self._headers(token),
+                no_proxy=no_proxy)
+        except Exception as e:
+            logger.warning('ChatGPT image download failed for %s: %s', file_id, e)
+            return None
+        if response.status_code != 200:
+            logger.warning('ChatGPT image download HTTP %s for %s',
+                           response.status_code, file_id)
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        url = body.get('download_url') if isinstance(body, dict) else None
+        return url if isinstance(url, str) and url.startswith('http') else None
+
     def stream(self, prompt: str, *, model: str, thinking_enabled: bool = False,
                search_enabled: bool = False, temperature: Optional[float] = None,
                max_tokens: Optional[int] = None,
+               images: Optional[List[Dict[str, Any]]] = None,
+               image_generation: bool = False,
+               no_proxy: bool = False,
                auth_key: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
         # Temperature/max_tokens are not honored by the web conversation API.
-        token = self._get_access_token()
+        token = self._get_access_token(no_proxy=no_proxy)
+
+        if images:
+            pointers = [self._upload_image(token, image.get('mime', 'image/png'),
+                                           image.get('data', b''), i,
+                                           no_proxy=no_proxy)
+                        for i, image in enumerate(images)]
+            content: Dict[str, Any] = {
+                'content_type': 'multimodal_text',
+                'parts': [{'content_type': 'text', 'text': prompt}, *pointers],
+            }
+        else:
+            content = {'content_type': 'text', 'parts': [prompt]}
 
         body: Dict[str, Any] = {
             'action': 'next',
             'messages': [{
                 'id': str(uuid.uuid4()),
                 'author': {'role': 'user'},
-                'content': {'content_type': 'text', 'parts': [prompt]},
+                'content': content,
                 'metadata': {},
             }],
             'model': model,
@@ -274,14 +382,16 @@ class ChatGPTProvider(Provider):
             'conversation_mode': {'kind': 'primary_assistant'},
             'timezone_offset_min': 0,
             'history_and_training_disabled': False,
-            'force_paragen': False,
+            'force_paragen': bool(image_generation),
+            'force_paragen_model_slug': 'dalle' if image_generation else None,
             'force_use_search_plugin': False,
             'system_hints': ['search'] if search_enabled else [],
             'supports_buffering': True,
         }
 
         response = http_post_stream(CHATGPT_CONVERSATION_URL,
-                                    headers=self._headers(token), json_body=body)
+                                    headers=self._headers(token), json_body=body,
+                                    no_proxy=no_proxy)
         if response.status_code != 200:
             try:
                 error_text = response.text or ''
@@ -289,15 +399,19 @@ class ChatGPTProvider(Provider):
                 error_text = f'HTTP {response.status_code}'
             raise classify_http_error(response.status_code, error_text,
                                       response.headers)
-        return self._iter_chunks(response)
+        return self._iter_chunks(response, no_proxy=no_proxy)
 
-    def _iter_chunks(self, response) -> Generator[Dict[str, Any], None, None]:
+    def _iter_chunks(self, response,
+                     no_proxy: bool = False) -> Generator[Dict[str, Any], None, None]:
         """Yield unified chunks from the ChatGPT conversation SSE stream.
 
         Each event carries the full assistant message so far; we emit deltas by
-        diffing against the previously seen text.
+        diffing against the previously seen text. Generated images arrive as
+        ``image_asset_pointer`` parts — each pointer is resolved to a
+        downloadable URL once and emitted as an ``image`` chunk.
         """
         prev = ''
+        seen_pointers: set = set()
         for line in response.iter_lines():
             data = parse_sse_data(line)
             if not data:
@@ -311,7 +425,7 @@ class ChatGPTProvider(Provider):
             if author not in ('assistant', 'tool'):
                 continue
             content = message.get('content') or {}
-            if content.get('content_type') not in (None, 'text'):
+            if content.get('content_type') not in (None, 'text', 'multimodal_text'):
                 # reasoning/thought payloads are not streamed by the web API
                 continue
             parts: List[Any] = content.get('parts') or []
@@ -324,6 +438,17 @@ class ChatGPTProvider(Provider):
             if delta:
                 prev += delta
                 yield {'content': delta, 'type': 'text', 'finish_reason': None}
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                pointer = str(part.get('asset_pointer') or '')
+                if not pointer or pointer in seen_pointers:
+                    continue
+                seen_pointers.add(pointer)
+                url = self._download_pointer(pointer, no_proxy=no_proxy)
+                if url:
+                    yield {'content': f'![image]({url})', 'type': 'image',
+                           'url': url, 'finish_reason': None}
             if message.get('status') == 'finished_successfully':
                 break
         yield {'content': '', 'type': 'text', 'finish_reason': 'stop'}

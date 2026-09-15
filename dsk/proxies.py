@@ -62,7 +62,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
-TOR_DEFAULT_URL = 'socks5h://torproxy:9050'
+TOR_DEFAULT_URL = 'socks5h://localhost:9050'
 
 # (default_scheme_or_None, url) — None means the scheme is embedded per line
 # or JSON payload. All URLs verified live (2026-09); sources may vanish, the
@@ -449,8 +449,15 @@ def mark_failure(proxy: Optional[str]) -> None:
 
 
 def proxies_kwargs(provider: Optional[str] = None,
-                   url: Optional[str] = None) -> Dict[str, Any]:
-    """Kwargs to splat into requests/curl_cffi calls for `provider`/`url`."""
+                   url: Optional[str] = None,
+                   no_proxy: bool = False) -> Dict[str, Any]:
+    """Kwargs to splat into requests/curl_cffi calls for `provider`/`url`.
+
+    ``no_proxy=True`` forces a DIRECT connection ({}), skipping the pool and
+    Tor entirely — used by the per-request ``disable_proxy`` endpoint param.
+    """
+    if no_proxy:
+        return {}
     # defensive: a URL accidentally passed positionally as provider
     if provider and '://' in provider:
         url = url or provider

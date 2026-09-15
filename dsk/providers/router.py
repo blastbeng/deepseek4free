@@ -159,6 +159,8 @@ class Router:
                 upstream_model=str(entry.get('upstream_model') or model_id),
                 thinking_enabled=bool(entry.get('thinking_enabled')),
                 search_enabled=bool(entry.get('search_enabled')),
+                vision=bool(entry.get('vision')),
+                image_gen=bool(entry.get('image_gen')),
                 context_length=int(entry.get('context_length') or 131072),
                 max_output_tokens=int(entry.get('max_output_tokens') or 32768),
                 extra=dict(entry.get('extra') or {}),
@@ -270,6 +272,8 @@ class Router:
                 'max_tokens': r.max_output_tokens,
                 'thinking_enabled': r.thinking_enabled,
                 'search_enabled': r.search_enabled,
+                'vision': r.vision,
+                'image_gen': r.image_gen,
                 'fallbacks': list(r.fallbacks),
             }
             for r in self.routes.values()
@@ -279,7 +283,10 @@ class Router:
     def stream(self, route: Route, prompt: str, *, temperature: Optional[float] = None,
                max_tokens: Optional[int] = None, auth_key: Optional[str] = None,
                thinking_override: Optional[bool] = None,
-               search_override: Optional[bool] = None
+               search_override: Optional[bool] = None,
+               images: Optional[List[Dict[str, Any]]] = None,
+               image_generation: bool = False,
+               no_proxy: bool = False,
                ) -> Generator[Dict[str, Any], None, None]:
         """Yield unified chunks, retrying rate limits/network errors and
         falling back through the route's chain when a provider keeps failing.
@@ -287,12 +294,26 @@ class Router:
         Fallbacks happen on request-level failures. Errors raised mid-stream
         (after content was already emitted) are surfaced as-is to avoid
         duplicating partial output.
+
+        ``images``/``image_generation`` restrict the fallback chain to
+        vision/image-gen capable targets and are forwarded to the provider.
         """
         thinking = route.thinking_enabled if thinking_override is None else thinking_override
         search = route.search_enabled if search_override is None else search_override
 
         chain = [route.model_id] + [f for f in route.fallbacks if f != route.model_id]
         last_error: Optional[ProviderError] = None
+
+        if images or image_generation:
+            # Vision/image-gen requests may only be served by capable targets.
+            capability = 'image_gen' if image_generation else 'vision'
+            capable = [mid for mid in chain
+                       if (target := self.routes.get(mid)) and getattr(target, capability)]
+            if not capable:
+                what = 'image generation' if image_generation else 'vision'
+                raise ProviderError(
+                    f'No model in the fallback chain of {route.model_id} supports {what}')
+            chain = capable
 
         for position, model_id in enumerate(chain):
             target = self.routes.get(model_id)
@@ -310,6 +331,8 @@ class Router:
                         prompt, model=target.upstream_model,
                         thinking_enabled=thinking, search_enabled=search,
                         temperature=temperature, max_tokens=max_tokens,
+                        images=images, image_generation=image_generation,
+                        no_proxy=no_proxy,
                         auth_key=auth_key,
                     )
                     for chunk in gen:
