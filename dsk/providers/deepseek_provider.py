@@ -25,11 +25,26 @@ from .base import (
 )
 
 
+def _bot_token_file() -> Path:
+    """Bot-managed token written by dsk.refresher (login/signup renewal)."""
+    base = os.getenv('COOKIES_DIR') or os.getenv('DSF_SELFHEAL_DIR')
+    directory = Path(base) if base else Path(__file__).resolve().parent.parent
+    return directory / 'deepseek_token'
+
+
 def _resolve_token(provided_key: Optional[str] = None) -> Optional[str]:
     """DeepSeek auth token resolution order:
-    1. DEEPSEEK_AUTH_TOKEN env var
-    2. key sent by the client (Authorization Bearer)
+    1. bot-managed token file (<COOKIES_DIR>/deepseek_token, written by the
+       refresher bot — wins over a stale env value so renewals take effect)
+    2. DEEPSEEK_AUTH_TOKEN env var
+    3. key sent by the client (Authorization Bearer)
     """
+    try:
+        bot_token = _bot_token_file().read_text(encoding='utf-8').strip()
+        if bot_token:
+            return bot_token
+    except OSError:
+        pass
     env_token = os.getenv('DEEPSEEK_AUTH_TOKEN', '').strip()
     if env_token:
         return env_token

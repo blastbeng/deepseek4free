@@ -6,8 +6,9 @@ private endpoints with browser credentials (no official API keys, no AI Studio).
 How it works
 ------------
 1. Credentials: the ``__Secure-1PSID`` (and optionally ``__Secure-1PSIDTS``)
-   cookies of a logged-in gemini.google.com session, provided via env vars
-   (``GEMINI_1PSID`` / ``GEMINI_1PSIDTS``) or a ``gemini_cookies.json`` file.
+   cookies of a logged-in gemini.google.com session, provided via a
+   bot-managed ``gemini_cookies.json`` file (kept fresh by ``dsk.refresher``)
+   or env vars (``GEMINI_1PSID`` / ``GEMINI_1PSIDTS``).
 2. Session init: GET ``https://gemini.google.com/app`` and scrape the SNlM0e
    XSRF token (``at``), frontend build label (``bl``), session id (``f.sid``).
 3. Model discovery (dynamic): ``batchexecute`` RPC ``otAQ7b`` (user status)
@@ -100,22 +101,22 @@ class GeminiWebProvider(Provider):
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._session: Optional[Dict[str, Any]] = None   # at/bl/f.sid/language
+        self._cookie_sig: str = ''                       # detects jar rotations
         self._models: Optional[List[Dict[str, Any]]] = None
         self._session_at: float = 0.0
         self._reqid = 10000
 
     # ------------------------------------------------------------ credentials
     def _cookies(self) -> Dict[str, str]:
-        """Resolve Gemini web cookies: env vars first, then cookies file."""
-        psid = (os.getenv('GEMINI_1PSID', '')
-                or os.getenv('GEMINI_COOKIES_1PSID', '')).strip()
-        psidts = (os.getenv('GEMINI_1PSIDTS', '')
-                  or os.getenv('GEMINI_COOKIES_1PSIDTS', '')).strip()
+        """Resolve Gemini web cookies: bot-managed jar first, then env vars."""
+        cookies = self._cookies_file()
+        psid = str(cookies.get('__Secure-1PSID', '') or '').strip()
+        psidts = str(cookies.get('__Secure-1PSIDTS', '') or '').strip()
         if not psid:
-            cookies = self._cookies_file()
-            if cookies:
-                psid = cookies.get('__Secure-1PSID', '').strip()
-                psidts = psidts or cookies.get('__Secure-1PSIDTS', '').strip()
+            psid = (os.getenv('GEMINI_1PSID', '')
+                    or os.getenv('GEMINI_COOKIES_1PSID', '')).strip()
+            psidts = psidts or (os.getenv('GEMINI_1PSIDTS', '')
+                                or os.getenv('GEMINI_COOKIES_1PSIDTS', '')).strip()
         if not psid:
             return {}
         out = {'__Secure-1PSID': psid}
@@ -148,10 +149,15 @@ class GeminiWebProvider(Provider):
     def _get_session(self, refresh: bool = False) -> Dict[str, Any]:
         """Scrape SNlM0e (at), build label (bl) and f.sid from the web app."""
         with self._lock:
+            cookies = self._cookies()
+            sig = repr(sorted(cookies.items()))
+            if sig != self._cookie_sig:
+                self._cookie_sig = sig        # credentials rotated by the
+                self._session = None          # refresher -> force re-init
+                self._session_at = 0.0
             if (not refresh and self._session is not None
                     and time.time() - self._session_at < SESSION_TTL):
                 return self._session
-            cookies = self._cookies()
             if not cookies:
                 raise ProviderAuthError(
                     'No Gemini web cookies. Set GEMINI_1PSID (and optionally '

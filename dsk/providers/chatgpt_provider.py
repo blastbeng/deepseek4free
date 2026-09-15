@@ -7,8 +7,8 @@ How it works
 ------------
 1. Credentials: either a directly provided access token (``CHATGPT_ACCESS_TOKEN``
    env var) or the ``__Secure-next-auth.session-token`` cookies of a logged-in
-   chatgpt.com session (``CHATGPT_SESSION_COOKIES`` env JSON or a
-   ``chatgpt_cookies.json`` file).
+   chatgpt.com session (bot-managed ``chatgpt_cookies.json`` file kept fresh by
+   ``dsk.refresher``, or ``CHATGPT_SESSION_COOKIES`` env JSON as fallback).
 2. Access token: GET ``https://chatgpt.com/api/auth/session`` with the session
    cookies returns ``{"accessToken": ...}``; the token is cached and refreshed
    when it expires.
@@ -98,10 +98,20 @@ class ChatGPTProvider(Provider):
         self._lock = threading.Lock()
         self._token: Optional[str] = None
         self._token_at = 0.0
+        self._token_sig: str = ''   # detects cookie-jar rotations
 
     # ------------------------------------------------------------- credentials
     def _session_cookies(self) -> Dict[str, str]:
-        """Session cookies from env JSON or a cookie file (dict or list form)."""
+        """Session cookies: bot-managed jar first, then env JSON fallback."""
+        path = _cookie_file()
+        if path.is_file():
+            try:
+                cookies = self._normalize_cookies(json.loads(path.read_text()))
+            except (ValueError, OSError) as e:
+                logger.warning('chatgpt_cookies.json unreadable: %s', e)
+            else:
+                if cookies:
+                    return cookies
         raw = (os.getenv('CHATGPT_SESSION_COOKIES', '') or '').strip()
         if raw:
             try:
@@ -110,15 +120,6 @@ class ChatGPTProvider(Provider):
                 logger.warning('CHATGPT_SESSION_COOKIES is not valid JSON, ignoring')
             else:
                 cookies = self._normalize_cookies(data)
-                if cookies:
-                    return cookies
-        path = _cookie_file()
-        if path.is_file():
-            try:
-                cookies = self._normalize_cookies(json.loads(path.read_text()))
-            except (ValueError, OSError) as e:
-                logger.warning('chatgpt_cookies.json unreadable: %s', e)
-            else:
                 if cookies:
                     return cookies
         return {}
@@ -151,10 +152,15 @@ class ChatGPTProvider(Provider):
         if env_token:
             return env_token
         with self._lock:
+            cookies = self._session_cookies()
+            sig = repr(sorted(cookies.items()))
+            if sig != self._token_sig:
+                self._token_sig = sig   # cookies rotated by the refresher
+                self._token = None      # -> drop the cached access token
+                self._token_at = 0.0
             if not refresh and self._token and \
                     time.monotonic() - self._token_at < TOKEN_TTL:
                 return self._token
-            cookies = self._session_cookies()
             if not cookies:
                 raise ProviderAuthError(
                     'No ChatGPT credentials. Set CHATGPT_ACCESS_TOKEN, or provide '

@@ -193,6 +193,40 @@ class Router:
         """Add/replace a route (used by tests and custom setups)."""
         self.routes[route.model_id] = route
 
+    def reload_providers(self) -> bool:
+        """Re-import provider modules and rebuild every provider instance.
+
+        Used by the self-healing layer after patching a provider module on
+        disk (upstream web-app changed). Thread-safe: swaps the instances
+        under the lock, then re-bootstraps DeepSeek's config-derived routes
+        and forces a full re-discovery of the web providers.
+        """
+        import importlib
+        with self._lock:
+            new_providers = {}
+            for name, module_name in (
+                ('deepseek', '.deepseek_provider'),
+                ('gemini', '.gemini_provider'),
+                ('chatgpt', '.chatgpt_provider'),
+            ):
+                module = importlib.import_module(module_name, __package__)
+                importlib.reload(module)
+                new_providers[name] = module.DeepSeekProvider() if name == 'deepseek' \
+                    else module.GeminiWebProvider() if name == 'gemini' \
+                    else module.ChatGPTProvider()
+            self.providers = new_providers
+            self._refreshed_at = 0.0
+        changed = False
+        try:
+            changed = self._apply_provider_models(
+                'deepseek', self.providers['deepseek'].list_models())
+            self._apply_fallbacks()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning('deepseek route bootstrap failed after reload: %s', e)
+        threading.Thread(target=self.refresh_models, kwargs={'force': True},
+                         name='model-re-discovery', daemon=True).start()
+        return changed
+
     # ------------------------------------------------------------- inspection
     def resolve(self, model_id: str, auth_key: Optional[str] = None) -> Route:
         """Resolve a model id to its route.
