@@ -252,12 +252,12 @@ def _build_prompt(messages: List[ChatMessage]) -> str:
             rendered.append(f"[System]\n{text}")
         elif role == "assistant":
             if msg.tool_calls:
-                # Re-render past calls in the exact protocol the model was
-                # taught (TOOL_CALL: {...}) so it recognizes its own behavior
-                # instead of learning a second, inconsistent format.
-                calls = []
+                # Re-render past calls in the exact DSML protocol the model
+                # was taught (and natively knows) so it recognizes its own
+                # behavior instead of learning a second, inconsistent format.
                 raw_calls = (msg.tool_calls if isinstance(msg.tool_calls, list)
                              else [msg.tool_calls])
+                invokes = []
                 for tc in raw_calls:
                     fn = tc.get("function", {}) if isinstance(tc, dict) else {}
                     raw_args = fn.get("arguments", "{}")
@@ -266,11 +266,22 @@ def _build_prompt(messages: List[ChatMessage]) -> str:
                                     if isinstance(raw_args, str) else raw_args)
                     except ValueError:
                         args_obj = raw_args
-                    payload = {"name": fn.get("name", "?"),
-                               "arguments": args_obj if args_obj is not None else {}}
-                    calls.append(_TOOL_MARKER.strip() + " "
-                                 + json.dumps(payload, ensure_ascii=False))
-                suffix = "\n" + "\n".join(calls) if calls else ""
+                    if not isinstance(args_obj, dict):
+                        args_obj = {"value": args_obj}
+                    parts = [f'<｜DSML｜ invoke name="{fn.get("name", "?")}">']
+                    for k, v in args_obj.items():
+                        if isinstance(v, str):
+                            parts.append(f'<｜DSML｜ parameter name="{k}" '
+                                         f'string="true">{v}</｜DSML｜ parameter>')
+                        else:
+                            parts.append(f'<｜DSML｜ parameter name="{k}" '
+                                         f'string="false">'
+                                         f'{json.dumps(v, ensure_ascii=False)}'
+                                         f'</｜DSML｜ parameter>')
+                    parts.append("</｜DSML｜ invoke>")
+                    invokes.append("\n".join(parts))
+                suffix = (("\n<｜DSML｜ calls>\n" + "\n".join(invokes)
+                           + "\n</｜DSML｜ calls>") if invokes else "")
                 rendered.append(f"[Assistant]\n{text}{suffix}")
             else:
                 rendered.append(f"[Assistant]\n{text}")
@@ -292,6 +303,106 @@ _TOOL_CALL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --- DeepSeek native DSML tool-call markup ----------------------------------
+# The chat.deepseek.com agent models natively emit their internal DSML markup
+# when they want to call tools, e.g.:
+#   <｜DSML｜ calls>
+#   <｜DSML｜ invoke name="power---bash">
+#   <｜DSML｜ parameter name="command" string="true">ls -la</｜DSML｜ parameter>
+#   <｜DSML｜ parameter name="timeout" string="false">120000</｜DSML｜ parameter>
+#   </｜DSML｜ invoke>
+#   </｜DSML｜ calls>
+# ('｜' is U+FF5C FULLWIDTH VERTICAL LINE; models vary the bar count.) When
+# this native markup was used instead of the taught protocol it leaked
+# verbatim into content and the tool calls never executed on the client.
+_DSML_TAG_RE = re.compile(
+    r"<(/?)(｜+)\s*DSML\s*(｜+)\s*(\w+)\s*([^>]*)>",
+    re.IGNORECASE,
+)
+_DSML_ATTR_RE = re.compile(r'([\w:-]+)\s*=\s*"([^"]*)"')
+# Opening of a tool-call section, for early boundary freezing while streaming.
+_DSML_OPEN_RE = re.compile(r"<｜+\s*DSML\s*｜+\s*(?:calls?|invoke)\b", re.IGNORECASE)
+
+
+def _parse_dsml_calls(text: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Parse native DSML tool-call markup.
+
+    Returns (pre_text, calls); calls is empty when the text contains no
+    usable DSML block. Tolerates missing <calls> wrappers, unclosed invokes
+    and template placeholders echoed from the instructions."""
+    tags = list(_DSML_TAG_RE.finditer(text))
+    if not tags:
+        return text, []
+    calls: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+    param: Optional[Tuple[str, bool, int]] = None
+    pre_end: Optional[int] = None
+    for m in tags:
+        closing = m.group(1) == "/"
+        tag = m.group(4).lower()
+        attrs = dict(_DSML_ATTR_RE.findall(m.group(5) or ""))
+        if tag == "calls":
+            if not closing and pre_end is None:
+                pre_end = m.start()
+            continue
+        if tag == "invoke":
+            if not closing:
+                if cur is not None:            # tolerate unclosed invoke
+                    calls.append(cur)
+                cur = {"name": (attrs.get("name") or "").strip(), "args": {}}
+                if pre_end is None:
+                    pre_end = m.start()
+            elif cur is not None:
+                calls.append(cur)
+                cur = None
+            continue
+        if tag == "parameter" and cur is not None:
+            if not closing:
+                param = (attrs.get("name", ""),
+                         attrs.get("string", "").strip().lower() == "true",
+                         m.end())
+            elif param is not None:
+                pname, as_str, start = param
+                content = text[start:m.start()]
+                if as_str:
+                    value: Any = content
+                else:
+                    parsed = _loads_repaired(content.strip())
+                    value = content if parsed is None else parsed
+                if pname:
+                    cur["args"][pname] = value
+                param = None
+            continue
+    if cur is not None:
+        calls.append(cur)
+    if not calls:
+        return text, []
+    out: List[Dict[str, str]] = []
+    for c in calls:
+        name = c["name"]
+        # Skip template placeholders the model may echo from the instructions.
+        if not name or "<" in name:
+            continue
+        args = c["args"]
+        # Native-style emission wraps the whole OpenAI arguments object in a
+        # single <parameter name="arguments" string="false">{...}</parameter>.
+        # Unwrap it so the tool receives its own flat parameters instead of
+        # a bogus "arguments" key.
+        if set(args) == {"arguments"}:
+            v = args["arguments"]
+            if isinstance(v, str):
+                v = _loads_repaired(v.strip())
+            if isinstance(v, dict):
+                args = v
+        out.append({"name": name,
+                    "arguments": json.dumps(args, ensure_ascii=False)})
+        if len(out) >= 8:                      # parallel-call cap
+            break
+    if not out:
+        return text, []
+    pre = text[:pre_end].strip() if pre_end is not None else ""
+    return pre, out
+
 
 def _loads_repaired(raw: str):
     """json.loads with pragmatic repairs for typical LLM quirks (smart
@@ -307,6 +418,17 @@ def _loads_repaired(raw: str):
     except ValueError:
         pass
     fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+    try:
+        return json.loads(fixed)
+    except ValueError:
+        pass
+    # Invalid escape sequences from shell/regex content (e.g. \| \( \d) —
+    # models often emit them inside "string=false" JSON. Double the
+    # backslash on any \X that JSON does not define.
+    fixed = re.sub(
+        r'\\(u[0-9a-fA-F]{4}|["\\/bfnrt])|\\(.)',
+        lambda m: m.group(0) if m.group(1) else "\\\\" + m.group(2),
+        fixed)
     try:
         return json.loads(fixed)
     except ValueError:
@@ -348,10 +470,14 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 def _parse_tool_calls(text: str) -> Tuple[str, List[Dict[str, str]]]:
     """Extract (pre_text, [{name, arguments}, ...]) from model output.
 
-    Tolerates marker variants, junk around the JSON payload and malformed
-    JSON (best-effort repair). Returns all calls found (parallel tool calls
-    are supported); pre_text is whatever the model wrote before the first
-    marker."""
+    Accepts the native DeepSeek DSML markup first, then the taught
+    TOOL_CALL: {...} protocol. Tolerates marker variants, junk around the
+    JSON payload and malformed JSON (best-effort repair). Returns all calls
+    found (parallel tool calls are supported); pre_text is whatever the
+    model wrote before the first tool-call block."""
+    pre, calls = _parse_dsml_calls(text)
+    if calls:
+        return pre, calls
     calls: List[Dict[str, str]] = []
     pre_end = len(text)
     for match in _TOOL_CALL_RE.finditer(text):
@@ -385,9 +511,10 @@ def _parse_tool_call(text: str):
 
 def _render_tool_instructions(tools: List[Dict[str, Any]], tool_choice: Any) -> str:
     """Builds the system block that teaches the DeepSeek model the tool-call
-    protocol. DeepSeek's web API has no native function calling, so we emulate
-    it: the model answers with a single TOOL_CALL: {json} line which is parsed
-    back into OpenAI tool_calls."""
+    protocol. DeepSeek's web API has no native function calling; its agent
+    models natively know DSML markup, so we teach exactly that (matching
+    their internal format maximizes adherence) and still parse the legacy
+    TOOL_CALL: {json} shorthand as a fallback."""
     lines = [
         "# Tool calling protocol",
         "You can use tools to help complete the task. Available tools:",
@@ -404,14 +531,27 @@ def _render_tool_instructions(tools: List[Dict[str, Any]], tool_choice: Any) -> 
             lines.append(f"   parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}")
     lines += [
         "",
-        "To call a tool, your ENTIRE response must be exactly one line in this format",
-        "and nothing else (no markdown fences, no extra text):",
-        f'{_TOOL_MARKER.strip()} {{"name": "<tool name>", "arguments": {{}}}}',
-        "Call at most ONE tool per response; the result is provided afterwards as a [Tool result] message.",
-        "After you receive [Tool result] messages, use them to continue or complete the task.",
-        "Never repeat a tool call that was already made with the same arguments.",
-        "If the task is complete or you have all the information you need, respond with plain text instead of calling a tool.",
-        "If you do not need a tool, respond with plain text.",
+        "To call tool(s), end your response with a DSML tool-call block using",
+        "exactly this markup (keep the special fullwidth bars ｜ intact):",
+        "",
+        "<｜DSML｜ calls>",
+        '<｜DSML｜ invoke name="<tool name>">',
+        '<｜DSML｜ parameter name="<param name>" string="true">plain text value</｜DSML｜ parameter>',
+        '<｜DSML｜ parameter name="<param name>" string="false">{"json": "value"}</｜DSML｜ parameter>',
+        "</｜DSML｜ invoke>",
+        "</｜DSML｜ calls>",
+        "",
+        "Rules:",
+        '- string="true" = the value is a plain string; string="false" = the value is raw JSON',
+        "  (objects, arrays, numbers, booleans). Omit optional parameters you do not need.",
+        "- Use one <DSML invoke> per tool; multiple invokes may share one block to run in",
+        "  parallel. Any text before the block is delivered as your prose answer.",
+        "- The tool result arrives as a [Tool result] message; then continue the task.",
+        "- Never repeat a tool call that was already made with the same arguments.",
+        "- If the task is complete or you have all the information you need, respond with",
+        "  plain text and NO tool-call block.",
+        "- As a shorthand you may instead answer with a single line:",
+        '  TOOL_CALL: {"name": "<tool name>", "arguments": {}}',
     ]
     if isinstance(tool_choice, dict) and isinstance(tool_choice.get("function"), dict):
         forced = tool_choice["function"].get("name")
@@ -719,10 +859,11 @@ async def _stream_completion(
 
     def _worker():
         # Tool-call responses are parsed authoritatively at stream end, but
-        # text is emitted incrementally: a holdback window keeps a partially-
-        # arrived TOOL_CALL marker from leaking into content deltas. Once a
-        # marker is detected the boundary is frozen and everything after it
-        # is buffered until the final parse decides tool_calls vs plain text.
+        # text is emitted incrementally: a holdback window keeps partially-
+        # arrived markers (the TOOL_CALL: line or DSML <｜DSML｜ invoke> tags)
+        # from leaking into content deltas. Once a marker is detected the
+        # boundary is frozen and everything after it is buffered until the
+        # final parse decides tool_calls vs plain text.
         holdback = 64   # chars withheld while no marker has been seen
         rescan = 32     # marker re-scan overlap before the last emit point
         text = ""
@@ -807,6 +948,8 @@ async def _stream_completion(
                 if boundary is not None:
                     continue  # inside the tool-call section: buffer only
                 match = _TOOL_CALL_RE.search(text, scanned)
+                if match is None:
+                    match = _DSML_OPEN_RE.search(text, scanned)
                 if match:
                     boundary = match.start()
                     _emit_upto(boundary)

@@ -166,3 +166,4 @@ dsk/cookies.json
 cookies.json
 data/
 .aider*
+.playwright-mcp/

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>deepseek4free · playground</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%F0%9F%90%8B%3C/text%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --border: #30363d;
@@ -40,6 +41,7 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button.danger { background: #da3633; border-color: #da3633; color: #fff; }
   button:disabled { opacity: .5; cursor: not-allowed; }
+  .gear { display: none; }
 
   main { flex: 1; display: flex; min-height: 0; }
   #chat {
@@ -47,7 +49,7 @@
     display: flex; flex-direction: column; gap: 12px;
   }
   .msg { max-width: 78%; border-radius: 10px; padding: 10px 14px; white-space: pre-wrap;
-         word-wrap: break-word; overflow-wrap: anywhere; }
+         word-wrap: break-word; overflow-wrap: anywhere; position: relative; }
   .msg.user { align-self: flex-end; background: var(--user-bubble);
               border: 1px solid #1f6feb55; }
   .msg.bot  { align-self: flex-start; background: var(--bot-bubble);
@@ -56,6 +58,10 @@
                color: var(--err); font-family: var(--mono); font-size: 13px; }
   .msg .who { font-size: 11px; color: var(--muted); margin-bottom: 4px;
               text-transform: uppercase; letter-spacing: .5px; }
+  .msg .copy { position: absolute; top: 5px; right: 6px; padding: 1px 7px; font-size: 11px;
+               opacity: 0; transition: opacity .12s; }
+  .msg:hover .copy { opacity: 1; }
+  .msg.error .badge { border-color: var(--err); color: var(--err); }
   details.think { margin: 0 0 8px 0; border: 1px dashed var(--border);
                   border-radius: 6px; background: #0d111788; }
   details.think summary { cursor: pointer; padding: 4px 10px; color: var(--muted);
@@ -63,10 +69,12 @@
   details.think .body { padding: 6px 10px; color: var(--muted);
                         font-size: 13px; white-space: pre-wrap; }
   .msg pre { background: #0a0d12; border: 1px solid var(--border); border-radius: 6px;
-             padding: 10px; overflow-x: auto; font-family: var(--mono); font-size: 13px; }
+             padding: 0; margin: 6px 0; overflow-x: auto; font-family: var(--mono); font-size: 13px; }
+  .msg pre .lang { padding: 4px 10px; font-size: 10px; color: var(--muted); font-family: var(--mono);
+                   text-transform: uppercase; letter-spacing: .6px; border-bottom: 1px solid var(--border); }
+  .msg pre code { display: block; padding: 10px; background: none; }
   .msg code { font-family: var(--mono); font-size: 13px; background: #0a0d12;
               border-radius: 4px; padding: 1px 4px; }
-  .msg pre code { background: none; padding: 0; }
 
   #settings {
     width: 290px; border-left: 1px solid var(--border); background: var(--panel);
@@ -81,16 +89,34 @@
   .badge { font-size: 10px; padding: 1px 6px; border-radius: 8px;
            border: 1px solid var(--border); color: var(--muted); }
   .badge.on { color: var(--ok); border-color: var(--ok); }
-  #stats { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  #stats { font-size: 11px; color: var(--muted); font-family: var(--mono); min-height: 15px; }
+  #stats .pulse { color: var(--accent); animation: blink 1s infinite; }
+  @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: .2; } }
 
   footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
+  #thumbs { display: none; gap: 10px; flex-wrap: wrap; max-width: 1000px;
+            margin: 0 auto 8px; align-items: flex-end; }
+  .thumb { position: relative; line-height: 0; }
+  .thumb img { height: 56px; border-radius: 6px; border: 1px solid var(--border); }
+  .thumb button { position: absolute; top: -7px; right: -7px; padding: 0 6px; font-size: 10px;
+                  line-height: 16px; border-radius: 9px; }
   #composer { display: flex; gap: 10px; align-items: flex-end; max-width: 1000px; margin: 0 auto; }
+  #attach { font-size: 15px; }
   #prompt {
     flex: 1; resize: none; min-height: 44px; max-height: 200px;
     font: inherit; line-height: 1.45;
   }
   .hint { text-align: center; color: var(--muted); font-size: 11px; margin-top: 6px; }
-  @media (max-width: 760px) { #settings { display: none; } .msg { max-width: 95%; } }
+  @media (max-width: 760px) {
+    .gear { display: inline-block; }
+    #settings {
+      position: fixed; top: 0; right: 0; bottom: 0; width: min(320px, 88vw); z-index: 30;
+      transform: translateX(105%); transition: transform .18s ease; box-shadow: -10px 0 30px #000a;
+    }
+    #settings.open { transform: none; }
+    .msg { max-width: 95%; }
+    #model { max-width: 44vw; min-width: 0; }
+  }
 </style>
 </head>
 <body>
@@ -99,6 +125,7 @@
   <select id="model" title="Model (from GET /v1/models)"></select>
   <span id="flags"></span>
   <div class="grow"></div>
+  <button id="gear" class="gear" title="Settings">⚙ settings</button>
   <button id="refresh" title="Reload model list">↻ models</button>
   <button id="clear" title="Clear conversation">✕ clear</button>
 </header>
@@ -127,15 +154,22 @@
         <label for="showthink">show thinking</label>
         <input type="checkbox" id="showthink" checked>
       </div>
+      <div class="row">
+        <label for="noproxy" title="Skip Tor + proxy pool for these requests (disable_proxy)">direct connection <span class="badge">no proxy</span></label>
+        <input type="checkbox" id="noproxy">
+      </div>
     </div>
     <div id="stats"></div>
   </aside>
 </main>
 <footer>
+  <div id="thumbs"></div>
   <div id="composer">
+    <button id="attach" title="Attach image(s)">📎</button>
     <textarea id="prompt" placeholder="Send a message… (Enter to send, Shift+Enter for newline)"></textarea>
     <button id="stop" class="danger" disabled>■ stop</button>
     <button id="send" class="primary">Send</button>
+    <input type="file" id="file" accept="image/*" multiple hidden>
   </div>
   <div class="hint">OpenAI-compatible endpoint · <span id="baseurl"></span></div>
 </footer>
@@ -144,9 +178,12 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const chat = $('chat'), modelSel = $('model'), flagsEl = $('flags');
-let messages = [];          // {role, content}
+const LS_KEY = 'dsk_pg_v1';
+let messages = [];          // {role, content} — content: string | [{type:text|image_url}]
+let pendingImages = [];     // data URLs awaiting send
 let controller = null;      // AbortController for the active stream
-let modelInfo = {};         // id -> {thinking_enabled, search_enabled, ...}
+let modelInfo = {};         // id -> {thinking_enabled, search_enabled, vision, ...}
+let statTimer = null, statT0 = 0, statChunks = 0;
 
 $('baseurl').textContent = location.origin;
 
@@ -154,15 +191,29 @@ function esc(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// Minimal markdown: fenced code, inline code, **bold**. Good enough for chat.
+function contentText(c) {
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    return c.map(p => p && p.type === 'text' ? p.text
+      : (p && p.type === 'image_url' ? '[image]' : '')).filter(Boolean).join('\n');
+  }
+  return '';
+}
+
+// Minimal markdown: fenced code (with language label), inline code, **bold**.
 function renderMd(text) {
   const parts = String(text).split(/```/);
   let html = '';
   for (let i = 0; i < parts.length; i++) {
     if (i % 2 === 1) {                       // code fence block
-      const nl = parts[i].indexOf('\n');
-      const code = nl >= 0 ? parts[i].slice(nl + 1) : parts[i];
-      html += '<pre><code>' + esc(code.replace(/\n$/, '')) + '</code></pre>';
+      let seg = parts[i], lang = '';
+      const nl = seg.indexOf('\n');
+      if (nl >= 0) {
+        const first = seg.slice(0, nl).trim();
+        if (/^[A-Za-z0-9_+#.\-]{1,20}$/.test(first)) { lang = first; seg = seg.slice(nl + 1); }
+      }
+      html += '<pre>' + (lang ? '<div class="lang">' + esc(lang) + '</div>' : '') +
+              '<code>' + esc(seg.replace(/\n$/, '')) + '</code></pre>';
     } else {
       let t = esc(parts[i]);
       t = t.replace(/`([^`\n]+)`/g, '<code>$1</code>');
@@ -173,21 +224,47 @@ function renderMd(text) {
   return html;
 }
 
+function setRaw(body, text) {
+  body.dataset.raw = text;
+  body.innerHTML = renderMd(text);
+}
+
 function addBubble(role) {
-  const div = document.createElement('div');
-  div.className = 'msg ' + (role === 'error' ? 'error' : role);
+  const root = document.createElement('div');
+  root.className = 'msg ' + (role === 'error' ? 'error' : role);
+  const body = document.createElement('div');
+  body.className = 'body';
   if (role !== 'error') {
     const who = document.createElement('div');
     who.className = 'who';
     who.textContent = role;
-    div.appendChild(who);
+    root.appendChild(who);
   }
-  const body = document.createElement('div');
-  body.className = 'body';
-  div.appendChild(body);
-  chat.appendChild(div);
+  if (role === 'bot' || role === 'user') {
+    const cp = document.createElement('button');
+    cp.className = 'copy'; cp.title = 'Copy'; cp.textContent = '⧉';
+    cp.onclick = () => {
+      navigator.clipboard.writeText(body.dataset.raw || body.textContent || '').then(() => {
+        cp.textContent = '✓';
+        setTimeout(() => { cp.textContent = '⧉'; }, 1200);
+      }).catch(() => {});
+    };
+    root.appendChild(cp);
+  }
+  root.appendChild(body);
+  chat.appendChild(root);
   chat.scrollTop = chat.scrollHeight;
-  return body;
+  return { root, body };
+}
+
+function errorBubble(msg, type, code) {
+  const b = addBubble('error');
+  let html = '⚠ ' + esc(msg || 'unknown error');
+  const badges = [];
+  if (type) badges.push('<span class="badge">' + esc(String(type)) + '</span>');
+  if (code !== undefined && code !== null && code !== '') badges.push('<span class="badge">' + esc(String(code)) + '</span>');
+  if (badges.length) html += ' &nbsp;' + badges.join(' ');
+  b.body.innerHTML = html;
 }
 
 function thinkBlock(parent) {
@@ -214,12 +291,17 @@ async function loadModels() {
       const bits = [];
       if (m.thinking_enabled) bits.push('🧠');
       if (m.search_enabled) bits.push('🔍');
+      if (m.vision) bits.push('📷');
+      if (m.image_gen) bits.push('🎨');
       opt.textContent = m.id + (bits.length ? '  ' + bits.join(' ') : '');
       modelSel.appendChild(opt);
     }
     if (!modelSel.options.length) {
       modelSel.innerHTML = '<option value="">(no models available)</option>';
     }
+    const want = modelSel.dataset.want;
+    if (want && modelInfo[want]) modelSel.value = want;
+    delete modelSel.dataset.want;
     updateFlags();
   } catch (e) {
     modelSel.innerHTML = '<option value="">failed to load models</option>';
@@ -234,8 +316,12 @@ function updateFlags() {
   f.push('<span class="badge">out ' + (m.max_tokens || m.max_completion_tokens || '?') + '</span>');
   if (m.thinking_enabled) f.push('<span class="badge on">thinking</span>');
   if (m.search_enabled) f.push('<span class="badge on">search</span>');
+  if (m.vision) f.push('<span class="badge on">vision</span>');
+  if (m.image_gen) f.push('<span class="badge on">image gen</span>');
   if ((m.fallbacks || []).length) f.push('<span class="badge">fb: ' + m.fallbacks.join(', ') + '</span>');
   flagsEl.innerHTML = f.join(' ');
+  $('attach').title = m.vision ? 'Attach image(s)'
+    : 'Attach image(s) — current model has no vision, they will be rejected';
 }
 
 function setBusy(busy) {
@@ -243,25 +329,143 @@ function setBusy(busy) {
   $('stop').disabled = !busy;
 }
 
+function startStatus() {
+  statT0 = performance.now(); statChunks = 0;
+  statTimer = setInterval(() => {
+    const s = ((performance.now() - statT0) / 1000).toFixed(1);
+    $('stats').innerHTML = '<span class="pulse">●</span> ' + s + 's · ' + statChunks + ' chunks';
+  }, 200);
+}
+
+function stopStatus(kind) {
+  if (statTimer) { clearInterval(statTimer); statTimer = null; }
+  const secs = ((performance.now() - statT0) / 1000).toFixed(1);
+  if (kind === 'done' && statChunks > 0) $('stats').textContent = 'last: ' + secs + 's · ~' + statChunks + ' chunks';
+  else if (kind === 'stop') $('stats').textContent = 'stopped: ' + secs + 's · ' + statChunks + ' chunks';
+  else if (kind === 'error') $('stats').textContent = 'failed: ' + secs + 's';
+}
+
+// ---------- persistence (localStorage) ----------
+function settingsSnapshot() {
+  return {
+    model: modelSel.value,
+    system: $('system').value,
+    temp: $('temp').value,
+    maxtok: $('maxtok').value,
+    search: $('search').checked,
+    showthink: $('showthink').checked,
+    noproxy: $('noproxy').checked,
+  };
+}
+
+function persist() {
+  const pack = (msgs, imgs) => JSON.stringify(Object.assign({ messages: msgs, pendingImages: imgs }, settingsSnapshot()));
+  try {
+    localStorage.setItem(LS_KEY, pack(messages, pendingImages));
+  } catch (_) {
+    try { // quota exceeded: drop image payloads
+      const slim = messages.map(m => typeof m.content === 'string' ? m : { role: m.role, content: contentText(m.content) });
+      localStorage.setItem(LS_KEY, pack(slim, []));
+    } catch (_2) {}
+  }
+}
+
+function restore() {
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); } catch (_) {}
+  if (!s) return;
+  if (Array.isArray(s.messages)) {
+    messages = s.messages.filter(m => m && m.role && m.content !== undefined);
+  }
+  pendingImages = Array.isArray(s.pendingImages) ? s.pendingImages : [];
+  if (typeof s.system === 'string') $('system').value = s.system;
+  if (s.temp !== undefined) { $('temp').value = s.temp; $('tempVal').textContent = parseFloat(s.temp).toFixed(2); }
+  if (s.maxtok !== undefined) $('maxtok').value = s.maxtok;
+  if (typeof s.search === 'boolean') $('search').checked = s.search;
+  if (typeof s.showthink === 'boolean') $('showthink').checked = s.showthink;
+  if (typeof s.noproxy === 'boolean') $('noproxy').checked = s.noproxy;
+  for (const m of messages) {
+    if (m.role === 'system') continue;
+    const b = addBubble(m.role === 'assistant' ? 'bot' : m.role);
+    setRaw(b.body, contentText(m.content));
+  }
+  if (pendingImages.length) renderThumbs();
+  if (s.model) modelSel.dataset.want = s.model;  // applied after loadModels()
+}
+
+// ---------- image attach ----------
+function renderThumbs() {
+  const t = $('thumbs');
+  t.innerHTML = '';
+  pendingImages.forEach((u, i) => {
+    const d = document.createElement('div');
+    d.className = 'thumb';
+    const img = document.createElement('img');
+    img.src = u; img.alt = 'attachment';
+    const x = document.createElement('button');
+    x.textContent = '✕'; x.title = 'Remove';
+    x.onclick = () => { pendingImages.splice(i, 1); renderThumbs(); persist(); };
+    d.appendChild(img); d.appendChild(x);
+    t.appendChild(d);
+  });
+  t.style.display = pendingImages.length ? 'flex' : 'none';
+}
+
+$('attach').onclick = () => $('file').click();
+$('file').onchange = () => {
+  const files = Array.from($('file').files || []);
+  let chain = Promise.resolve();
+  for (const f of files) {
+    if (!f.type.startsWith('image/')) continue;
+    if (f.size > 6 * 1024 * 1024) {
+      errorBubble('Image "' + f.name + '" is too large (max 6 MB).', 'client', 'image_too_large');
+      continue;
+    }
+    chain = chain.then(() => new Promise((ok) => {
+      const r = new FileReader();
+      r.onload = () => { pendingImages.push(r.result); ok(); };
+      r.onerror = () => ok();
+      r.readAsDataURL(f);
+    }));
+  }
+  chain.then(() => { $('file').value = ''; renderThumbs(); persist(); });
+};
+
+// ---------- send / stream ----------
 async function send() {
   const text = $('prompt').value.trim();
-  if (!text || controller) return;
+  if ((!text && !pendingImages.length) || controller) return;
   $('prompt').value = '';
   autoGrow();
+  $('settings').classList.remove('open');
 
   if (messages.length === 0 && $('system').value.trim()) {
     messages.push({ role: 'system', content: $('system').value.trim() });
   }
-  messages.push({ role: 'user', content: text });
-  addBubble('user').textContent = text;
+  let content = text;
+  if (pendingImages.length) {
+    content = [{ type: 'text', text: text || 'Describe the image(s).' }];
+    for (const url of pendingImages) content.push({ type: 'image_url', image_url: { url: url } });
+  }
+  messages.push({ role: 'user', content });
+  const ub = addBubble('user');
+  ub.body.textContent = text + (pendingImages.length ? '\n🖼 ' + pendingImages.length + ' image(s)' : '');
+  ub.body.dataset.raw = ub.body.textContent;
+  persist();
 
-  const body = addBubble('bot');
+  const model = modelInfo[modelSel.value] || {};
+  if (pendingImages.length && model.vision === false) {
+    pendingImages = []; renderThumbs();
+    messages.pop();
+    errorBubble('Model "' + modelSel.value + '" does not support vision — image(s) dropped. Pick a 📷-flagged model.', 'client', 'model_does_not_support_vision');
+    return;
+  }
+
+  const b = addBubble('bot');
   const think = { el: null, text: '' };
   let answer = '';
   setBusy(true);
-  const t0 = performance.now();
-  let tokens = 0;
-
+  startStatus();
   controller = new AbortController();
   try {
     const payload = {
@@ -272,7 +476,7 @@ async function send() {
     };
     if (parseInt($('maxtok').value, 10) > 0) payload.max_tokens = parseInt($('maxtok').value, 10);
     if ($('search').checked) payload.search_enabled = true;
-    if (messages[0] && messages[0].role === 'system') payload.messages = messages;
+    if ($('noproxy').checked) payload.disable_proxy = true;
 
     const res = await fetch('/v1/chat/completions', {
       method: 'POST',
@@ -281,9 +485,12 @@ async function send() {
       signal: controller.signal,
     });
     if (!res.ok) {
-      let msg = 'HTTP ' + res.status;
-      try { msg = (await res.json()).error?.message || msg; } catch (_) {}
-      throw new Error(msg);
+      let msg = 'HTTP ' + res.status, type, code;
+      try {
+        const j = await res.json();
+        if (j.error) { msg = j.error.message || msg; type = j.error.type; code = j.error.code; }
+      } catch (_) {}
+      throw Object.assign(new Error(msg), { errType: type, errCode: code });
     }
 
     const reader = res.body.getReader();
@@ -302,35 +509,44 @@ async function send() {
         if (data === '[DONE]') continue;
         let j;
         try { j = JSON.parse(data); } catch (_) { continue; }
-        if (j.error) throw new Error(j.error.message || 'stream error');
+        if (j.error) {
+          throw Object.assign(new Error(j.error.message || 'stream error'),
+            { errType: j.error.type, errCode: j.error.code });
+        }
         const delta = j.choices?.[0]?.delta || {};
         if (delta.reasoning_content) {
-          if (!think.el) think.el = thinkBlock(body.parentElement);
+          if (!think.el) think.el = thinkBlock(b.root);
           think.text += delta.reasoning_content;
           think.el.textContent = think.text;
           chat.scrollTop = chat.scrollHeight;
         }
         if (delta.content) {
           answer += delta.content;
-          tokens++;
-          body.innerHTML = renderMd(answer);
+          statChunks++;
+          setRaw(b.body, answer);
           chat.scrollTop = chat.scrollHeight;
         }
       }
     }
     messages.push({ role: 'assistant', content: answer });
-    const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    $('stats').textContent = 'last: ' + secs + 's · ~' + tokens + ' chunks';
+    stopStatus('done');
   } catch (e) {
     if (e.name === 'AbortError') {
-      body.innerHTML += '\n<i style="color:var(--warn)">[stopped]</i>';
+      const st = document.createElement('i');
+      st.style.color = 'var(--warn)';
+      st.textContent = ' [stopped]';
+      b.body.appendChild(st);
       if (answer) messages.push({ role: 'assistant', content: answer });
+      stopStatus('stop');
     } else {
-      addBubble('error').textContent = '⚠ ' + (e.message || e);
+      if (!answer && !think.text) b.root.remove();  // drop empty bot bubble
+      errorBubble(e.message, e.errType, e.errCode);
+      stopStatus('error');
     }
   } finally {
     setBusy(false);
     controller = null;
+    persist();
   }
 }
 
@@ -343,16 +559,31 @@ function autoGrow() {
 $('send').onclick = send;
 $('stop').onclick = () => controller && controller.abort();
 $('refresh').onclick = loadModels;
-$('clear').onclick = () => { messages = []; chat.innerHTML = ''; $('stats').textContent = ''; };
+$('gear').onclick = () => $('settings').classList.toggle('open');
+$('clear').onclick = () => {
+  messages = []; pendingImages = [];
+  chat.innerHTML = ''; renderThumbs();
+  $('stats').textContent = '';
+  persist();
+};
 $('prompt').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $('prompt').addEventListener('input', autoGrow);
-modelSel.addEventListener('change', updateFlags);
+modelSel.addEventListener('change', () => { updateFlags(); persist(); });
+for (const id of ['system', 'temp', 'maxtok', 'search', 'showthink', 'noproxy']) {
+  $(id).addEventListener('change', persist);
+  $(id).addEventListener('input', persist);
+}
 $('temp').addEventListener('input', () => {
   $('tempVal').textContent = parseFloat($('temp').value).toFixed(2);
 });
 
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') $('settings').classList.remove('open');
+});
+
+restore();
 loadModels();
 </script>
 </body>
