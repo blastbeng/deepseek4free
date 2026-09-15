@@ -48,27 +48,40 @@ MODEL_THINKER = os.getenv("DSF_MODEL_THINKER", "deepseek-reasoner")
 MODEL_FAST = os.getenv("DSF_MODEL_FAST", "deepseek-chat")
 MODEL_SEARCH = os.getenv("DSF_MODEL_SEARCH", "deepseek-search")
 
+# Context / output limits advertised in /v1/models.
+# The DeepSeek web API does not expose per-model metadata, so these are the
+# officially documented values for DeepSeek's current models (128K context,
+# 64K max output in thinking mode / 32K otherwise) and can be overridden.
+CONTEXT_LENGTH = int(os.getenv("DSF_CONTEXT_LENGTH", "131072"))
+MAX_OUTPUT_THINKING = int(os.getenv("DSF_MAX_OUTPUT_THINKING", "65536"))
+MAX_OUTPUT = int(os.getenv("DSF_MAX_OUTPUT", "32768"))
+
 API_KEY = os.getenv("DSF_API_KEY", "")
 
+
+def _model_entry(model_id: str, max_output_tokens: int) -> Dict[str, Any]:
+    """Build an OpenAI-style model entry with limit metadata.
+
+    The extra fields are read by agent tooling to size the context window and
+    max output tokens (e.g. AiderDesk reads context_length / max_model_len and
+    max_completion_tokens / max_tokens).
+    """
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 1700000000,
+        "owned_by": "deepseek4free",
+        "context_length": CONTEXT_LENGTH,
+        "max_model_len": CONTEXT_LENGTH,
+        "max_completion_tokens": max_output_tokens,
+        "max_tokens": max_output_tokens,
+    }
+
+
 MODELS = [
-    {
-        "id": MODEL_THINKER,
-        "object": "model",
-        "created": 1700000000,
-        "owned_by": "deepseek4free",
-    },
-    {
-        "id": MODEL_FAST,
-        "object": "model",
-        "created": 1700000000,
-        "owned_by": "deepseek4free",
-    },
-    {
-        "id": MODEL_SEARCH,
-        "object": "model",
-        "created": 1700000000,
-        "owned_by": "deepseek4free",
-    },
+    _model_entry(MODEL_THINKER, MAX_OUTPUT_THINKING),
+    _model_entry(MODEL_FAST, MAX_OUTPUT),
+    _model_entry(MODEL_SEARCH, MAX_OUTPUT),
 ]
 
 app = FastAPI(title="DeepSeek4Free OpenAI-compatible API")

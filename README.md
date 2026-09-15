@@ -79,6 +79,8 @@ This is the main addition of this fork. A FastAPI server translates between the 
   | `deepseek-search` | thinking disabled + **web search** enabled |
 
   (names are overridable via `DSF_MODEL_THINKER` / `DSF_MODEL_FAST` / `DSF_MODEL_SEARCH`)
+
+  The DeepSeek web API does **not** expose per-model metadata, so `/v1/models` advertises DeepSeek's documented limits — 128K context (`context_length` / `max_model_len`) and max output of 64K for `deepseek-reasoner` / 32K otherwise (`max_completion_tokens` / `max_tokens`). Agent tools like AiderDesk and aider read these fields to size the context window and max output tokens; adjust them via `DSF_CONTEXT_LENGTH`, `DSF_MAX_OUTPUT_THINKING` and `DSF_MAX_OUTPUT` if DeepSeek changes its limits.
 - **Streaming** — the synchronous DeepSeek generator runs in a worker thread and is bridged into an async SSE response. `thinking` chunks are re-emitted as OpenAI `reasoning_content` deltas; `text` chunks become normal `delta.content` deltas; the stream ends with a proper `finish_reason` chunk and `data: [DONE]`.
 - **Tool-calling emulation** — see the next section.
 - **Compatibility** — standard OpenAI parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `frequency_penalty`, `presence_penalty`, `response_format`, `stream_options.include_usage`, …) are accepted; the ones DeepSeek cannot honour are tolerated and ignored, so exotic clients never get validation errors.
@@ -205,6 +207,9 @@ aider --model openai/deepseek-chat \
 | `DSF_MODEL_THINKER` | `deepseek-reasoner` | Name exposed for the thinking-enabled model |
 | `DSF_MODEL_FAST` | `deepseek-chat` | Name exposed for the fast model |
 | `DSF_MODEL_SEARCH` | `deepseek-search` | Name exposed for the web-search model |
+| `DSF_CONTEXT_LENGTH` | `131072` | Context length advertised on `/v1/models` (DeepSeek's documented 128K) |
+| `DSF_MAX_OUTPUT_THINKING` | `65536` | Max output tokens advertised for the thinking model (documented 64K) |
+| `DSF_MAX_OUTPUT` | `32768` | Max output tokens advertised for the other models (documented 32K) |
 
 ---
 
