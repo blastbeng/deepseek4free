@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 import subprocess
 import time
+import os
 
 ThinkingMode = Literal['detailed', 'simple', 'disabled']
 SearchMode = Literal['enabled', 'disabled']
@@ -42,7 +43,10 @@ class DeepSeekAPI:
 
     def __init__(self, auth_token: str):
         if not auth_token or not isinstance(auth_token, str):
-            raise AuthenticationError("Invalid auth token provided")
+            # Fall back to environment variable (used by the OpenAI server & Docker)
+            auth_token = os.getenv('DEEPSEEK_AUTH_TOKEN', '').strip()
+            if not auth_token:
+                raise AuthenticationError("Invalid auth token provided")
 
         try:
             curl_cffi_version = pkg_resources.get_distribution('curl-cffi').version
@@ -56,8 +60,13 @@ class DeepSeekAPI:
         self.auth_token = auth_token
         self.pow_solver = DeepSeekPOW()
 
-        # Load cookies from JSON file
-        cookies_path = Path(__file__).parent / 'cookies.json'
+        # Load cookies from JSON file (override location with COOKIES_DIR,
+        # e.g. a mounted Docker volume at /data)
+        cookies_dir = os.getenv('COOKIES_DIR')
+        if cookies_dir and Path(cookies_dir).is_dir():
+            cookies_path = Path(cookies_dir) / 'cookies.json'
+        else:
+            cookies_path = Path(__file__).parent / 'cookies.json'
         try:
             with open(cookies_path, 'r') as f:
                 cookie_data = json.load(f)
@@ -99,7 +108,11 @@ class DeepSeekAPI:
             time.sleep(2)
 
             # Reload cookies
-            cookies_path = Path(__file__).parent / 'cookies.json'
+            cookies_dir = os.getenv('COOKIES_DIR')
+            if cookies_dir and Path(cookies_dir).is_dir():
+                cookies_path = Path(cookies_dir) / 'cookies.json'
+            else:
+                cookies_path = Path(__file__).parent / 'cookies.json'
             with open(cookies_path, 'r') as f:
                 cookie_data = json.load(f)
                 self.cookies = cookie_data.get('cookies', {})
@@ -149,7 +162,10 @@ class DeepSeekAPI:
                 elif response.status_code != 200:
                     raise APIError(f"API request failed: {response.text}", response.status_code)
 
-                return response.json()
+                try:
+                    return response.json()
+                except ValueError:
+                    raise APIError("Empty or non-JSON response from server", response.status_code)
 
             except requests.exceptions.RequestException as e:
                 raise NetworkError(f"Network error occurred: {str(e)}")
@@ -166,7 +182,7 @@ class DeepSeekAPI:
                 {'target_path': '/api/v0/chat/completion'}
             )
             return response['data']['biz_data']['challenge']
-        except KeyError:
+        except (KeyError, TypeError):
             raise APIError("Invalid challenge response format from server")
 
     def create_chat_session(self) -> str:
@@ -178,7 +194,7 @@ class DeepSeekAPI:
                 {'character_id': None}
             )
             return response['data']['biz_data']['id']
-        except KeyError:
+        except (KeyError, TypeError):
             raise APIError("Invalid session creation response format from server")
 
     def chat_completion(self,

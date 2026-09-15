@@ -2,6 +2,13 @@
 
 A Python package for interacting with the DeepSeek AI chat API. This package provides a clean interface to interact with DeepSeek's chat model, with support for streaming responses, thinking process visibility, and web search capabilities.
 
+## 🍴 Fork Notice
+
+> This repository is a **fork** of [blastbeng/deepseek4free](https://github.com/blastbeng/deepseek4free).
+> All credit for the original reverse-engineered DeepSeek API client, the WASM proof-of-work implementation, and the Cloudflare bypass goes to [@blastbeng](https://github.com/blastbeng) — huge thanks! 🙏
+>
+> This fork extends the original library with an **OpenAI-compatible API server** (`/v1/chat/completions`, `/v1/models`) suitable for agent coding tools (e.g. [aider](https://aider.chat) / aiderdesk), plus full **Docker / docker-compose** packaging.
+
 ### Learn how to reverse engineer private api's !!
 - and reverse wasm like it was required here
 - [whop.com/reverser-academy](https://whop.com/reverser-academy/) (beta)
@@ -91,7 +98,96 @@ You only need to run this when:
 
 The captured cookie will be stored in `dsk/cookies.json` and automatically used by the API.
 
-## 📚 Usage
+## 🐳 Docker (OpenAI-compatible server)
+
+The easiest way to run DeepSeek4Free is as an OpenAI-compatible server in Docker. It exposes the standard OpenAI endpoints (`/v1/chat/completions`, `/v1/models`) so it works with **aider, aiderdesk, OpenWebUI, LiteLLM, LibreChat, the `openai` SDK**, and any other tool that speaks the OpenAI API.
+
+### 1. Configure your token
+
+```bash
+cp .env.example .env
+# then edit .env and set DEEPSEEK_AUTH_TOKEN
+```
+
+### 2. Start the server
+
+```bash
+docker compose up -d --build
+```
+
+The API is now available at `http://localhost:8000/v1`.
+
+### 3. Point your tools at it
+
+**aider / aiderdesk** (`~/.aider.conf.yml` or env):
+```bash
+export OPENAI_API_BASE=http://localhost:8000/v1
+export OPENAI_API_KEY=anything          # or your DSF_API_KEY value
+aider --model openai/deepseek-chat
+```
+
+**openai python sdk**
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="anything")
+resp = client.chat.completions.create(
+    model="deepseek-reasoner",
+    messages=[{"role": "user", "content": "Hello!"}],
+    stream=True,
+)
+for chunk in resp:
+    print(chunk.choices[0].delta.content or "", end="")
+```
+
+### Exposed models
+
+| Model | Maps to |
+|---|---|
+| `deepseek-reasoner` | DeepSeek with thinking process enabled |
+| `deepseek-chat` | DeepSeek without thinking process |
+| `deepseek-search` | DeepSeek with web search enabled |
+
+Streaming responses include the model's reasoning as `reasoning_content` deltas for `deepseek-reasoner`.
+
+### Configuration (env vars)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEEPSEEK_AUTH_TOKEN` | — | Your DeepSeek userToken (required unless provided per-request as API key) |
+| `DSF_API_KEY` | *(none)* | If set, clients must send this as `Authorization: Bearer <key>` |
+| `DSF_PORT` | `8000` | Host port binding |
+| `DSF_HOST` | `0.0.0.0` | Server bind host (non-Docker runs) |
+| `DSF_MODEL_THINKER` | `deepseek-reasoner` | Name of the thinking-enabled model |
+| `DSF_MODEL_FAST` | `deepseek-chat` | Name of the fast model |
+| `DSF_MODEL_SEARCH` | `deepseek-search` | Name of the web-search model |
+
+### Alternative: pass your token as the API key
+
+You can skip `DEEPSEEK_AUTH_TOKEN` entirely and pass your DeepSeek userToken **as the OpenAI API key** — the server uses it directly:
+
+```bash
+aider --model openai/deepseek-chat --openai-api-base http://localhost:8000/v1 \
+      --openai-api-key <your_userToken>
+```
+
+### Cloudflare cookies in Docker
+
+If requests get blocked by Cloudflare, obtain a `cf_clearance` cookie once (needs a real display, run outside Docker or with `DOCKERMODE=true` which uses Xvfb):
+
+```bash
+python -m dsk.bypass    # writes dsk/cookies.json
+```
+
+The `dsf-data` Docker volume persists cookies at `/data/cookies.json` between restarts; `dsk/api.py` reads them automatically.
+
+### Local (non-Docker) run
+
+```bash
+pip install -r requirements.txt
+DEEPSEEK_AUTH_TOKEN=yourtoken python -m dsk.openai_server
+```
+
+## 📚 Original Library Usage
 
 ### Basic Example
 

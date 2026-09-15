@@ -1,0 +1,26 @@
+services:
+  deepseek4free:
+    build: .
+    image: deepseek4free:latest
+    container_name: deepseek4free
+    # Lifecycle managed by systemd (docker-compose@.service)
+    restart: no
+    ports:
+      - "${DSF_PORT:-8000}:8000"
+    environment:
+      # Your DeepSeek userToken (JSON.parse(localStorage.getItem("userToken")).value)
+      - DEEPSEEK_AUTH_TOKEN=${DEEPSEEK_AUTH_TOKEN:-}
+      # Optional: require clients to send this as their API key
+      - DSF_API_KEY=${DSF_API_KEY:-}
+      # Optional: override model names exposed on /v1/models
+      - DSF_MODEL_THINKER=${DSF_MODEL_THINKER:-deepseek-reasoner}
+      - DSF_MODEL_FAST=${DSF_MODEL_FAST:-deepseek-chat}
+      - DSF_MODEL_SEARCH=${DSF_MODEL_SEARCH:-deepseek-search}
+      - DOCKERMODE=true
+    volumes:
+      # Persist cf_clearance cookies across container restarts
+      - dsf-data:/data
+    shm_size: "1gb"
+
+volumes:
+  dsf-data:
