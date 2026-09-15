@@ -343,6 +343,50 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 
 ---
 
+## 🔄 Credential refresher (default ON)
+
+The service keeps its web sessions alive **autonomously** — no human re-copying cookies. `GET /health` exposes the live state under `refresher`.
+
+**Renewal ladder** (run when a self-heal probe classifies a provider as `auth`, or proactively every `DSF_REFRESHER_TTL`):
+
+1. **HTTP cookie refresh** (always) — Gemini/ChatGPT cookie jars are rotated over plain HTTP; DeepSeek is verified with a live probe (its `userToken` only changes on login).
+2. **Headless-browser re-login** (default ON) — re-signs-in with the per-provider login credentials below inside the container's Chromium and exports the fresh token/cookies.
+3. **Auto-signup** (default ON, DeepSeek) — when even the login is dead, a brand-new free account is created. If no `DEEPSEEK_LOGIN_EMAIL` is configured, the address is **auto-generated**:
+   - your own **catch-all IMAP domain** (`DSF_MAIL_DOMAIN` + IMAP settings) — random local parts, OTP read from your mailbox; or
+   - a **mail.tm throwaway mailbox** (public temp-mail, zero configuration) as fallback.
+
+All rungs respect per-provider cooldowns and daily attempt caps; every action is logged to `data/refresher/history.jsonl` (`python -m dsk.refresher status`). Everything can be disabled: `DSF_REFRESHER=false`, `DSF_REFRESHER_LOGIN=false`, `DSF_REFRESHER_AUTOSIGNUP=false`, `DSF_MAIL_AUTOGEN=false`.
+
+Bot-written credential files (`data/deepseek_token`, `data/gemini_cookies.json`, `data/chatgpt_cookies.json`) **win over** the env vars — delete a file to hand control back to the environment.
+
+```bash
+# environment variables (all shown with their defaults)
+DSF_REFRESHER=true
+DSF_REFRESHER_TTL=21600        # proactive refresh cycle, seconds
+DSF_REFRESHER_COOLDOWN=1800    # per-provider cooldown after an attempt
+DSF_REFRESHER_MAX_RENEWS=6     # daily attempt budget per provider
+DSF_REFRESHER_LOGIN=true       # rung 2: headless re-login
+DSF_REFRESHER_AUTOSIGNUP=true  # rung 3: create fresh accounts
+DSF_MAIL_AUTOGEN=true          # auto-create throwaway mailboxes
+DSF_MAIL_DOMAIN=               # your catch-all domain (optional; else mail.tm)
+DSF_MAIL_IMAP_HOST=            # IMAP mailbox for OTP delivery
+DSF_MAIL_IMAP_PORT=993
+DSF_MAIL_IMAP_USER=
+DSF_MAIL_IMAP_PASS=
+DSF_MAIL_OTP_SENDER=deepseek   # sender substring filter
+DSF_MAIL_OTP_MAX_AGE=30        # ignore older mail, minutes
+DSF_MAIL_OTP_REGEX=\b(\d{6})\b # code extraction
+
+DEEPSEEK_LOGIN_EMAIL=          # optional; autogen e-mail is used when empty
+DEEPSEEK_LOGIN_PASSWORD=
+GEMINI_LOGIN_EMAIL=
+GEMINI_LOGIN_PASSWORD=
+CHATGPT_LOGIN_EMAIL=
+CHATGPT_LOGIN_PASSWORD=
+```
+
+---
+
 ## ☁️ Cloudflare cookies
 
 In normal operation cookies are fetched and refreshed automatically. If you hit persistent Cloudflare errors:

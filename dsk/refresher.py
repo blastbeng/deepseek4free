@@ -12,8 +12,8 @@ strategies is, from cheapest to most invasive:
        deepseek  nothing to rotate over HTTP (the userToken only changes on
                  login) — verified with a live probe instead
 
-  2. Headless-browser re-login (opt-in: DSF_REFRESHER_LOGIN=true plus
-     per-provider credentials). Uses the same DrissionPage/Chromium stack as
+  2. Headless-browser re-login (default ON: DSF_REFRESHER_LOGIN=true, set
+     false to disable). Uses the same DrissionPage/Chromium stack as
      the Cloudflare bypass; exports the fresh cookies/token automatically.
        DEEPSEEK_LOGIN_EMAIL / DEEPSEEK_LOGIN_PASSWORD
        CHATGPT_LOGIN_EMAIL  / CHATGPT_LOGIN_PASSWORD
@@ -22,10 +22,13 @@ strategies is, from cheapest to most invasive:
      Email verification codes (OTP) during login are fetched from an IMAP
      mailbox (see DSF_MAIL_* below), so the loop stays unmanned.
 
-  3. Account auto-signup (experimental, deepseek only, opt-in:
-     DSF_REFRESHER_AUTOSIGNUP=true). Creates a fresh free account with
-     DEEPSEEK_LOGIN_EMAIL/DEEPSEEK_LOGIN_PASSWORD + IMAP OTP when even the
-     login session is dead.
+  3. Account auto-signup (default ON, deepseek only: DSF_REFRESHER_AUTOSIGNUP).
+     Creates a fresh free account when even the login session is dead. With
+     no DEEPSEEK_LOGIN_EMAIL/PASSWORD configured, the e-mail address is
+     AUTO-GENERATED (dsk/mailgen.py): a catch-all IMAP domain
+     (DSF_MAIL_DOMAIN) when available, else a mail.tm throwaway account —
+     the verification code is read from that mailbox automatically. Disable
+     the auto-generation with DSF_MAIL_AUTOGEN=false.
 
 Renewals are triggered two ways: the self-healing daemon calls ``renew``
 whenever a provider probe classifies as ``auth``, and the refresher daemon
@@ -38,9 +41,12 @@ README): data/deepseek_token, data/gemini_cookies.json, data/chatgpt_cookies.jso
 Delete the file to hand control back to the environment.
 
 Mail config (for OTP during browser flows):
+    DSF_MAIL_AUTOGEN       auto-create throwaway mailboxes (default true)
+    DSF_MAIL_DOMAIN        catch-all domain for autogen (optional; without
+                           it mail.tm public temp-mail is used)
     DSF_MAIL_IMAP_HOST / _PORT (993) / _USER / _PASS
     DSF_MAIL_OTP_SENDER    substring matched against the sender (default deepseek)
-    DSF_MAIL_OTP_REGEX     code regex (default \\b(\\d{6})\\b)
+    DSF_MAIL_OTP_REGEX     code regex (default \\\\b(\\\\d{6})\\\\b)
     DSF_MAIL_OTP_MAX_AGE   ignore older mail, minutes (default 30)
 
 CLI:
@@ -48,6 +54,7 @@ CLI:
     python -m dsk.refresher refresh gemini
     python -m dsk.refresher login deepseek
     python -m dsk.refresher signup
+    python -m dsk.refresher mailgen   (create a throwaway mailbox as a test)
 """
 
 import imaplib
@@ -61,6 +68,8 @@ from email import message_from_bytes
 from email.header import decode_header
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from . import mailgen
 
 _BASE = Path(__file__).resolve().parent
 
@@ -267,8 +276,12 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
 
 
 # ------------------------------------------------------------------ IMAP OTP
-def imap_otp(max_wait_s: int = 120) -> Optional[str]:
-    """Poll the configured IMAP mailbox for a fresh verification code."""
+def imap_otp(max_wait_s: int = 120, to_needle: Optional[str] = None) -> Optional[str]:
+    """Poll the configured IMAP mailbox for a fresh verification code.
+
+    ``to_needle`` restricts matches to mails addressed to that recipient —
+    used by the catch-all autogen backend so unrelated codes are ignored.
+    """
     host = os.getenv('DSF_MAIL_IMAP_HOST', '').strip()
     if not host:
         return None
@@ -291,6 +304,12 @@ def imap_otp(max_wait_s: int = 120) -> Optional[str]:
                 if not msg_data or not msg_data[0]:
                     continue
                 msg = message_from_bytes(msg_data[0][1])
+                if to_needle:
+                    recipients = ' '.join(str(msg.get(h, ''))
+                                          for h in ('To', 'Delivered-To',
+                                                    'X-Original-To')).lower()
+                    if to_needle.lower() not in recipients:
+                        continue
                 sender = str(msg.get('From', '')).lower()
                 if sender_needle and sender_needle not in sender:
                     continue
@@ -493,10 +512,26 @@ def browser_login(name: str) -> Tuple[bool, str]:
 
 
 def signup_deepseek() -> Tuple[bool, str]:
-    """EXPERIMENTAL: create a fresh DeepSeek account with the login creds."""
+    """Create a fresh DeepSeek account — fully autonomous when possible.
+
+    Credentials ladder:
+      1. DEEPSEEK_LOGIN_EMAIL / DEEPSEEK_LOGIN_PASSWORD if configured;
+      2. otherwise an auto-generated throwaway mailbox (dsk/mailgen.py):
+         catch-all IMAP domain when DSF_MAIL_DOMAIN is set, else a mail.tm
+         temp account. The verification code is read from that mailbox, so
+         no human and no pre-existing account are needed.
+    """
     email, password = _creds('deepseek')
+    session = None
+    generated = False
     if not email or not password:
-        return False, 'no DEEPSEEK_LOGIN_EMAIL/PASSWORD configured'
+        if not mailgen.autogen_enabled():
+            return False, 'no DEEPSEEK_LOGIN_EMAIL/PASSWORD and mail autogen off'
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email, password = session['address'], session['password']
+        generated = True
     try:
         page = _browser()
     except Exception as e:  # noqa: BLE001
@@ -508,7 +543,13 @@ def signup_deepseek() -> Tuple[bool, str]:
             return False, 'email field not found'
         _fill_first(page, _PASSWORD_SELECTORS, password)
         _click_any(page, ['Send Code', 'Send code', '获取验证码'])
-        code = imap_otp(max_wait_s=180)
+        if generated:
+            code = mailgen.fetch_otp(session, max_wait_s=180)
+            if not code:
+                # fall back to the plain IMAP poller (no recipient filter)
+                code = imap_otp(max_wait_s=30)
+        else:
+            code = imap_otp(max_wait_s=180)
         if not code:
             return False, 'signup code email not found in mailbox'
         if not _fill_first(page, ['@placeholder:code', '@placeholder:Code',
@@ -519,7 +560,9 @@ def signup_deepseek() -> Tuple[bool, str]:
         _export_cookies(page, 'deepseek', ('deepseek.com',))
         if token:
             _save_deepseek_token(token)
-            return True, 'account created, userToken captured'
+            via = f'account created (autogen {session["backend"]}: {email})' \
+                if generated else 'account created'
+            return True, f'{via}, userToken captured'
         return False, 'signup finished but no userToken appeared'
     except Exception as e:  # noqa: BLE001
         return False, f'signup flow failed: {type(e).__name__}: {e}'
@@ -579,7 +622,7 @@ def _renew_locked(name: str, reason: str) -> Dict[str, Any]:
         _log_history(name, 'renewed', '; '.join(steps))
         return {'renewed': True, 'via': 'http-refresh', 'steps': steps}
 
-    if _env_bool('DSF_REFRESHER_LOGIN', False):
+    if _env_bool('DSF_REFRESHER_LOGIN', True):
         ok, detail = browser_login(name)
         steps.append(f'login: {detail}')
         _log_history(name, 'browser-login', detail)
@@ -588,7 +631,7 @@ def _renew_locked(name: str, reason: str) -> Dict[str, Any]:
             _log_history(name, 'renewed', '; '.join(steps))
             return {'renewed': True, 'via': 'browser-login', 'steps': steps}
 
-    if name == 'deepseek' and _env_bool('DSF_REFRESHER_AUTOSIGNUP', False):
+    if name == 'deepseek' and _env_bool('DSF_REFRESHER_AUTOSIGNUP', True):
         ok, detail = signup_deepseek()
         steps.append(f'signup: {detail}')
         _log_history(name, 'autosignup', detail)
@@ -653,8 +696,9 @@ def status() -> Dict[str, Any]:
     return {'enabled': _env_bool('DSF_REFRESHER', True),
             'daemon': started,
             'ttl': _ttl(),
-            'browser_login': _env_bool('DSF_REFRESHER_LOGIN', False),
-            'autosignup': _env_bool('DSF_REFRESHER_AUTOSIGNUP', False),
+            'browser_login': _env_bool('DSF_REFRESHER_LOGIN', True),
+            'autosignup': _env_bool('DSF_REFRESHER_AUTOSIGNUP', True),
+            'mail_autogen': mailgen.autogen_enabled(),
             'mail_configured': bool(os.getenv('DSF_MAIL_IMAP_HOST', '').strip()),
             'credentials': {p: bool(all(_creds(p))) for p in REFRESH},
             'last_results': results}
@@ -673,6 +717,12 @@ def main(argv: List[str]) -> int:  # pragma: no cover - CLI
         return 0
     if cmd == 'signup':
         print(json.dumps(dict(zip(('ok', 'detail'), signup_deepseek())), indent=2))
+        return 0
+    if cmd == 'mailgen':
+        session, err = mailgen.create_email()
+        print(json.dumps({'ok': bool(session),
+                          'detail': session or err,
+                          'address': (session or {}).get('address')}, indent=2))
         return 0
     print(__doc__)
     return 1
