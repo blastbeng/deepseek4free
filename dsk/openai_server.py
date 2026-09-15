@@ -9,6 +9,9 @@ ChatGPT for free, plus a built-in llama.cpp-style playground UI:
     POST /v1/chat/completions  streaming + non-streaming
     GET  /v1/models
     GET  /health
+    GET  /selfheal/status      self-maintenance (selfheal + refresher) status
+    POST /selfheal/probe       force a probe cycle (heal/renew on failure)
+    POST /selfheal/refresh     force a credential refresh cycle
 
 Configuration (env):
     DSF_API_KEY       optional API key clients must send as Bearer token
@@ -36,6 +39,7 @@ Run:  python -m dsk.openai_server
 import json
 import os
 import queue
+import re
 import time
 import uuid
 import secrets
@@ -43,7 +47,7 @@ import threading
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
@@ -73,12 +77,22 @@ DEFAULT_MODEL = ROUTER.routes[os.getenv("DSF_MODEL_FAST", "deepseek-chat").strip
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Kick off dynamic model discovery in a background thread (never blocks
-    startup; failures are tolerated and logged by the router)."""
+    """Kick off dynamic model discovery and the self-maintenance daemons in
+    background threads (never blocks startup; failures are tolerated)."""
     threading.Thread(
         target=ROUTER.refresh_models, kwargs={"force": True},
         name="model-discovery", daemon=True,
     ).start()
+    try:
+        from . import selfheal as _selfheal
+        _selfheal.start_daemon()
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[selfheal] daemon unavailable: {exc}")
+    try:
+        from . import refresher as _refresher
+        _refresher.start_daemon()
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[refresher] daemon unavailable: {exc}")
     yield
 
 
@@ -160,12 +174,25 @@ def _build_prompt(messages: List[ChatMessage]) -> str:
             rendered.append(f"[System]\n{text}")
         elif role == "assistant":
             if msg.tool_calls:
+                # Re-render past calls in the exact protocol the model was
+                # taught (TOOL_CALL: {...}) so it recognizes its own behavior
+                # instead of learning a second, inconsistent format.
                 calls = []
-                raw_calls = msg.tool_calls if isinstance(msg.tool_calls, list) else [msg.tool_calls]
+                raw_calls = (msg.tool_calls if isinstance(msg.tool_calls, list)
+                             else [msg.tool_calls])
                 for tc in raw_calls:
                     fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                    calls.append(f"{fn.get('name', '?')}({fn.get('arguments', '')})")
-                suffix = f"\nTool calls: " + "; ".join(calls) if calls else ""
+                    raw_args = fn.get("arguments", "{}")
+                    try:
+                        args_obj = (json.loads(raw_args)
+                                    if isinstance(raw_args, str) else raw_args)
+                    except ValueError:
+                        args_obj = raw_args
+                    payload = {"name": fn.get("name", "?"),
+                               "arguments": args_obj if args_obj is not None else {}}
+                    calls.append(_TOOL_MARKER.strip() + " "
+                                 + json.dumps(payload, ensure_ascii=False))
+                suffix = "\n" + "\n".join(calls) if calls else ""
                 rendered.append(f"[Assistant]\n{text}{suffix}")
             else:
                 rendered.append(f"[Assistant]\n{text}")
@@ -180,6 +207,102 @@ def _build_prompt(messages: List[ChatMessage]) -> str:
 
 
 _TOOL_MARKER = "TOOL_CALL: "
+# LLMs routinely mangle the exact marker (bold, backticks, missing space,
+# lowercase, full-width colon). Accept all of these variants:
+_TOOL_CALL_RE = re.compile(
+    r"[`*]{0,3}(?:TOOL[\s_\-]?CALL)[`*]{0,3}\s*(?::|：|=)\s*[`*]{0,3}",
+    re.IGNORECASE,
+)
+
+
+def _loads_repaired(raw: str):
+    """json.loads with pragmatic repairs for typical LLM quirks (smart
+    quotes, trailing commas). Returns None when unrecoverable."""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+    fixed = (raw.replace("\u201c", '"').replace("\u201d", '"')
+             .replace("\u2018", "'").replace("\u2019", "'"))
+    try:
+        return json.loads(fixed)
+    except ValueError:
+        pass
+    fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+    try:
+        return json.loads(fixed)
+    except ValueError:
+        return None
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Find and parse the first balanced JSON object in *text*."""
+    depth = 0
+    start: Optional[int] = None
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    obj = _loads_repaired(text[start:i + 1])
+                    if isinstance(obj, dict):
+                        return obj
+                    start = None
+    return None
+
+
+def _parse_tool_calls(text: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Extract (pre_text, [{name, arguments}, ...]) from model output.
+
+    Tolerates marker variants, junk around the JSON payload and malformed
+    JSON (best-effort repair). Returns all calls found (parallel tool calls
+    are supported); pre_text is whatever the model wrote before the first
+    marker."""
+    calls: List[Dict[str, str]] = []
+    pre_end = len(text)
+    for match in _TOOL_CALL_RE.finditer(text):
+        payload = _extract_json_object(text[match.end():])
+        if payload is None:
+            break
+        name = payload.get("name") or payload.get("tool") or payload.get("tool_name")
+        if not name:
+            break
+        args = payload.get("arguments",
+                           payload.get("args", payload.get("parameters", {})))
+        if not isinstance(args, str):
+            args = json.dumps(args if isinstance(args, dict) else {},
+                              ensure_ascii=False)
+        calls.append({"name": str(name), "arguments": args})
+        pre_end = min(pre_end, match.start())
+        if len(calls) >= 8:  # hard cap on parallel calls
+            break
+    if not calls:
+        return text, []
+    return text[:pre_end].strip(), calls
+
+
+def _parse_tool_call(text: str):
+    """Returns (pre_text, tool_name, arguments_json_str) or (text, None, None)."""
+    pre, calls = _parse_tool_calls(text)
+    if calls:
+        return pre, calls[0]["name"], calls[0]["arguments"]
+    return text, None, None
 
 
 def _render_tool_instructions(tools: List[Dict[str, Any]], tool_choice: Any) -> str:
@@ -219,59 +342,6 @@ def _render_tool_instructions(tools: List[Dict[str, Any]], tool_choice: Any) -> 
     return "\n".join(lines)
 
 
-def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Find and parse the first balanced JSON object in *text*."""
-    depth = 0
-    start: Optional[int] = None
-    in_str = False
-    esc = False
-    for i, ch in enumerate(text):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    try:
-                        obj = json.loads(text[start:i + 1])
-                        if isinstance(obj, dict):
-                            return obj
-                    except ValueError:
-                        pass
-                    start = None
-    return None
-
-
-def _parse_tool_call(text: str):
-    """Returns (pre_text, tool_name, arguments_json_str) or (text, None, None)."""
-    idx = text.find(_TOOL_MARKER)
-    if idx == -1:
-        return text, None, None
-    pre = text[:idx].strip()
-    payload = _extract_json_object(text[idx + len(_TOOL_MARKER):])
-    if payload is None:
-        return text, None, None
-    name = payload.get("name") or payload.get("tool") or payload.get("tool_name")
-    if not name:
-        return text, None, None
-    args = payload.get("arguments", payload.get("args", {}))
-    if not isinstance(args, str):
-        args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
-    return pre, str(name), args
-
-
 def _chunk_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
@@ -301,7 +371,61 @@ async def health():
         proxy_summary = _proxies.active_summary()
     except Exception:
         proxy_summary = 'unavailable'
-    return {"status": "ok", "proxy": proxy_summary}
+    try:
+        from . import selfheal as _selfheal
+        selfheal_summary = _selfheal.status()
+    except Exception:
+        selfheal_summary = 'unavailable'
+    try:
+        from . import refresher as _refresher
+        refresher_summary = _refresher.status()
+    except Exception:
+        refresher_summary = 'unavailable'
+    return {"status": "ok", "proxy": proxy_summary,
+            "selfheal": selfheal_summary, "refresher": refresher_summary}
+
+
+@app.get("/selfheal/status")
+async def selfheal_status():
+    """Self-maintenance status: upstream health probes, auto-patch incidents
+    and credential-renewal bookkeeping."""
+    out: dict = {}
+    try:
+        from . import selfheal as _selfheal
+        out["selfheal"] = _selfheal.status()
+    except Exception as exc:
+        out["selfheal"] = {"error": str(exc)}
+    try:
+        from . import refresher as _refresher
+        out["refresher"] = _refresher.status()
+    except Exception as exc:
+        out["refresher"] = {"error": str(exc)}
+    return out
+
+
+@app.post("/selfheal/probe")
+async def selfheal_probe():
+    """Force a probe cycle now: structural failures trigger LLM auto-patching,
+    auth failures trigger credential renewal (on-demand, daemon-independent)."""
+    try:
+        from . import selfheal as _selfheal
+        results = await asyncio.get_running_loop().run_in_executor(
+            None, _selfheal.probe_cycle)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"probed": results}
+
+
+@app.post("/selfheal/refresh")
+async def selfheal_refresh():
+    """Force a credential refresh cycle now (HTTP cookie/token refresh rung)."""
+    try:
+        from . import refresher as _refresher
+        results = await asyncio.get_running_loop().run_in_executor(
+            None, _refresher.refresh_cycle)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"refreshed": results}
 
 
 @app.get("/")
@@ -403,23 +527,23 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         return _error_response(str(e), err_type, code, status)
 
     full_text = "".join(content_parts)
-    pre_text, tool_name, tool_args = (full_text, None, None)
+    pre_text, calls = full_text, []
     if use_tools:
-        pre_text, tool_name, tool_args = _parse_tool_call(full_text)
+        pre_text, calls = _parse_tool_calls(full_text)
 
     message: Dict[str, Any] = {
         "role": "assistant",
-        "content": pre_text if tool_name else full_text,
+        "content": pre_text if calls else full_text,
     }
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
     finish_reason = "stop"
-    if tool_name:
+    if calls:
         message["tool_calls"] = [{
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
-            "function": {"name": tool_name, "arguments": tool_args},
-        }]
+            "function": {"name": c["name"], "arguments": c["arguments"]},
+        } for c in calls]
         finish_reason = "tool_calls"
 
     return {
@@ -488,9 +612,61 @@ async def _stream_completion(
     # for cross-thread put_nowait and can deadlock the event loop).
     q: "queue.Queue[Optional[str]]" = queue.Queue()
     finish_holder = {"reason": "stop"}
+    errored = {"flag": False}
 
     def _worker():
-        buffered_text: List[str] = []
+        # Tool-call responses are parsed authoritatively at stream end, but
+        # text is emitted incrementally: a holdback window keeps a partially-
+        # arrived TOOL_CALL marker from leaking into content deltas. Once a
+        # marker is detected the boundary is frozen and everything after it
+        # is buffered until the final parse decides tool_calls vs plain text.
+        holdback = 64   # chars withheld while no marker has been seen
+        rescan = 32     # marker re-scan overlap before the last emit point
+        text = ""
+        emitted = 0                      # chars already sent as content deltas
+        scanned = 0                      # marker-search cursor
+        boundary: Optional[int] = None   # start of the tool-call section
+
+        def _emit_upto(upto: int) -> None:
+            nonlocal emitted
+            if upto <= emitted:
+                return
+            data = {
+                "id": cid, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": text[emitted:upto]},
+                    "finish_reason": None,
+                }],
+            }
+            q.put(_sse(data))
+            emitted = upto
+
+        def _tool_deltas(calls: List[Dict[str, str]]) -> None:
+            for i, call in enumerate(calls):
+                q.put(_sse({
+                    "id": cid, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": [{
+                            "index": i,
+                            "id": f"call_{uuid.uuid4().hex[:24]}",
+                            "type": "function",
+                            "function": {"name": call["name"],
+                                         "arguments": call["arguments"]},
+                        }]},
+                        "finish_reason": None,
+                    }],
+                }))
+
+        def _flush_prose() -> None:
+            # On upstream failure hand back whatever prose was received so
+            # the client loses nothing; raw tool-call sections stay hidden.
+            if boundary is None:
+                _emit_upto(len(text))
+
         try:
             for chunk in chunk_gen:
                 ctype = chunk.get("type", "")
@@ -498,66 +674,56 @@ async def _stream_completion(
                 if not content:
                     continue
                 if ctype == "thinking":
-                    payload = {"reasoning_content": content}
-                elif use_tools:
-                    # Tool-call responses must be parsed as a whole, so the
-                    # text is buffered and emitted after the stream ends.
-                    buffered_text.append(content)
+                    q.put(_sse({
+                        "id": cid, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"reasoning_content": content},
+                            "finish_reason": None,
+                        }],
+                    }))
                     continue
+                text += content
+                if not use_tools:
+                    _emit_upto(len(text))
+                    continue
+                if boundary is not None:
+                    continue  # inside the tool-call section: buffer only
+                match = _TOOL_CALL_RE.search(text, scanned)
+                if match:
+                    boundary = match.start()
+                    _emit_upto(boundary)
                 else:
-                    payload = {"content": content}
-                data = {
-                    "id": cid,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {"index": 0, "delta": payload, "finish_reason": None}
-                    ],
-                }
-                q.put(_sse(data))
+                    safe = max(0, len(text) - holdback)
+                    scanned = max(0, safe - rescan)
+                    _emit_upto(safe)
 
             if use_tools:
-                pre_text, tool_name, tool_args = _parse_tool_call("".join(buffered_text))
-                if tool_name:
-                    if pre_text:
-                        q.put(_sse({
-                            "id": cid, "object": "chat.completion.chunk",
-                            "created": created, "model": model,
-                            "choices": [{"index": 0,
-                                         "delta": {"content": pre_text},
-                                         "finish_reason": None}],
-                        }))
-                    q.put(_sse({
-                        "id": cid, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0,
-                                     "delta": {"tool_calls": [{
-                                         "index": 0,
-                                         "id": f"call_{uuid.uuid4().hex[:24]}",
-                                         "type": "function",
-                                         "function": {"name": tool_name,
-                                                      "arguments": tool_args},
-                                     }]},
-                                     "finish_reason": None}],
-                    }))
+                _pre, calls = _parse_tool_calls(text)
+                if calls:
+                    if boundary is not None:
+                        _emit_upto(boundary)  # release any prose tail
+                    _tool_deltas(calls)
                     finish_holder["reason"] = "tool_calls"
-                elif buffered_text:
-                    q.put(_sse({
-                        "id": cid, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0,
-                                     "delta": {"content": "".join(buffered_text)},
-                                     "finish_reason": None}],
-                    }))
+                else:
+                    # No valid call: flush everything, including any raw
+                    # marker the model produced, as plain content.
+                    _emit_upto(len(text))
             q.put(None)
         except ProviderAuthError as e:
+            errored["flag"] = True
+            _flush_prose()
             q.put(_error_sse(str(e), "invalid_request_error", "invalid_token"))
             q.put(None)
         except ProviderRateLimitError as e:
+            errored["flag"] = True
+            _flush_prose()
             q.put(_error_sse(f"Rate limit: {e}", "rate_limit_error", "rate_limit"))
             q.put(None)
         except ProviderError as e:
+            errored["flag"] = True
+            _flush_prose()
             q.put(_error_sse(str(e)))
             q.put(None)
 
@@ -570,29 +736,33 @@ async def _stream_completion(
             if item is None:
                 break
             yield item
-        done = {
-            "id": cid,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [
-                {"index": 0, "delta": {}, "finish_reason": finish_holder["reason"]}
-            ],
-        }
-        yield _sse(done)
-        if include_usage:
-            yield _sse({
+        if not errored["flag"]:
+            # Suppress the finish chunk on upstream failure: an error event
+            # followed by a normal stop would let clients treat the stream
+            # as a successful (truncated) completion.
+            done = {
                 "id": cid,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": prompt_len // 4,
-                    "completion_tokens": 0,
-                    "total_tokens": prompt_len // 4,
-                },
-            })
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": finish_holder["reason"]}
+                ],
+            }
+            yield _sse(done)
+            if include_usage:
+                yield _sse({
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt_len // 4,
+                        "completion_tokens": 0,
+                        "total_tokens": prompt_len // 4,
+                    },
+                })
     finally:
         yield "data: [DONE]\n\n"
 
