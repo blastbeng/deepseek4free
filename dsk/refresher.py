@@ -22,13 +22,19 @@ strategies is, from cheapest to most invasive:
      Email verification codes (OTP) during login are fetched from an IMAP
      mailbox (see DSF_MAIL_* below), so the loop stays unmanned.
 
-  3. Account auto-signup (default ON, deepseek only: DSF_REFRESHER_AUTOSIGNUP).
-     Creates a fresh free account when even the login session is dead. With
-     no DEEPSEEK_LOGIN_EMAIL/PASSWORD configured, the e-mail address is
-     AUTO-GENERATED (dsk/mailgen.py): a catch-all IMAP domain
-     (DSF_MAIL_DOMAIN) when available, else a mail.tm throwaway account —
-     the verification code is read from that mailbox automatically. Disable
-     the auto-generation with DSF_MAIL_AUTOGEN=false.
+  3. Account auto-signup (default ON for ALL providers:
+     DSF_REFRESHER_AUTOSIGNUP). Creates a fresh free account when even the
+     login session is dead — and BOOTSTRAPS providers that have no
+     credentials at all (the refresher daemon signs every missing provider
+     up on its first cycle, so a fresh install comes up unattended). The
+     e-mail address is AUTO-GENERATED (dsk/mailgen.py): a catch-all IMAP
+     domain (DSF_MAIL_DOMAIN) when available, else a mail.tm throwaway
+     account — the verification code is read from that mailbox
+     automatically. Disable the auto-generation with DSF_MAIL_AUTOGEN=false.
+     Created accounts are persisted to data/accounts.json so later renewal
+     cycles can re-login with them. Google/OpenAI may still throw captcha
+     or phone walls at automation — those rungs are best effort and their
+     failures surface in history.jsonl like any other ladder miss.
 
 Renewals are triggered two ways: the self-healing daemon calls ``renew``
 whenever a provider probe classifies as ``auth``, and the refresher daemon
@@ -53,7 +59,8 @@ CLI:
     python -m dsk.refresher status
     python -m dsk.refresher refresh gemini
     python -m dsk.refresher login deepseek
-    python -m dsk.refresher signup
+    python -m dsk.refresher signup [deepseek|chatgpt|gemini]
+    python -m dsk.refresher bootstrap   (create credentials for every provider that has none)
     python -m dsk.refresher mailgen   (create a throwaway mailbox as a test)
 """
 
@@ -203,6 +210,61 @@ def _save_deepseek_token(token: str) -> Path:
     except OSError:
         pass
     return path
+
+
+# -------------------------------------------------- credential bootstrap
+def _has_creds(name: str) -> bool:
+    """True when the provider has any usable credential (file or env).
+
+    Used to decide whether the daemon must bootstrap (auto-signup) a
+    provider. For deepseek only the userToken counts — bypass cookies
+    alone cannot serve requests."""
+    if name == 'deepseek':
+        if os.getenv('DEEPSEEK_AUTH_TOKEN', '').strip():
+            return True
+        try:
+            f = _data_dir() / 'deepseek_token'
+            return bool(f.is_file() and f.read_text(encoding='utf-8').strip())
+        except OSError:
+            return False
+    if name == 'chatgpt':
+        if (os.getenv('CHATGPT_ACCESS_TOKEN', '')
+                or os.getenv('CHATGPT_SESSION_TOKEN', '')).strip():
+            return True
+        if os.getenv('CHATGPT_SESSION_COOKIES', '').strip():
+            return True
+        return bool(_load_jar('chatgpt'))
+    return bool(_load_jar('gemini'))          # jar already merges env 1PSID
+
+
+_ACCOUNTS_FILE = 'accounts.json'
+
+
+def _load_accounts() -> Dict[str, Dict[str, str]]:
+    """Accounts the bot created itself (provider -> {email, password,...})."""
+    try:
+        data = json.loads((_data_dir() / _ACCOUNTS_FILE)
+                          .read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_account(name: str, email: str, password: str,
+                  backend: str = '') -> None:
+    """Persist a bot-created account so later renewals can re-login."""
+    accs = _load_accounts()
+    accs[name] = {'email': email, 'password': password, 'backend': backend,
+                  'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+    path = _data_dir() / _ACCOUNTS_FILE
+    tmp = path.with_suffix('.new')
+    tmp.write_text(json.dumps(accs, indent=2, ensure_ascii=False),
+                   encoding='utf-8')
+    os.replace(tmp, path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def _proxies_kwargs(url: str) -> Dict[str, Any]:
@@ -398,6 +460,18 @@ def _click_any(page, targets: List[str]) -> bool:
     return False
 
 
+def _select_first(page, selectors: List[str], value: str) -> bool:
+    for sel in selectors:
+        try:
+            ele = page.ele(sel, timeout=3)
+            if ele:
+                ele.select.by_text(value)
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
 def _wait_token(page, timeout_s: int = 150) -> Optional[str]:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -428,10 +502,15 @@ def _export_cookies(page, name: str, domains: Tuple[str, ...]) -> int:
 
 
 def _creds(name: str) -> Tuple[str, str]:
+    """Login credentials: env first, then accounts the bot created itself
+    (data/accounts.json, written by the signup rungs)."""
     prefix = {'deepseek': 'DEEPSEEK', 'chatgpt': 'CHATGPT', 'gemini': 'GEMINI'}[name]
     email = os.getenv(f'{prefix}_LOGIN_EMAIL', '').strip()
     password = os.getenv(f'{prefix}_LOGIN_PASSWORD', '').strip()
-    return email, password
+    if email and password:
+        return email, password
+    stored = _load_accounts().get(name) or {}
+    return (stored.get('email') or email, stored.get('password') or password)
 
 
 _DEEPSEEK_EMAIL_SELECTORS = ['@placeholder:email', '@placeholder:Email',
@@ -573,6 +652,151 @@ def signup_deepseek() -> Tuple[bool, str]:
             pass
 
 
+def signup_chatgpt() -> Tuple[bool, str]:
+    """Create a fresh ChatGPT account — fully autonomous (best effort).
+
+    Uses an auto-generated throwaway mailbox (dsk/mailgen.py) for the
+    verification code. OpenAI may still show an Arkose captcha or demand
+    phone verification for some IPs; those cases end the attempt with a
+    clear detail string and the ladder records a normal miss. Created
+    account credentials are persisted so later renewals can re-login."""
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+    session, err = mailgen.create_email()
+    if not session:
+        return False, f'autogen mailbox unavailable: {err}'
+    email, password = session['address'], session['password']
+    try:
+        page = _browser()
+    except Exception as e:  # noqa: BLE001
+        return False, f'browser unavailable: {e}'
+    try:
+        page.get('https://chatgpt.com/auth/login')
+        time.sleep(6)
+        if not _click_any(page, ['Sign up', 'Sign Up', 'Create account']):
+            return False, 'sign-up entry not found (bot wall?)'
+        time.sleep(4)
+        _click_any(page, ['Continue with email', 'Email'])
+        time.sleep(2)
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found (bot wall?)'
+        _click_any(page, ['Continue', 'Next'])
+        time.sleep(3)
+        if not _fill_first(page, _PASSWORD_SELECTORS, password):
+            return False, 'password field not found'
+        _click_any(page, ['Continue', 'Next'])
+        time.sleep(8)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='openai')
+        if not code:
+            return False, 'verification email not found (captcha/phone wall may have blocked signup)'
+        if not _fill_first(page, ['css:input[name=code]',
+                                  'css:input[inputmode=numeric]',
+                                  'css:input[autocomplete=one-time-code]',
+                                  '@placeholder:code', '@placeholder:Code',
+                                  'css:input[type=text]'], code):
+            return False, 'verification code field not found'
+        _click_any(page, ['Continue', 'Verify'])
+        time.sleep(12)
+        _save_account('chatgpt', email, password,
+                      session.get('backend', ''))
+        n = _export_cookies(page, 'chatgpt', ('chatgpt.com', 'openai.com'))
+        via = f'account created ({session["backend"]}: {email})'
+        if n > 0:
+            return True, f'{via}, {n} session cookies exported'
+        return False, f'{via} but no session cookies captured'
+    except Exception as e:  # noqa: BLE001
+        return False, f'chatgpt signup failed: {type(e).__name__}: {e}'
+    finally:
+        try:
+            page.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def signup_gemini() -> Tuple[bool, str]:
+    """Create a fresh Google account for Gemini — best effort.
+
+    Google's anti-bot (captcha, phone verification, unusual-traffic
+    checks) blocks most automated attempts; every failure surfaces as a
+    ladder miss. Uses an auto-generated mailbox for the verification
+    code; the account is persisted for later re-login attempts."""
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+    session, err = mailgen.create_email()
+    if not session:
+        return False, f'autogen mailbox unavailable: {err}'
+    email, password = session['address'], session['password']
+    try:
+        page = _browser()
+    except Exception as e:  # noqa: BLE001
+        return False, f'browser unavailable: {e}'
+    try:
+        page.get('https://accounts.google.com/signup/v2/createaccount'
+                 '?flowName=GlifWebSignIn&flowEntry=AccountSignUp')
+        time.sleep(6)
+        if not _fill_first(page, ['css:input#firstName',
+                                  'css:input[name=firstName]'], 'Alex'):
+            return False, 'google first-name field not found (bot wall?)'
+        _fill_first(page, ['css:input#lastName',
+                           'css:input[name=lastName]'], 'Free')
+        _click_any(page, ['Next', 'Weiter'])
+        time.sleep(4)
+        _fill_first(page, ['css:input#day', 'css:input[name=day]'], '12')
+        _select_first(page, ['css:select#month'], 'June')
+        _fill_first(page, ['css:input#year', 'css:input[name=year]'], '1994')
+        _select_first(page, ['css:select#gender'], 'Rather not say')
+        _click_any(page, ['Next', 'Weiter'])
+        time.sleep(4)
+        # prefer the "use existing email" branch so no Gmail is required
+        _click_any(page, ['Use your existing email', 'current email address'])
+        time.sleep(2)
+        if not _fill_first(page, ['css:input#userName',
+                                  'css:input[name=userName]',
+                                  'css:input[type=email]'], email):
+            return False, 'existing-email field not found'
+        _click_any(page, ['Next', 'Weiter'])
+        time.sleep(3)
+        if not _fill_first(page, ['css:input[name=Passwd]',
+                                  'css:input[type=password]'], password):
+            return False, 'google password field not found'
+        _fill_first(page, ['css:input[name=PasswdAgain]'], password)
+        _click_any(page, ['Next', 'Weiter'])
+        time.sleep(6)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='accounts.google')
+        if not code:
+            return False, 'google verification email not found (captcha/phone wall likely)'
+        if not _fill_first(page, ['css:input#code',
+                                  'css:input[name=code]'], code):
+            return False, 'google code field not found'
+        _click_any(page, ['Next', 'Weiter'])
+        time.sleep(6)
+        _click_any(page, ["Yes, I'm in", 'Skip', 'Not now', 'Confirm'])
+        time.sleep(3)
+        _click_any(page, ['I agree'])
+        time.sleep(8)
+        _save_account('gemini', email, password, session.get('backend', ''))
+        page.get('https://gemini.google.com/app')
+        time.sleep(6)
+        n = _export_cookies(page, 'gemini', ('google.com',))
+        via = f'account created ({session["backend"]}: {email})'
+        if n > 0:
+            return True, f'{via}, {n} google cookies exported'
+        return False, f'{via} but no cookies captured (2FA/anti-bot?)'
+    except Exception as e:  # noqa: BLE001
+        return False, f'gemini signup failed: {type(e).__name__}: {e}'
+    finally:
+        try:
+            page.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
+          'gemini': signup_gemini}
+
+
 # ------------------------------------------------------------------ renew
 def renew(name: str, reason: str = '') -> Dict[str, Any]:
     """Run the full renewal ladder for one provider. Returns a status dict."""
@@ -631,8 +855,8 @@ def _renew_locked(name: str, reason: str) -> Dict[str, Any]:
             _log_history(name, 'renewed', '; '.join(steps))
             return {'renewed': True, 'via': 'browser-login', 'steps': steps}
 
-    if name == 'deepseek' and _env_bool('DSF_REFRESHER_AUTOSIGNUP', True):
-        ok, detail = signup_deepseek()
+    if _env_bool('DSF_REFRESHER_AUTOSIGNUP', True):
+        ok, detail = SIGNUP[name]()   # all providers: create what is missing
         steps.append(f'signup: {detail}')
         _log_history(name, 'autosignup', detail)
         status = _verify(name)
@@ -656,18 +880,45 @@ def _verify(name: str) -> str:
 
 # ------------------------------------------------------------------ daemon
 def refresh_cycle() -> Dict[str, Any]:
-    """Proactively rotate refreshable cookies (gemini/chatgpt) once."""
+    """Proactive daemon cycle: rotate refreshable cookies (gemini/chatgpt)
+    and BOOTSTRAP any provider that has no credentials at all — the signup
+    rung creates fresh ones unattended."""
+    if not _env_bool('DSF_REFRESHER', True):
+        return {'refresher': 'disabled'}
     out: Dict[str, Any] = {}
-    for name in ('gemini', 'chatgpt'):
-        if not _load_jar(name):
-            out[name] = 'skipped (no credentials)'
+    for name in ('gemini', 'chatgpt', 'deepseek'):
+        if not _has_creds(name):
+            if not _env_bool('DSF_REFRESHER_AUTOSIGNUP', True):
+                out[name] = 'skipped (no credentials, autosignup off)'
+                continue
+            try:
+                out[name] = renew(name, reason='bootstrap')
+            except Exception as e:  # noqa: BLE001
+                out[name] = f'bootstrap error: {type(e).__name__}: {e}'
             continue
+        if name == 'deepseek':
+            continue  # token is verified live by the self-heal probe
         try:
             ok, detail = REFRESH[name]()
             out[name] = detail
             _log_history(name, 'proactive-refresh' if ok else 'refresh-issue', detail)
         except Exception as e:  # noqa: BLE001
             out[name] = f'error: {e}'
+    return out
+
+
+def bootstrap_all() -> Dict[str, Any]:
+    """Force credential creation for every provider that currently has
+    none (CLI / manual trigger; bypasses the per-provider cooldown)."""
+    out: Dict[str, Any] = {}
+    for name in REFRESH:
+        if _has_creds(name):
+            out[name] = {'renewed': False, 'skipped': 'credentials present'}
+            continue
+        try:
+            out[name] = renew(name, reason='manual-bootstrap')
+        except Exception as e:  # noqa: BLE001
+            out[name] = {'renewed': False, 'error': str(e)[:300]}
     return out
 
 
@@ -698,9 +949,13 @@ def status() -> Dict[str, Any]:
             'ttl': _ttl(),
             'browser_login': _env_bool('DSF_REFRESHER_LOGIN', True),
             'autosignup': _env_bool('DSF_REFRESHER_AUTOSIGNUP', True),
+            'autosignup_providers': sorted(SIGNUP),
             'mail_autogen': mailgen.autogen_enabled(),
             'mail_configured': bool(os.getenv('DSF_MAIL_IMAP_HOST', '').strip()),
             'credentials': {p: bool(all(_creds(p))) for p in REFRESH},
+            'has_credentials': {p: _has_creds(p) for p in REFRESH},
+            'bootstrap': {'enabled': _env_bool('DSF_REFRESHER_AUTOSIGNUP', True),
+                          'missing': [p for p in REFRESH if not _has_creds(p)]},
             'last_results': results}
 
 
@@ -716,7 +971,11 @@ def main(argv: List[str]) -> int:  # pragma: no cover - CLI
         print(json.dumps(dict(zip(('ok', 'detail'), browser_login(argv[2]))), indent=2))
         return 0
     if cmd == 'signup':
-        print(json.dumps(dict(zip(('ok', 'detail'), signup_deepseek())), indent=2))
+        prov = argv[2] if len(argv) > 2 else 'deepseek'
+        print(json.dumps(dict(zip(('ok', 'detail'), SIGNUP[prov]())), indent=2))
+        return 0
+    if cmd == 'bootstrap':
+        print(json.dumps(bootstrap_all(), indent=2, default=str))
         return 0
     if cmd == 'mailgen':
         session, err = mailgen.create_email()

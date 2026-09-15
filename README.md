@@ -351,11 +351,13 @@ The service keeps its web sessions alive **autonomously** — no human re-copyin
 
 1. **HTTP cookie refresh** (always) — Gemini/ChatGPT cookie jars are rotated over plain HTTP; DeepSeek is verified with a live probe (its `userToken` only changes on login).
 2. **Headless-browser re-login** (default ON) — re-signs-in with the per-provider login credentials below inside the container's Chromium and exports the fresh token/cookies.
-3. **Auto-signup** (default ON, DeepSeek) — when even the login is dead, a brand-new free account is created. If no `DEEPSEEK_LOGIN_EMAIL` is configured, the address is **auto-generated**:
+3. **Auto-signup** (default ON, **all providers**) — when even the login is dead — or a provider has **no credentials at all** — a brand-new free account is **created** (the refresher daemon bootstraps every missing provider on its first cycle). If no `<PROVIDER>_LOGIN_EMAIL` is configured, the address is **auto-generated**:
    - your own **catch-all IMAP domain** (`DSF_MAIL_DOMAIN` + IMAP settings) — random local parts, OTP read from your mailbox; or
    - a **mail.tm throwaway mailbox** (public temp-mail, zero configuration) as fallback.
 
-All rungs respect per-provider cooldowns and daily attempt caps; every action is logged to `data/refresher/history.jsonl` (`python -m dsk.refresher status`). Everything can be disabled: `DSF_REFRESHER=false`, `DSF_REFRESHER_LOGIN=false`, `DSF_REFRESHER_AUTOSIGNUP=false`, `DSF_MAIL_AUTOGEN=false`.
+   Created accounts are persisted to `data/accounts.json` so later renewals can re-login with them. Google/OpenAI may still hit captcha or phone-verification walls — those rungs are **best effort** and their failures surface in the history log.
+
+All rungs respect per-provider cooldowns and daily attempt caps; every action is logged to `data/refresher/history.jsonl` (`python -m dsk.refresher status`, `python -m dsk.refresher bootstrap` to force-create missing credentials now). Everything can be disabled: `DSF_REFRESHER=false`, `DSF_REFRESHER_LOGIN=false`, `DSF_REFRESHER_AUTOSIGNUP=false`, `DSF_MAIL_AUTOGEN=false`.
 
 Bot-written credential files (`data/deepseek_token`, `data/gemini_cookies.json`, `data/chatgpt_cookies.json`) **win over** the env vars — delete a file to hand control back to the environment.
 
