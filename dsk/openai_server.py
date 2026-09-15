@@ -212,7 +212,10 @@ def _build_prompt(messages: List[ChatMessage]) -> str:
             else:
                 rendered.append(f"[Assistant]\n{text}")
         elif role == "tool":
-            rendered.append(f"[Tool result]\n{text}")
+            # Explicit continuation cue: the model otherwise tends to re-issue
+            # the same call instead of consuming the result.
+            rendered.append(f"[Tool result]\n{text}\n(Tool call completed successfully. "
+                            f"Use this result to continue the task. Do NOT repeat the call.)")
         else:
             rendered.append(text)
     return "\n\n".join(rendered).strip()
@@ -246,6 +249,9 @@ def _render_tool_instructions(tools: List[Dict[str, Any]], tool_choice: Any) -> 
         "and nothing else (no markdown fences, no extra text):",
         f'{_TOOL_MARKER.strip()} {{"name": "<tool name>", "arguments": {{}}}}',
         "Call at most ONE tool per response; the result is provided afterwards as a [Tool result] message.",
+        "After you receive [Tool result] messages, use them to continue or complete the task.",
+        "Never repeat a tool call that was already made with the same arguments.",
+        "If the task is complete or you have all the information you need, respond with plain text instead of calling a tool.",
         "If you do not need a tool, respond with plain text.",
     ]
     if isinstance(tool_choice, dict) and isinstance(tool_choice.get("function"), dict):
@@ -354,7 +360,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     prompt = _build_prompt(body.messages)
     use_tools = bool(body.tools) and body.tool_choice != "none"
     if use_tools:
-        prompt = f"{prompt}\n\n[System]\n{_render_tool_instructions(body.tools, body.tool_choice)}"
+        # The protocol block is PREPENDED (not appended): if placed at the end
+        # it becomes the most recent text the model reads and its "to call a
+        # tool..." phrasing biases the model into re-issuing calls even after
+        # a tool result was returned (agent-loop repeat-call bug).
+        prompt = f"[System]\n{_render_tool_instructions(body.tools, body.tool_choice)}\n\n{prompt}"
     if not prompt:
         raise HTTPException(
             status_code=400,
