@@ -1,17 +1,19 @@
 # DeepSeek4Free (OpenAI-compatible fork)
 
-**Free access to DeepSeek through its own web API — exposed as a standard OpenAI-compatible server, packaged in Docker, and built for agent coding.**
+**Free access to DeepSeek, Gemini (Web) and ChatGPT (Web) through their own web APIs — exposed as a standard OpenAI-compatible server, packaged in Docker, and built for agent coding.**
 
-This project talks directly to `chat.deepseek.com` with your own account token (`userToken`) instead of the official paid API, then re-exposes it behind the familiar OpenAI endpoints (`/v1/chat/completions`, `/v1/models`). That means any tool that speaks the OpenAI API — [aider](https://aider.chat) / **AiderDesk agent mode**, OpenWebUI, LiteLLM, LibreChat, the `openai` SDK, anything else — can use DeepSeek for free.
+This project talks directly to the chat web apps — `chat.deepseek.com` (account token), `gemini.google.com` (session cookies) and `chatgpt.com` backend-api (session cookies) — instead of any official paid API, then re-exposes them behind the familiar OpenAI endpoints (`/v1/chat/completions`, `/v1/models`). That means any tool that speaks the OpenAI API — [aider](https://aider.chat) / **AiderDesk agent mode**, OpenWebUI, LiteLLM, LibreChat, the `openai` SDK, anything else — can use these models for free.
 
 ```
-┌──────────────┐   OpenAI API    ┌────────────────────────────┐   web API   ┌───────────────────┐
-│ aider /      │ ──────────────► │  dsk/openai_server.py      │ ──────────► │ chat.deepseek.com │
-│ AiderDesk /  │  /v1/chat/...   │  FastAPI + SSE + tool-call │  token+PoW  │  (Cloudflare in   │
-│ any OpenAI   │ ◄────────────── │  emulation                 │ ◄────────── │   front)          │
-│ client       │  SSE chunks     └────────────────────────────┘  SSE chunks └───────────────────┘
+┌──────────────┐   OpenAI API    ┌────────────────────────────┐   web API    ┌──────────────────────────┐
+│ aider /      │ ──────────────► │  dsk/openai_server.py      │ ───────────► │ chat.deepseek.com (token)│
+│ AiderDesk /  │  /v1/chat/...   │  FastAPI + SSE + tool-call │  reverse-    │ gemini.google.com (cookie│
+│ any OpenAI   │ ◄────────────── │  emulation + playground    │  engineered  │ chatgpt.com backend-api  │
+│ client       │  SSE chunks     └────────────────────────────┘              └──────────────────────────┘
 └──────────────┘
 ```
+
+**No hardcoded models.** Model lists are discovered *dynamically* from each provider's live web session: DeepSeek exposes its three web-app modes, ChatGPT is discovered via `/backend-api/models`, Gemini via its own web RPC — so new upstream models appear on `/v1/models` automatically (refreshed every `DSF_MODELS_TTL` seconds, with on-demand re-discovery when an unknown model id is requested). Unknown providers are skipped gracefully and previously discovered routes are kept on refresh failures.
 
 ## 🍴 Fork notice & credits
 
@@ -110,8 +112,30 @@ The result: aider, **AiderDesk agent mode**, and every other function-calling cl
 | `dsk/CloudflareBypasser.py` | Browser automation that clicks through Cloudflare challenges |
 | `dsk/run_and_get_cookies.py` | Standalone helper to grab cookies from a running bypass server |
 | `dsk/server.py` | Upstream's original bypass HTTP service (unchanged from the original repo) |
-| `dsk/openai_server.py` | **This fork:** OpenAI-compatible API server (aider/AiderDesk entry point) |
+| `dsk/openai_server.py` | **This fork:** OpenAI-compatible API server (aider/AiderDesk entry point) + playground web UI |
+| `dsk/providers/base.py` | Provider abstraction, dynamic `Route` model registry, retry/fallback error taxonomy |
+| `dsk/providers/deepseek_provider.py` | DeepSeek web provider (PoW + Cloudflare bypass) |
+| `dsk/providers/gemini_provider.py` | Gemini web-chat provider (`gemini.google.com` session cookies, no official API) |
+| `dsk/providers/chatgpt_provider.py` | ChatGPT web provider (`chatgpt.com/backend-api` session cookies, no official API) |
+| `dsk/providers/router.py` | Dynamic model discovery (TTL cache) + retry/fallback orchestration |
+| `dsk/static/index.html` | llama.cpp-style playground web UI (served at `/` and `/playground`) |
 | `dsk/wasm/` | DeepSeek's SHA3 WASM module used for PoW |
+
+---
+
+## 🔀 Providers (all reverse-engineered — no official API keys)
+
+| Provider | Auth | Models |
+|---|---|---|
+| **DeepSeek** | `userToken` from `chat.deepseek.com` localStorage | 3 web-app modes (`deepseek-chat`, `deepseek-reasoner`, `deepseek-search`) |
+| **Gemini (Web)** | `__Secure-1PSID` / `__Secure-1PSIDTS` cookies from `gemini.google.com` | Discovered live from the web session |
+| **ChatGPT (Web)** | session cookies (or accessToken) from `chatgpt.com` | Discovered live via `/backend-api/models` |
+
+Getting the Gemini cookies: log in at [gemini.google.com](https://gemini.google.com) → DevTools (F12) → Application → Cookies → copy `__Secure-1PSID` and `__Secure-1PSIDTS` into `.env` as `GEMINI_1PSID` / `GEMINI_1PSIDTS`.
+
+Getting the ChatGPT session: log in at [chatgpt.com](https://chatgpt.com) → either fetch `https://chatgpt.com/api/auth/session` (copy `accessToken` into `CHATGPT_ACCESS_TOKEN`), or export the cookie jar (DevTools → Application → Cookies) as JSON into `CHATGPT_SESSION_COOKIES` (preferred — the access token is refreshed automatically). Cookie jars can also be dropped as files into the `./data` volume (`gemini_cookies.json`, `chatgpt_cookies.json`).
+
+Providers without configured credentials are simply skipped; the server runs with whichever providers are available.
 
 ---
 
@@ -131,7 +155,7 @@ cp .env.example .env
 # edit .env and set DEEPSEEK_AUTH_TOKEN=<paste your token>
 ```
 
-`.env.example` contains every supported variable (`DEEPSEEK_AUTH_TOKEN`, optional `DSF_API_KEY`, `DSF_PORT`, and the model-name overrides) with comments.
+`.env.example` contains every supported variable (DeepSeek token, optional Gemini/ChatGPT web-session credentials, `DSF_API_KEY`, `DSF_PORT`, model-name overrides, discovery TTL and fallback chains) with comments.
 
 ### 3. Run
 
@@ -183,12 +207,17 @@ aider --model openai/deepseek-chat \
 
 ---
 
+## 🖥️ Playground
+
+A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/playground`): pick any discovered model from the dropdown, stream responses (with a collapsible thinking panel for `reasoning_content`), tweak system message / temperature / max tokens / web-search toggle, and stop generations mid-stream. It talks to the same OpenAI endpoints your agent tools use, so it doubles as an end-to-end test harness.
+
 ## 🔌 API reference
 
 | Endpoint | Description |
 |---|---|
-| `GET /v1/models` | Lists the exposed models (`deepseek-reasoner`, `deepseek-chat`, `deepseek-search`) |
+| `GET /v1/models` | Lists every model discovered from all configured providers (dynamic, TTL-cached) |
 | `POST /v1/chat/completions` | Chat completions, streaming (`stream: true`) and non-streaming; supports `tools` |
+| `GET /` or `/playground` | Chat playground web UI |
 | `GET /health` | Liveness probe |
 
 - Requests may include any standard OpenAI field; unsupported ones are ignored.
@@ -210,6 +239,14 @@ aider --model openai/deepseek-chat \
 | `DSF_CONTEXT_LENGTH` | `131072` | Context length advertised on `/v1/models` (DeepSeek's documented 128K) |
 | `DSF_MAX_OUTPUT_THINKING` | `65536` | Max output tokens advertised for the thinking model (documented 64K) |
 | `DSF_MAX_OUTPUT` | `32768` | Max output tokens advertised for the other models (documented 32K) |
+| `GEMINI_1PSID` | *(none)* | `__Secure-1PSID` cookie from `gemini.google.com` (enables the Gemini web provider) |
+| `GEMINI_1PSIDTS` | *(none)* | `__Secure-1PSIDTS` cookie from `gemini.google.com` |
+| `CHATGPT_ACCESS_TOKEN` | *(none)* | ChatGPT web `accessToken` (from `/api/auth/session`) |
+| `CHATGPT_SESSION_COOKIES` | *(none)* | ChatGPT session cookie jar as JSON (preferred over the raw token; auto-refresh) |
+| `DSF_MODELS_TTL` | `300` | Seconds between dynamic model re-discovery across providers |
+| `DSF_FALLBACKS` | *(none)* | JSON map of per-model fallback chains, e.g. `{"deepseek-chat": ["deepseek-reasoner"]}` |
+| `DSF_DEFAULT_FALLBACKS` | *(none)* | Comma-separated fallbacks applied to every route |
+| `COOKIES_DIR` | *(none)* (Docker: `/data`) | Directory where provider cookie files are persisted |
 
 ---
 
@@ -229,8 +266,9 @@ You only need this when you see Cloudflare challenges, your `cf_clearance` cooki
 ```bash
 git clone https://github.com/blastbeng/deepseek4free.git
 cd deepseek4free
-pip install -r requirements.txt
-DEEPSEEK_AUTH_TOKEN=yourtoken python -m dsk.openai_server
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt "setuptools<81"
+DEEPSEEK_AUTH_TOKEN=yourtoken .venv/bin/python -m dsk.openai_server
 ```
 
 ---

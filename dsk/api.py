@@ -2,8 +2,8 @@ from curl_cffi import requests
 from typing import Optional, Dict, Any, Generator, Literal
 import json
 from .pow import DeepSeekPOW
-import pkg_resources
 import sys
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 import subprocess
 import time
@@ -49,11 +49,14 @@ class DeepSeekAPI:
                 raise AuthenticationError("Invalid auth token provided")
 
         try:
-            curl_cffi_version = pkg_resources.get_distribution('curl-cffi').version
+            try:
+                curl_cffi_version = importlib_metadata.version('curl_cffi')
+            except importlib_metadata.PackageNotFoundError:
+                curl_cffi_version = importlib_metadata.version('curl-cffi')
             if curl_cffi_version != '0.8.1b9':
                 print("\033[93mWarning: DeepSeek API requires curl-cffi version 0.8.1b9", file=sys.stderr)
                 print("Please install the correct version using: pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
-        except pkg_resources.DistributionNotFound:
+        except Exception:
             print("\033[93mWarning: curl-cffi not found. Please install version 0.8.1b9:", file=sys.stderr)
             print("pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
 

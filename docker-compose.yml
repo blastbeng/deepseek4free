@@ -18,6 +18,16 @@ services:
       - DSF_MODEL_THINKER=${DSF_MODEL_THINKER:-deepseek-reasoner}
       - DSF_MODEL_FAST=${DSF_MODEL_FAST:-deepseek-chat}
       - DSF_MODEL_SEARCH=${DSF_MODEL_SEARCH:-deepseek-search}
+      # Gemini web-chat session cookies (reverse-engineered, no official API key)
+      - GEMINI_1PSID=${GEMINI_1PSID:-}
+      - GEMINI_1PSIDTS=${GEMINI_1PSIDTS:-}
+      # ChatGPT web session (reverse-engineered, no official API key)
+      - CHATGPT_ACCESS_TOKEN=${CHATGPT_ACCESS_TOKEN:-}
+      - CHATGPT_SESSION_COOKIES=${CHATGPT_SESSION_COOKIES:-}
+      # Dynamic model discovery TTL + fallback chains
+      - DSF_MODELS_TTL=${DSF_MODELS_TTL:-300}
+      - DSF_FALLBACKS=${DSF_FALLBACKS:-}
+      - DSF_DEFAULT_FALLBACKS=${DSF_DEFAULT_FALLBACKS:-}
       - DOCKERMODE=true
     volumes:
       # Persist cf_clearance cookies across container restarts (local ./data dir)

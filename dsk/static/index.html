@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>deepseek4free · playground</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #2f81f7;
+    --user-bubble: #1f6feb33; --bot-bubble: #161b22;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; white-space: nowrap; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  select, input[type="text"], input[type="number"], textarea {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font: inherit;
+  }
+  select:focus, input:focus, textarea:focus { outline: 1px solid var(--accent); }
+  #model { min-width: 230px; }
+  .grow { flex: 1; }
+  button {
+    background: #21262d; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: #da3633; border-color: #da3633; color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  main { flex: 1; display: flex; min-height: 0; }
+  #chat {
+    flex: 1; overflow-y: auto; padding: 18px 16px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .msg { max-width: 78%; border-radius: 10px; padding: 10px 14px; white-space: pre-wrap;
+         word-wrap: break-word; overflow-wrap: anywhere; }
+  .msg.user { align-self: flex-end; background: var(--user-bubble);
+              border: 1px solid #1f6feb55; }
+  .msg.bot  { align-self: flex-start; background: var(--bot-bubble);
+              border: 1px solid var(--border); }
+  .msg.error { align-self: center; background: #f8514915; border: 1px solid #f8514966;
+               color: var(--err); font-family: var(--mono); font-size: 13px; }
+  .msg .who { font-size: 11px; color: var(--muted); margin-bottom: 4px;
+              text-transform: uppercase; letter-spacing: .5px; }
+  details.think { margin: 0 0 8px 0; border: 1px dashed var(--border);
+                  border-radius: 6px; background: #0d111788; }
+  details.think summary { cursor: pointer; padding: 4px 10px; color: var(--muted);
+                          font-size: 12px; user-select: none; }
+  details.think .body { padding: 6px 10px; color: var(--muted);
+                        font-size: 13px; white-space: pre-wrap; }
+  .msg pre { background: #0a0d12; border: 1px solid var(--border); border-radius: 6px;
+             padding: 10px; overflow-x: auto; font-family: var(--mono); font-size: 13px; }
+  .msg code { font-family: var(--mono); font-size: 13px; background: #0a0d12;
+              border-radius: 4px; padding: 1px 4px; }
+  .msg pre code { background: none; padding: 0; }
+
+  #settings {
+    width: 290px; border-left: 1px solid var(--border); background: var(--panel);
+    padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
+  }
+  #settings h2 { font-size: 12px; margin: 0; color: var(--muted);
+                 text-transform: uppercase; letter-spacing: .8px; }
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  .field input[type="number"], .field select { width: 100%; }
+  .row { display: flex; align-items: center; justify-content: space-between; }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: 8px;
+           border: 1px solid var(--border); color: var(--muted); }
+  .badge.on { color: var(--ok); border-color: var(--ok); }
+  #stats { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+
+  footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 16px; }
+  #composer { display: flex; gap: 10px; align-items: flex-end; max-width: 1000px; margin: 0 auto; }
+  #prompt {
+    flex: 1; resize: none; min-height: 44px; max-height: 200px;
+    font: inherit; line-height: 1.45;
+  }
+  .hint { text-align: center; color: var(--muted); font-size: 11px; margin-top: 6px; }
+  @media (max-width: 760px) { #settings { display: none; } .msg { max-width: 95%; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>deepseek4free <span>· playground</span></h1>
+  <select id="model" title="Model (from GET /v1/models)"></select>
+  <span id="flags"></span>
+  <div class="grow"></div>
+  <button id="refresh" title="Reload model list">↻ models</button>
+  <button id="clear" title="Clear conversation">✕ clear</button>
+</header>
+<main>
+  <div id="chat"></div>
+  <aside id="settings">
+    <h2>Settings</h2>
+    <div class="field">
+      <label for="system">System message</label>
+      <textarea id="system" rows="4" placeholder="You are a helpful assistant."></textarea>
+    </div>
+    <div class="field">
+      <div class="row"><label for="temp">temperature</label><span id="tempVal" class="badge">1.00</span></div>
+      <input type="range" id="temp" min="0" max="2" step="0.05" value="1" style="width:100%">
+    </div>
+    <div class="field">
+      <label for="maxtok">max tokens (0 = default)</label>
+      <input type="number" id="maxtok" min="0" step="256" value="0">
+    </div>
+    <div class="field">
+      <div class="row">
+        <label for="search">web search <span class="badge">extra</span></label>
+        <input type="checkbox" id="search">
+      </div>
+      <div class="row">
+        <label for="showthink">show thinking</label>
+        <input type="checkbox" id="showthink" checked>
+      </div>
+    </div>
+    <div id="stats"></div>
+  </aside>
+</main>
+<footer>
+  <div id="composer">
+    <textarea id="prompt" placeholder="Send a message… (Enter to send, Shift+Enter for newline)"></textarea>
+    <button id="stop" class="danger" disabled>■ stop</button>
+    <button id="send" class="primary">Send</button>
+  </div>
+  <div class="hint">OpenAI-compatible endpoint · <span id="baseurl"></span></div>
+</footer>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const chat = $('chat'), modelSel = $('model'), flagsEl = $('flags');
+let messages = [];          // {role, content}
+let controller = null;      // AbortController for the active stream
+let modelInfo = {};         // id -> {thinking_enabled, search_enabled, ...}
+
+$('baseurl').textContent = location.origin;
+
+function esc(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Minimal markdown: fenced code, inline code, **bold**. Good enough for chat.
+function renderMd(text) {
+  const parts = String(text).split(/```/);
+  let html = '';
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 1) {                       // code fence block
+      const nl = parts[i].indexOf('\n');
+      const code = nl >= 0 ? parts[i].slice(nl + 1) : parts[i];
+      html += '<pre><code>' + esc(code.replace(/\n$/, '')) + '</code></pre>';
+    } else {
+      let t = esc(parts[i]);
+      t = t.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+      t = t.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+      html += t;
+    }
+  }
+  return html;
+}
+
+function addBubble(role) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + (role === 'error' ? 'error' : role);
+  if (role !== 'error') {
+    const who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = role;
+    div.appendChild(who);
+  }
+  const body = document.createElement('div');
+  body.className = 'body';
+  div.appendChild(body);
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return body;
+}
+
+function thinkBlock(parent) {
+  const det = document.createElement('details');
+  det.className = 'think';
+  det.open = $('showthink').checked;
+  det.innerHTML = '<summary>🧠 thinking</summary><div class="body"></div>';
+  parent.prepend(det);
+  return det.querySelector('.body');
+}
+
+async function loadModels() {
+  modelSel.innerHTML = '<option value="">loading…</option>';
+  try {
+    const r = await fetch('/v1/models');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    modelInfo = {};
+    modelSel.innerHTML = '';
+    for (const m of data.data || []) {
+      modelInfo[m.id] = m;
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      const bits = [];
+      if (m.thinking_enabled) bits.push('🧠');
+      if (m.search_enabled) bits.push('🔍');
+      opt.textContent = m.id + (bits.length ? '  ' + bits.join(' ') : '');
+      modelSel.appendChild(opt);
+    }
+    if (!modelSel.options.length) {
+      modelSel.innerHTML = '<option value="">(no models available)</option>';
+    }
+    updateFlags();
+  } catch (e) {
+    modelSel.innerHTML = '<option value="">failed to load models</option>';
+  }
+}
+
+function updateFlags() {
+  const m = modelInfo[modelSel.value];
+  if (!m) { flagsEl.innerHTML = ''; return; }
+  const f = [];
+  f.push('<span class="badge">ctx ' + (m.context_length || '?') + '</span>');
+  f.push('<span class="badge">out ' + (m.max_tokens || m.max_completion_tokens || '?') + '</span>');
+  if (m.thinking_enabled) f.push('<span class="badge on">thinking</span>');
+  if (m.search_enabled) f.push('<span class="badge on">search</span>');
+  if ((m.fallbacks || []).length) f.push('<span class="badge">fb: ' + m.fallbacks.join(', ') + '</span>');
+  flagsEl.innerHTML = f.join(' ');
+}
+
+function setBusy(busy) {
+  $('send').disabled = busy;
+  $('stop').disabled = !busy;
+}
+
+async function send() {
+  const text = $('prompt').value.trim();
+  if (!text || controller) return;
+  $('prompt').value = '';
+  autoGrow();
+
+  if (messages.length === 0 && $('system').value.trim()) {
+    messages.push({ role: 'system', content: $('system').value.trim() });
+  }
+  messages.push({ role: 'user', content: text });
+  addBubble('user').textContent = text;
+
+  const body = addBubble('bot');
+  const think = { el: null, text: '' };
+  let answer = '';
+  setBusy(true);
+  const t0 = performance.now();
+  let tokens = 0;
+
+  controller = new AbortController();
+  try {
+    const payload = {
+      model: modelSel.value,
+      messages: messages,
+      stream: true,
+      temperature: parseFloat($('temp').value),
+    };
+    if (parseInt($('maxtok').value, 10) > 0) payload.max_tokens = parseInt($('maxtok').value, 10);
+    if ($('search').checked) payload.search_enabled = true;
+    if (messages[0] && messages[0].role === 'system') payload.messages = messages;
+
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { msg = (await res.json()).error?.message || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') continue;
+        let j;
+        try { j = JSON.parse(data); } catch (_) { continue; }
+        if (j.error) throw new Error(j.error.message || 'stream error');
+        const delta = j.choices?.[0]?.delta || {};
+        if (delta.reasoning_content) {
+          if (!think.el) think.el = thinkBlock(body.parentElement);
+          think.text += delta.reasoning_content;
+          think.el.textContent = think.text;
+          chat.scrollTop = chat.scrollHeight;
+        }
+        if (delta.content) {
+          answer += delta.content;
+          tokens++;
+          body.innerHTML = renderMd(answer);
+          chat.scrollTop = chat.scrollHeight;
+        }
+      }
+    }
+    messages.push({ role: 'assistant', content: answer });
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    $('stats').textContent = 'last: ' + secs + 's · ~' + tokens + ' chunks';
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      body.innerHTML += '\n<i style="color:var(--warn)">[stopped]</i>';
+      if (answer) messages.push({ role: 'assistant', content: answer });
+    } else {
+      addBubble('error').textContent = '⚠ ' + (e.message || e);
+    }
+  } finally {
+    setBusy(false);
+    controller = null;
+  }
+}
+
+function autoGrow() {
+  const p = $('prompt');
+  p.style.height = 'auto';
+  p.style.height = Math.min(p.scrollHeight, 200) + 'px';
+}
+
+$('send').onclick = send;
+$('stop').onclick = () => controller && controller.abort();
+$('refresh').onclick = loadModels;
+$('clear').onclick = () => { messages = []; chat.innerHTML = ''; $('stats').textContent = ''; };
+$('prompt').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$('prompt').addEventListener('input', autoGrow);
+modelSel.addEventListener('change', updateFlags);
+$('temp').addEventListener('input', () => {
+  $('tempVal').textContent = parseFloat($('temp').value).toFixed(2);
+});
+
+loadModels();
+</script>
+</body>
+</html>

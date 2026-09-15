@@ -1,10 +1,12 @@
 """
-OpenAI-compatible API server for DeepSeek (reverse-engineered chat API).
+OpenAI-compatible API server for DeepSeek4Free (multi-provider).
 
 Exposes standard OpenAI endpoints so any OpenAI client / agent tooling
-(aider, aiderdesk, openai SDK, LiteLLM, ...) can use DeepSeek for free:
+(aider, aiderdesk, openai SDK, LiteLLM, ...) can use DeepSeek, Gemini and
+ChatGPT for free, plus a built-in llama.cpp-style playground UI:
 
-    POST /v1/chat/completions   (streaming + non-streaming)
+    GET  /                     playground web UI (also /playground)
+    POST /v1/chat/completions  streaming + non-streaming
     GET  /v1/models
     GET  /health
 
@@ -15,6 +17,18 @@ Configuration (env):
     DSF_PORT          bind port (default 8000)
     DEEPSEEK_AUTH_TOKEN  userToken from chat.deepseek.com localStorage
                          (or an existing dsk/cookies.json is reused)
+    GEMINI_1PSID / GEMINI_1PSIDTS  __Secure-1PSID cookies of a logged-in
+                         gemini.google.com session (or gemini_cookies.json)
+    CHATGPT_ACCESS_TOKEN  accessToken from chatgpt.com/api/auth/session, or
+                         session cookies via CHATGPT_SESSION_COOKIES /
+                         chatgpt_cookies.json
+
+Models are discovered dynamically from each provider's web session — nothing
+is hardcoded (see dsk/providers/router.py). Fallback chains:
+    DSF_FALLBACKS     JSON {model_id: [fallback_id, ...]} fallback chains
+    DSF_DEFAULT_FALLBACKS  comma list for routes without explicit fallbacks
+
+See dsk/providers/router.py for the full model-registry configuration.
 
 Run:  python -m dsk.openai_server
 """
@@ -27,84 +41,48 @@ import uuid
 import secrets
 import threading
 import asyncio
-from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, Generator, List, Optional
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 
-from .api import (
-    DeepSeekAPI,
-    AuthenticationError,
-    RateLimitError,
-    NetworkError,
-    APIError,
+from .providers.base import (
+    ProviderAuthError,
+    ProviderError,
+    ProviderRateLimitError,
+    ProviderUnavailableError,
 )
+from .providers.router import Router
 
 HOST = os.getenv("DSF_HOST", "0.0.0.0")
 PORT = int(os.getenv("DSF_PORT", "8000"))
 
-MODEL_THINKER = os.getenv("DSF_MODEL_THINKER", "deepseek-reasoner")
-MODEL_FAST = os.getenv("DSF_MODEL_FAST", "deepseek-chat")
-MODEL_SEARCH = os.getenv("DSF_MODEL_SEARCH", "deepseek-search")
-
-# Context / output limits advertised in /v1/models.
-# The DeepSeek web API does not expose per-model metadata, so these are the
-# officially documented values for DeepSeek's current models (128K context,
-# 64K max output in thinking mode / 32K otherwise) and can be overridden.
-CONTEXT_LENGTH = int(os.getenv("DSF_CONTEXT_LENGTH", "131072"))
-MAX_OUTPUT_THINKING = int(os.getenv("DSF_MAX_OUTPUT_THINKING", "65536"))
-MAX_OUTPUT = int(os.getenv("DSF_MAX_OUTPUT", "32768"))
-
 API_KEY = os.getenv("DSF_API_KEY", "")
 
+# Static playground UI (llama.cpp-style chat) served from dsk/static.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-def _model_entry(model_id: str, max_output_tokens: int) -> Dict[str, Any]:
-    """Build an OpenAI-style model entry with limit metadata.
-
-    The extra fields are read by agent tooling to size the context window and
-    max output tokens (e.g. AiderDesk reads context_length / max_model_len and
-    max_completion_tokens / max_tokens).
-    """
-    return {
-        "id": model_id,
-        "object": "model",
-        "created": 1700000000,
-        "owned_by": "deepseek4free",
-        "context_length": CONTEXT_LENGTH,
-        "max_model_len": CONTEXT_LENGTH,
-        "max_completion_tokens": max_output_tokens,
-        "max_tokens": max_output_tokens,
-    }
+ROUTER = Router()
+DEFAULT_MODEL = ROUTER.routes[os.getenv("DSF_MODEL_FAST", "deepseek-chat").strip()].model_id \
+    if os.getenv("DSF_MODEL_FAST", "deepseek-chat").strip() in ROUTER.routes \
+    else next(iter(ROUTER.routes))
 
 
-MODELS = [
-    _model_entry(MODEL_THINKER, MAX_OUTPUT_THINKING),
-    _model_entry(MODEL_FAST, MAX_OUTPUT),
-    _model_entry(MODEL_SEARCH, MAX_OUTPUT),
-]
-
-app = FastAPI(title="DeepSeek4Free OpenAI-compatible API")
-
-# One DeepSeekAPI per auth token, guarded by a lock (session creation is not
-# thread-safe and DeepSeek rate-limits aggressive parallel requests).
-_api_lock = threading.Lock()
-_api_instance: Optional[DeepSeekAPI] = None
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Kick off dynamic model discovery in a background thread (never blocks
+    startup; failures are tolerated and logged by the router)."""
+    threading.Thread(
+        target=ROUTER.refresh_models, kwargs={"force": True},
+        name="model-discovery", daemon=True,
+    ).start()
+    yield
 
 
-def _resolve_auth_token(provided_key: Optional[str]) -> Optional[str]:
-    """Auth token resolution order:
-    1. DEEPSEEK_AUTH_TOKEN env var
-    2. key sent by the client (Authorization Bearer) — allows users to pass
-       their DeepSeek userToken straight from the OpenAI client config
-    3. existing dsk/cookies.json (contains cookies; token may still come from client)
-    """
-    env_token = os.getenv("DEEPSEEK_AUTH_TOKEN", "").strip()
-    if env_token:
-        return env_token
-    if provided_key and provided_key.strip():
-        return provided_key.strip()
-    return None
+app = FastAPI(title="DeepSeek4Free OpenAI-compatible API", lifespan=lifespan)
 
 
 def _check_api_key(request: Request) -> Optional[str]:
@@ -127,26 +105,6 @@ def _check_api_key(request: Request) -> Optional[str]:
     return provided or None
 
 
-def _get_api(token: Optional[str] = None) -> DeepSeekAPI:
-    global _api_instance
-    with _api_lock:
-        if _api_instance is None or (token and token != _api_instance.auth_token):
-            if not token:
-                raise HTTPException(
-                    status_code=401,
-                    detail={
-                        "error": {
-                            "message": "No DeepSeek auth token. Set DEEPSEEK_AUTH_TOKEN "
-                            "or send your userToken as the API key.",
-                            "type": "invalid_request_error",
-                            "code": "missing_token",
-                        }
-                    },
-                )
-            _api_instance = DeepSeekAPI(token)
-        return _api_instance
-
-
 class ChatMessage(BaseModel):
     role: str
     content: Any  # str or list of content parts
@@ -155,7 +113,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = MODEL_FAST
+    model: str = DEFAULT_MODEL
     messages: List[ChatMessage]
     stream: bool = False
     temperature: Optional[float] = None
@@ -341,21 +299,44 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+@app.get("/playground")
+async def playground():
+    """llama.cpp-style chat playground (static, self-contained, no CDN)."""
+    return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     _check_api_key(request)
-    return {"object": "list", "data": MODELS}
+    # Best-effort TTL-cached re-discovery so newly available upstream models
+    # show up without a restart.
+    await asyncio.get_running_loop().run_in_executor(None, ROUTER.refresh_models)
+    return {"object": "list", "data": ROUTER.list_models()}
+
+
+def _error_status(err: ProviderError) -> tuple:
+    """Map provider errors to (type, code, HTTP status)."""
+    if isinstance(err, ProviderAuthError):
+        return "invalid_request_error", "invalid_token", 401
+    if isinstance(err, ProviderRateLimitError):
+        return "rate_limit_error", "rate_limit", 429
+    if isinstance(err, ProviderUnavailableError):
+        return "api_error", "provider_unavailable", 502
+    return "api_error", "upstream_error", 502
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
     client_key = _check_api_key(request)
-    token = _resolve_auth_token(client_key)
-    api = _get_api(token)
+    # resolve() may trigger a network re-discovery for unknown ids — keep it
+    # off the event loop.
+    route = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: ROUTER.resolve(body.model, auth_key=client_key))
 
-    model = body.model if body.model in (MODEL_THINKER, MODEL_FAST, MODEL_SEARCH) else MODEL_FAST
-    thinking_enabled = model == MODEL_THINKER
-    search_enabled = bool(body.search_enabled) or model == MODEL_SEARCH
+    # Body-level overrides: search flag stays opt-in via the extra field.
+    thinking_override = route.thinking_enabled
+    search_override = True if body.search_enabled else None
 
     prompt = _build_prompt(body.messages)
     use_tools = bool(body.tools) and body.tool_choice != "none"
@@ -378,14 +359,23 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         )
 
     created = int(time.time())
-    model_name = model
+    model_name = route.model_id
+    prompt_len = len(prompt)
+
+    chunk_gen = ROUTER.stream(
+        route, prompt,
+        temperature=body.temperature, max_tokens=body.max_tokens,
+        auth_key=client_key,
+        thinking_override=thinking_override,
+        search_override=search_override,
+    )
 
     # ---- Streaming ----
     if body.stream:
         include_usage = bool((body.stream_options or {}).get("include_usage"))
         return StreamingResponse(
-            _stream_completion(api, prompt, thinking_enabled, search_enabled,
-                               created, model_name, use_tools, include_usage),
+            _stream_completion(chunk_gen, created, model_name,
+                               use_tools, include_usage, prompt_len),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -396,23 +386,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
     # ---- Non-streaming ----
     content_parts: List[str] = []
+    reasoning_parts: List[str] = []
     try:
-        session_id = api.create_chat_session()
-        for chunk in api.chat_completion(
-            session_id, prompt,
-            thinking_enabled=thinking_enabled,
-            search_enabled=search_enabled,
-        ):
-            if chunk.get("type") == "text" and chunk.get("content"):
+        for chunk in chunk_gen:
+            if chunk.get("type") == "thinking" and chunk.get("content"):
+                reasoning_parts.append(chunk["content"])
+            elif chunk.get("type") == "text" and chunk.get("content"):
                 content_parts.append(chunk["content"])
-    except AuthenticationError as e:
-        return _error_response(str(e), "invalid_request_error", "invalid_token", 401)
-    except RateLimitError as e:
-        return _error_response(str(e), "rate_limit_error", "rate_limit", 429)
-    except NetworkError as e:
-        return _error_response(str(e), "api_error", "network_error", 502)
-    except (APIError, ValueError) as e:
-        return _error_response(str(e), "api_error", "upstream_error", 502)
+    except ProviderError as e:
+        err_type, code, status = _error_status(e)
+        return _error_response(str(e), err_type, code, status)
 
     full_text = "".join(content_parts)
     pre_text, tool_name, tool_args = (full_text, None, None)
@@ -423,6 +406,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         "role": "assistant",
         "content": pre_text if tool_name else full_text,
     }
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
     finish_reason = "stop"
     if tool_name:
         message["tool_calls"] = [{
@@ -445,25 +430,26 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             }
         ],
         "usage": {
-            "prompt_tokens": len(prompt) // 4,
+            "prompt_tokens": prompt_len // 4,
             "completion_tokens": sum(len(p) for p in content_parts) // 4,
-            "total_tokens": (len(prompt) + sum(len(p) for p in content_parts)) // 4,
+            "total_tokens": (prompt_len + sum(len(p) for p in content_parts)) // 4,
         },
     }
+
+
 async def _stream_completion(
-    api: DeepSeekAPI,
-    prompt: str,
-    thinking_enabled: bool,
-    search_enabled: bool,
+    chunk_gen: Generator[Dict[str, Any], None, None],
     created: int,
     model: str,
     use_tools: bool = False,
     include_usage: bool = False,
+    prompt_len: int = 0,
 ):
-    """Streams the blocking DeepSeek generator into OpenAI-style SSE chunks.
+    """Streams a provider-agnostic chunk generator into OpenAI-style SSE chunks.
 
-    The DeepSeek client is synchronous and blocking, so it runs in a worker
-    thread and formatted SSE payloads are pushed through an asyncio queue."""
+    The underlying provider generators are synchronous and blocking, so they
+    run in a worker thread and formatted SSE payloads are pushed through an
+    asyncio queue."""
     cid = _chunk_id()
     first = {
         "id": cid,
@@ -501,13 +487,7 @@ async def _stream_completion(
     def _worker():
         buffered_text: List[str] = []
         try:
-            session_id = api.create_chat_session()
-            for chunk in api.chat_completion(
-                session_id,
-                prompt,
-                thinking_enabled=thinking_enabled,
-                search_enabled=search_enabled,
-            ):
+            for chunk in chunk_gen:
                 ctype = chunk.get("type", "")
                 content = chunk.get("content", "") or ""
                 if not content:
@@ -566,13 +546,13 @@ async def _stream_completion(
                                      "finish_reason": None}],
                     }))
             q.put(None)
-        except AuthenticationError as e:
+        except ProviderAuthError as e:
             q.put(_error_sse(str(e), "invalid_request_error", "invalid_token"))
             q.put(None)
-        except RateLimitError as e:
+        except ProviderRateLimitError as e:
             q.put(_error_sse(f"Rate limit: {e}", "rate_limit_error", "rate_limit"))
             q.put(None)
-        except (NetworkError, APIError, ValueError) as e:
+        except ProviderError as e:
             q.put(_error_sse(str(e)))
             q.put(None)
 
@@ -603,9 +583,9 @@ async def _stream_completion(
                 "model": model,
                 "choices": [],
                 "usage": {
-                    "prompt_tokens": len(prompt) // 4,
+                    "prompt_tokens": prompt_len // 4,
                     "completion_tokens": 0,
-                    "total_tokens": len(prompt) // 4,
+                    "total_tokens": prompt_len // 4,
                 },
             })
     finally:
