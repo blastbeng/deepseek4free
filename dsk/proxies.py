@@ -25,6 +25,16 @@ and deduplicated):
   DSF_PROXY_MODE       random (default) | round | single
   DSF_PROXY_EXCLUDE    comma-separated providers that always go direct
   DSF_PROXY_COOLDOWN   seconds a proxy is skipped after a runtime failure
+  DSF_PROXY_ROTATE_TTL seconds a provider keeps its assigned proxy before
+                       it is re-randomized (default 300)
+
+Provider randomization: every provider (deepseek/gemini/chatgpt/...) gets
+its OWN proxy, picked randomly and preferably distinct from the proxies
+already assigned to other providers — concurrent providers are spread
+across different exit IPs instead of sharing one. Assignments are sticky
+for DSF_PROXY_ROTATE_TTL seconds, then rotate to a new random proxy, and
+are dropped immediately on runtime failure so the provider gets a fresh
+random proxy on the next request.
 
 Health checking (DSF_PROXY_CHECK=true): a background worker periodically
 probes every pooled proxy (concurrent, DSF_PROXY_CHECK_CONCURRENCY workers,
@@ -196,6 +206,7 @@ class _State:
         self.fetched_at: float = 0.0
         self.checked_at: float = 0.0
         self.cooldown: Dict[str, float] = {}  # proxy -> retry-after (epoch)
+        self.assignments: Dict[str, Tuple[str, float]] = {}  # provider -> (proxy, expires)
         self.rr: int = 0
         self.controller_started = False
         self.last_error: str = ''
@@ -214,6 +225,11 @@ def _check_ttl() -> float:
 
 def _check_enabled() -> bool:
     return _env_bool('DSF_PROXY_CHECK')
+
+
+def _rotate_ttl() -> float:
+    """How long a provider keeps its assigned proxy before re-randomizing."""
+    return max(1.0, float(os.getenv('DSF_PROXY_ROTATE_TTL', '300') or 300))
 
 
 def _static_proxies() -> List[str]:
@@ -366,10 +382,17 @@ def all_proxies() -> List[str]:
 
 
 def get_proxy(provider: Optional[str] = None) -> Optional[str]:
-    """Pick a proxy for `provider` (None -> go direct). Never blocks."""
+    """Pick a proxy for `provider` (None -> go direct). Never blocks.
+
+    With a provider key the result is a per-provider sticky assignment:
+    a randomly chosen proxy (distinct from other providers' when possible)
+    kept for DSF_PROXY_ROTATE_TTL seconds, so traffic is randomized across
+    different providers/exit IPs rather than one shared proxy.
+    """
     _ensure_controller()
+    key = provider.strip().lower() if provider and provider.strip() else None
     exclude = {e.strip().lower() for e in os.getenv('DSF_PROXY_EXCLUDE', '').split(',') if e.strip()}
-    if provider and provider.lower() in exclude:
+    if key and key in exclude:
         return None
     pool = all_proxies()
     if not pool:
@@ -380,9 +403,29 @@ def get_proxy(provider: Optional[str] = None) -> Optional[str]:
         candidates = healthy or pool  # until first pass, try the whole pool
         cooldown = float(os.getenv('DSF_PROXY_COOLDOWN', '120') or 120)
         alive = [p for p in candidates if _STATE.cooldown.get(p, 0) <= now]
+        # drop assignments that expired or whose proxy is no longer usable
+        _STATE.assignments = {prov: pair for prov, pair in _STATE.assignments.items()
+                              if pair[1] > now and pair[0] in alive}
+        mode = os.getenv('DSF_PROXY_MODE', 'random').strip().lower()
+        if key:
+            assigned = _STATE.assignments.get(key)
+            if assigned:
+                return assigned[0]
+            if not alive:
+                return None
+            if mode == 'single':
+                proxy = alive[0]
+            else:
+                # randomize between providers: prefer a proxy not yet taken
+                # by another provider; share only if the pool is too small
+                taken = {pair[0] for pair in _STATE.assignments.values()}
+                distinct = [p for p in alive if p not in taken]
+                proxy = random.choice(distinct or alive)
+            _STATE.assignments[key] = (proxy, now + _rotate_ttl())
+            return proxy
+        # provider=None: plain per-request selection (no stickiness)
         if not alive:
             return None
-        mode = os.getenv('DSF_PROXY_MODE', 'random').strip().lower()
         if mode == 'single':
             return alive[0]
         if mode == 'round':
@@ -393,17 +436,25 @@ def get_proxy(provider: Optional[str] = None) -> Optional[str]:
 
 
 def mark_failure(proxy: Optional[str]) -> None:
-    """Put a proxy on cooldown after a runtime failure."""
+    """Put a proxy on cooldown and release any provider assigned to it."""
     if not proxy:
         return
     cooldown = float(os.getenv('DSF_PROXY_COOLDOWN', '120') or 120)
+    now = time.time()
     with _STATE.lock:
-        _STATE.cooldown[proxy] = time.time() + cooldown
+        _STATE.cooldown[proxy] = now + cooldown
+        # force a fresh random assignment for every provider that used it
+        _STATE.assignments = {prov: pair for prov, pair in _STATE.assignments.items()
+                              if pair[0] != proxy}
 
 
 def proxies_kwargs(provider: Optional[str] = None,
                    url: Optional[str] = None) -> Dict[str, Any]:
     """Kwargs to splat into requests/curl_cffi calls for `provider`/`url`."""
+    # defensive: a URL accidentally passed positionally as provider
+    if provider and '://' in provider:
+        url = url or provider
+        provider = None
     provider = provider or _provider_for_url(url or '')
     proxy = get_proxy(provider)
     if not proxy:
@@ -427,6 +478,11 @@ def active_summary() -> str:
         parts.append("auto-sources=on")
     mode = os.getenv('DSF_PROXY_MODE', 'random').strip().lower() or 'random'
     parts.append(f"mode={mode}")
+    with _STATE.lock:
+        assignments = {prov: pair[0] for prov, pair in _STATE.assignments.items()}
+    if assignments:
+        parts.append("assigned=" + ','.join(f"{prov}->{p.split('://', 1)[-1]}"
+                                            for prov, p in sorted(assignments.items())))
     if err:
         parts.append(f"last_error={err[:80]}")
     return 'direct' if not pool_n else ', '.join(parts)

@@ -296,7 +296,12 @@ def _error_response(message: str, err_type: str, code: str, status: int) -> JSON
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    try:
+        from . import proxies as _proxies
+        proxy_summary = _proxies.active_summary()
+    except Exception:
+        proxy_summary = 'unavailable'
+    return {"status": "ok", "proxy": proxy_summary}
 
 
 @app.get("/")

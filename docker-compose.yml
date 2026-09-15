@@ -47,6 +47,7 @@ services:
       - DSF_PROXY_MODE=${DSF_PROXY_MODE:-random}
       - DSF_PROXY_EXCLUDE=${DSF_PROXY_EXCLUDE:-}
       - DSF_PROXY_COOLDOWN=${DSF_PROXY_COOLDOWN:-120}
+      - DSF_PROXY_ROTATE_TTL=${DSF_PROXY_ROTATE_TTL:-300}
       - DOCKERMODE=true
     networks:
       # Reaches the torproxy container (SOCKS5) running on this shared network

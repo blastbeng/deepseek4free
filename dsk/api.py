@@ -144,7 +144,7 @@ class DeepSeekAPI:
                     pow_response = self.pow_solver.solve_challenge(challenge)
                     headers = self._get_headers(pow_response)
 
-                proxy_kw = _proxies.proxies_kwargs(url)
+                proxy_kw = _proxies.proxies_kwargs(url=url)
                 response = requests.request(
                     method=method,
                     url=url,
@@ -256,7 +256,7 @@ class DeepSeekAPI:
                 )
             )
 
-            proxy_kw = _proxies.proxies_kwargs(f"{self.BASE_URL}/chat/completion")
+            proxy_kw = _proxies.proxies_kwargs(url=f"{self.BASE_URL}/chat/completion")
             response = requests.post(
                 f"{self.BASE_URL}/chat/completion",
                 headers=headers,

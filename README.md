@@ -125,17 +125,91 @@ The result: aider, **AiderDesk agent mode**, and every other function-calling cl
 
 ## 🔀 Providers (all reverse-engineered — no official API keys)
 
-| Provider | Auth | Models |
-|---|---|---|
-| **DeepSeek** | `userToken` from `chat.deepseek.com` localStorage | 3 web-app modes (`deepseek-chat`, `deepseek-reasoner`, `deepseek-search`) |
-| **Gemini (Web)** | `__Secure-1PSID` / `__Secure-1PSIDTS` cookies from `gemini.google.com` | Discovered live from the web session |
-| **ChatGPT (Web)** | session cookies (or accessToken) from `chatgpt.com` | Discovered live via `/backend-api/models` |
+Three free providers are supported. Each one borrows the credentials of a
+normal browser session — no API keys, no payments. Providers without
+configured credentials are simply skipped; the server runs with whichever
+are available. Configure them in `.env` (see `cp .env.example .env`) and
+restart the stack (`sudo systemctl restart docker-compose@deepseek4free`
+or `docker compose up -d`).
 
-Getting the Gemini cookies: log in at [gemini.google.com](https://gemini.google.com) → DevTools (F12) → Application → Cookies → copy `__Secure-1PSID` and `__Secure-1PSIDTS` into `.env` as `GEMINI_1PSID` / `GEMINI_1PSIDTS`.
+### 1. DeepSeek (`deepseek-chat`, `deepseek-reasoner`, `deepseek-search`)
 
-Getting the ChatGPT session: log in at [chatgpt.com](https://chatgpt.com) → either fetch `https://chatgpt.com/api/auth/session` (copy `accessToken` into `CHATGPT_ACCESS_TOKEN`), or export the cookie jar (DevTools → Application → Cookies) as JSON into `CHATGPT_SESSION_COOKIES` (preferred — the access token is refreshed automatically). Cookie jars can also be dropped as files into the `./data` volume (`gemini_cookies.json`, `chatgpt_cookies.json`).
+Uses your free-account `userToken` from the DeepSeek web app:
 
-Providers without configured credentials are simply skipped; the server runs with whichever providers are available.
+1. Log in at [chat.deepseek.com](https://chat.deepseek.com) (a free account is enough).
+2. Open DevTools (F12) → **Console** and run:
+   `JSON.parse(localStorage.getItem("userToken")).value`
+   (alternative: Network tab → send any chat → copy the `authorization`
+   header value without the `Bearer ` prefix).
+3. Put it in `.env`:
+   ```bash
+   DEEPSEEK_AUTH_TOKEN=userToken value from step 2
+   ```
+4. Cloudflare: nothing to configure — the bypass module solves challenges
+   with a headless Chromium and caches `cf_clearance` in `./data/cookies.json`
+   automatically. If you ever see Cloudflare errors, run `python -m dsk.bypass`
+   once (see *Cloudflare cookies* below).
+
+Notes: the `userToken` expires when you log out or rotate sessions — if
+requests start returning 401, repeat step 2.
+
+### 2. Gemini web (`gemini.google.com`)
+
+Uses the two session cookies of your Google account:
+
+1. Log in at [gemini.google.com](https://gemini.google.com).
+2. DevTools (F12) → **Application** → Cookies → `https://gemini.google.com`.
+3. Copy `__Secure-1PSID` and `__Secure-1PSIDTS` into `.env`:
+   ```bash
+   GEMINI_1PSID=<value of __Secure-1PSID>
+   GEMINI_1PSIDTS=<value of __Secure-1PSIDTS>
+   ```
+4. Models are discovered live from the session (e.g. `gemini-2.5-flash`,
+   `gemini-2.5-pro`) — no model list to configure.
+
+Notes: `__Secure-1PSIDTS` rotates periodically; if discovery fails or
+requests 401, re-copy **both** cookies. A cookie jar can also be dropped
+as a file into the `./data` volume as `gemini_cookies.json`.
+
+### 3. ChatGPT web (`chatgpt.com` backend-api)
+
+Two options — the cookie jar is preferred (the access token is refreshed
+automatically):
+
+1. Log in at [chatgpt.com](https://chatgpt.com).
+2. Either
+   - fetch `https://chatgpt.com/api/auth/session` in the same browser
+     (or DevTools → Network) and copy `accessToken` into `.env`:
+     ```bash
+     CHATGPT_ACCESS_TOKEN=<accessToken>
+     ```
+   - or export the cookie jar (DevTools → Application → Cookies → export,
+     or a JSON array/object of cookies) into `.env`:
+     ```bash
+     CHATGPT_SESSION_COOKIES=<JSON string>
+     ```
+3. Alternatively drop the jar as a file into the `./data` volume as
+   `chatgpt_cookies.json`.
+4. Models are discovered live via `/backend-api/models`.
+
+### Verifying a provider
+
+```bash
+# which routes/models are live (discovered from your sessions):
+curl -s http://localhost:${DSF_PORT:-8000}/v1/models | python3 -m json.tool
+
+# quick smoke test (streaming):
+curl -N -X POST http://localhost:${DSF_PORT:-8000}/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"ping"}],"stream":true}'
+
+# per-provider proxy assignments + pool state:
+curl -s http://localhost:${DSF_PORT:-8000}/health
+```
+
+Unknown model ids are routed by fuzzy match, and per-model fallback
+chains (`DSF_FALLBACKS` / `DSF_DEFAULT_FALLBACKS`) kick in automatically
+when a provider fails.
 
 ---
 
@@ -255,6 +329,7 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_PROXY_MODE` | `random` | Proxy selection: `random`, `round`, or `single` |
 | `DSF_PROXY_EXCLUDE` | *(none)* | Providers that always go direct (e.g. `deepseek`) |
 | `DSF_PROXY_COOLDOWN` | `120` | Seconds a failing proxy is skipped |
+| `DSF_PROXY_ROTATE_TTL` | `300` | Seconds a provider keeps its assigned proxy before re-randomizing |
 | `DSF_PROXY_AUTO` | `false` | Aggregate public free-proxy lists from the web automatically |
 | `DSF_PROXY_SOURCES` | *(built-in)* | Override the auto source list (`socks5=<url>`, ... ) |
 | `DSF_PROXY_MAX_POOL` | `250` | Random sample cap for the aggregated pool |
@@ -304,6 +379,8 @@ DSF_PROXY_LIST_URL=https://example.com/proxy-list.txt
 **Health checking** (`DSF_PROXY_CHECK=true`) — strongly recommended with free lists, where typically only ~10% of published proxies are alive at any moment: a background worker probes every pooled proxy concurrently and traffic only uses the ones that answer. Combined with `DSF_PROXY_COOLDOWN`, a proxy that dies mid-session is skipped and traffic falls back to direct, so a dead pool never breaks the service.
 
 Selection is `random` by default (`DSF_PROXY_MODE=round|single` also available). A proxy that fails is put on cooldown (`DSF_PROXY_COOLDOWN`, 120s) and traffic falls back to direct, so a dead proxy never breaks the service. Providers that misbehave behind proxies (e.g. bot-protection false positives) can be pinned to direct with `DSF_PROXY_EXCLUDE=deepseek`.
+
+**Per-provider randomization:** every provider (`deepseek`, `gemini`, `chatgpt`, …) gets its *own* proxy, chosen randomly and — while the pool is large enough — distinct from the proxies already used by the other providers, so concurrent providers are spread across different exit IPs instead of hammering one shared proxy. Each assignment is sticky for `DSF_PROXY_ROTATE_TTL` seconds (default 300), then the provider is re-randomized; a runtime failure releases the assignment immediately so the next request picks a fresh random proxy. `GET /health` reports current assignments (`assigned=deepseek->1.2.3.4:8080,...`).
 
 Sanity-check your setup from the host: `DSF_PROXY_TOR=true DSF_PROXY_TOR_URL=socks5h://127.0.0.1:9050 python -m dsk.proxies` — it prints each proxy and the exit IP it reaches.
 
