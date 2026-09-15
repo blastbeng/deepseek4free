@@ -59,6 +59,9 @@ class DeepSeekAPI:
 
         self.auth_token = auth_token
         self.pow_solver = DeepSeekPOW()
+        # Track the last JSON-Patch path so events that omit "p" can be
+        # attributed to the right field (DeepSeek stream format)
+        self._last_patch_path = ''
 
         # Load cookies from JSON file (override location with COOKIES_DIR,
         # e.g. a mounted Docker volume at /data)
@@ -269,6 +272,8 @@ class DeepSeekAPI:
                         yield parsed
                         if parsed.get('finish_reason') == 'stop':
                             break
+                except APIError:
+                    raise
                 except Exception as e:
                     raise APIError(f"Error parsing response chunk: {str(e)}")
 
@@ -276,13 +281,21 @@ class DeepSeekAPI:
             raise NetworkError(f"Network error occurred during streaming: {str(e)}")
 
     def _parse_chunk(self, chunk: bytes) -> Optional[Dict[str, Any]]:
-        """Parse a SSE chunk from the API response"""
+        """Parse a SSE chunk from the API response.
+
+        Supports the current DeepSeek stream format (JSON-Patch style events
+        like {"p": "response/content", "o": "APPEND", "v": "..."}) as well as
+        the legacy OpenAI-style {"choices": [{"delta": ...}]} format.
+        """
         if not chunk:
             return None
 
         try:
             if chunk.startswith(b'data: '):
                 data = json.loads(chunk[6:])
+
+                if isinstance(data, dict) and 'v' in data:
+                    return self._parse_patch_chunk(data)
 
                 if 'choices' in data and data['choices']:
                     choice = data['choices'][0]
@@ -296,7 +309,49 @@ class DeepSeekAPI:
                         }
         except json.JSONDecodeError:
             raise APIError("Invalid JSON in response chunk")
+        except APIError:
+            raise
         except Exception as e:
             raise APIError(f"Error parsing chunk: {str(e)}")
 
+        return None
+
+    def _parse_patch_chunk(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Parse a JSON-Patch style stream event.
+
+        Observed events:
+          {"v": {...response object...}}                       -> initial message state
+          {"p": "response/content", "o": "APPEND", "v": "..."} -> content delta
+          {"v": "..."} (right after a content event)           -> implicit content delta
+          {"p": "response/status", "v": "FINISHED"}            -> completion
+          {"p": "response/thinking_content", ...}              -> thinking delta
+        """
+        path = data.get('p', '')
+        value = data.get('v')
+
+        # Initial message snapshot: nothing to stream
+        if isinstance(value, dict):
+            return None
+
+        # Completion signal
+        if 'status' in path and value == 'FINISHED':
+            return {'content': '', 'type': 'text', 'finish_reason': 'stop'}
+
+        # Content delta: explicit path or implicit continuation of the last one
+        if path.endswith('/content') or ('/content' in self._last_patch_path and not path):
+            self._last_patch_path = path or self._last_patch_path
+            if isinstance(value, str) and value:
+                return {'content': value, 'type': 'text', 'finish_reason': None}
+            return None
+
+        # Thinking content delta
+        if 'thinking_content' in path or ('thinking_content' in self._last_patch_path and not path):
+            self._last_patch_path = path or self._last_patch_path
+            if isinstance(value, str) and value:
+                return {'content': value, 'type': 'thinking', 'finish_reason': None}
+            return None
+
+        # Any other path (token usage, tips, search results...) is ignored,
+        # but remember it in case the next event omits the path
+        self._last_patch_path = path
         return None
