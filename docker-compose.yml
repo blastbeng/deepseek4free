@@ -1,7 +1,7 @@
 services:
   deepseek4free:
     build: .
-    image: deepseek4free:latest
+    image: blastbeng/deepseek4free:latest
     container_name: deepseek4free
     # Lifecycle managed by systemd (docker-compose@.service)
     restart: no
