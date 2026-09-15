@@ -149,6 +149,10 @@ for chunk in resp:
 
 Streaming responses include the model's reasoning as `reasoning_content` deltas for `deepseek-reasoner`.
 
+### Agent coding / tool calling
+
+The DeepSeek web API has no native function calling, so this server **emulates OpenAI tool calling**: when a request includes `tools`, the model is given a tool protocol and its `TOOL_CALL: {json}` answers are parsed back into standard `tool_calls` responses (`finish_reason: "tool_calls"`, assistant `tool_calls` history and `[Tool result]` messages are rendered into the prompt). This makes **AiderDesk agent mode, aider, and other function-calling clients work end-to-end**. Tools are only advertised when requested (`tool_choice: "none"` disables them); standard OpenAI parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `stream_options.include_usage`, …) are accepted and tolerated.
+
 ### Configuration (env vars)
 
 | Variable | Default | Description |
