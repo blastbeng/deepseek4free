@@ -28,13 +28,22 @@ services:
       - DSF_MODELS_TTL=${DSF_MODELS_TTL:-300}
       - DSF_FALLBACKS=${DSF_FALLBACKS:-}
       - DSF_DEFAULT_FALLBACKS=${DSF_DEFAULT_FALLBACKS:-}
-      # Outbound proxy rotation (dsk/proxies.py): Tor + arbitrary proxy lists
+      # Outbound proxy rotation (dsk/proxies.py): Tor + automatic free proxies
       - DSF_PROXY=${DSF_PROXY:-}
       - DSF_PROXIES=${DSF_PROXIES:-}
       - DSF_PROXY_TOR=${DSF_PROXY_TOR:-false}
       - DSF_PROXY_TOR_URL=${DSF_PROXY_TOR_URL:-socks5h://torproxy:9050}
+      - DSF_PROXY_AUTO=${DSF_PROXY_AUTO:-false}
+      - DSF_PROXY_SOURCES=${DSF_PROXY_SOURCES:-}
+      - DSF_PROXY_MAX_POOL=${DSF_PROXY_MAX_POOL:-250}
       - DSF_PROXY_LIST_URL=${DSF_PROXY_LIST_URL:-}
-      - DSF_PROXY_LIST_TTL=${DSF_PROXY_LIST_TTL:-3600}
+      - DSF_PROXY_LIST_URLS=${DSF_PROXY_LIST_URLS:-}
+      - DSF_PROXY_LIST_TTL=${DSF_PROXY_LIST_TTL:-1800}
+      - DSF_PROXY_CHECK=${DSF_PROXY_CHECK:-false}
+      - DSF_PROXY_CHECK_URL=${DSF_PROXY_CHECK_URL:-https://api.ipify.org?format=json}
+      - DSF_PROXY_CHECK_TTL=${DSF_PROXY_CHECK_TTL:-1800}
+      - DSF_PROXY_CHECK_TIMEOUT=${DSF_PROXY_CHECK_TIMEOUT:-8}
+      - DSF_PROXY_CHECK_CONCURRENCY=${DSF_PROXY_CHECK_CONCURRENCY:-24}
       - DSF_PROXY_MODE=${DSF_PROXY_MODE:-random}
       - DSF_PROXY_EXCLUDE=${DSF_PROXY_EXCLUDE:-}
       - DSF_PROXY_COOLDOWN=${DSF_PROXY_COOLDOWN:-120}

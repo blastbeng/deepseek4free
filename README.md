@@ -255,6 +255,14 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_PROXY_MODE` | `random` | Proxy selection: `random`, `round`, or `single` |
 | `DSF_PROXY_EXCLUDE` | *(none)* | Providers that always go direct (e.g. `deepseek`) |
 | `DSF_PROXY_COOLDOWN` | `120` | Seconds a failing proxy is skipped |
+| `DSF_PROXY_AUTO` | `false` | Aggregate public free-proxy lists from the web automatically |
+| `DSF_PROXY_SOURCES` | *(built-in)* | Override the auto source list (`socks5=<url>`, ... ) |
+| `DSF_PROXY_MAX_POOL` | `250` | Random sample cap for the aggregated pool |
+| `DSF_PROXY_LIST_URLS` | *(none)* | Extra list URL(s) (text/JSON) fetched with `DSF_PROXY_LIST_TTL` |
+| `DSF_PROXY_CHECK` | `false` | Background health probing; traffic only uses alive proxies |
+| `DSF_PROXY_CHECK_TTL` | `1800` | Healthy-lease duration / re-check interval |
+| `DSF_PROXY_CHECK_TIMEOUT` | `8` | Per-probe timeout in seconds |
+| `DSF_PROXY_CHECK_CONCURRENCY` | `24` | Concurrent health probes |
 
 ---
 
@@ -282,9 +290,18 @@ DSF_PROXY_TOR=true
 DSF_PROXY=socks5h://torproxy:9050
 DSF_PROXIES=socks5://1.2.3.4:1080,http://5.6.7.8:8080
 
-# Or fetch a dynamic proxy list from the web (plain text or JSON), refreshed hourly:
+# FULLY DYNAMIC: automatically aggregate public free-proxy lists from the web
+# (TheSpeedX, monosans, proxifly, proxyscrape, roosterkid, geonode — verified
+# working sources), refreshed every 30 min and randomly sampled to 250:
+DSF_PROXY_AUTO=true
+DSF_PROXY_MAX_POOL=250
+# Optional custom sources ("socks5=<url>" sets the scheme):
+DSF_PROXY_SOURCES=socks5=https://example.com/socks5.txt
+# Optional extra list URL(s) (plain text or JSON):
 DSF_PROXY_LIST_URL=https://example.com/proxy-list.txt
 ```
+
+**Health checking** (`DSF_PROXY_CHECK=true`) — strongly recommended with free lists, where typically only ~10% of published proxies are alive at any moment: a background worker probes every pooled proxy concurrently and traffic only uses the ones that answer. Combined with `DSF_PROXY_COOLDOWN`, a proxy that dies mid-session is skipped and traffic falls back to direct, so a dead pool never breaks the service.
 
 Selection is `random` by default (`DSF_PROXY_MODE=round|single` also available). A proxy that fails is put on cooldown (`DSF_PROXY_COOLDOWN`, 120s) and traffic falls back to direct, so a dead proxy never breaks the service. Providers that misbehave behind proxies (e.g. bot-protection false positives) can be pinned to direct with `DSF_PROXY_EXCLUDE=deepseek`.
 
