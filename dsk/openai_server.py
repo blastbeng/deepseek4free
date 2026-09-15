@@ -473,6 +473,7 @@ async def _stream_completion(
     # awaits items via run_in_executor (asyncio.Queue is NOT thread-safe
     # for cross-thread put_nowait and can deadlock the event loop).
     q: "queue.Queue[Optional[str]]" = queue.Queue()
+    finish_holder = {"reason": "stop"}
 
     def _worker():
         buffered_text: List[str] = []
@@ -532,6 +533,7 @@ async def _stream_completion(
                                      }]},
                                      "finish_reason": None}],
                     }))
+                    finish_holder["reason"] = "tool_calls"
                 elif buffered_text:
                     q.put(_sse({
                         "id": cid, "object": "chat.completion.chunk",
@@ -566,7 +568,7 @@ async def _stream_completion(
             "created": created,
             "model": model,
             "choices": [
-                {"index": 0, "delta": {}, "finish_reason": "stop"}
+                {"index": 0, "delta": {}, "finish_reason": finish_holder["reason"]}
             ],
         }
         yield _sse(done)
