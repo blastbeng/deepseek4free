@@ -22,6 +22,24 @@ except ImportError:  # pragma: no cover - curl_cffi is in requirements.txt
 
 import requests as std_requests
 
+try:  # optional outbound proxy rotation (dsk/proxies.py)
+    from dsk import proxies as _proxies
+except Exception:
+    try:
+        from .. import proxies as _proxies
+    except Exception:
+        _proxies = None
+
+
+def proxy_kwargs_for(url: str) -> Dict[str, Any]:
+    """Proxy kwargs for the host in ``url`` ({} when proxies are disabled)."""
+    if _proxies is None:
+        return {}
+    try:
+        return _proxies.proxies_kwargs(url=url)
+    except Exception:
+        return {}
+
 
 class ProviderError(Exception):
     """Base class for provider failures."""
@@ -98,37 +116,44 @@ class Route:
 
 def http_post_stream(url: str, headers: Optional[Dict[str, str]] = None,
                      json_body: Optional[Dict[str, Any]] = None,
-                     timeout: int = 600):
+                     timeout: int = 600, proxies: Optional[Dict[str, str]] = None):
     """POST and return a streaming response.
 
     Uses curl_cffi with a Chrome TLS fingerprint when available — required for
     Cloudflare-protected hosts (chat.deepseek.com, chatgpt.com).
     """
+    extra = {'proxies': proxies} if proxies else proxy_kwargs_for(url)
     if cffi_requests is not None:
         return cffi_requests.post(
             url, headers=headers or {}, json=json_body,
             stream=True, impersonate='chrome120', timeout=timeout,
+            **extra,
         )
     return std_requests.post(
         url, headers=headers or {}, json=json_body, stream=True, timeout=timeout,
+        **extra,
     )
 
 
 def http_get(url: str, headers: Optional[Dict[str, str]] = None,
-             cookies: Optional[Dict[str, str]] = None, timeout: int = 60):
+             cookies: Optional[Dict[str, str]] = None, timeout: int = 60,
+             proxies: Optional[Dict[str, str]] = None):
     """GET a URL and return the raw response.
 
     Uses curl_cffi with a Chrome TLS fingerprint when available — required for
     Cloudflare-protected hosts (chatgpt.com, gemini.google.com). Callers check
     ``status_code`` and parse the body themselves (JSON or HTML scrape).
     """
+    extra = {'proxies': proxies} if proxies else proxy_kwargs_for(url)
     if cffi_requests is not None:
         return cffi_requests.get(
             url, headers=headers or {}, cookies=cookies or None,
             impersonate='chrome120', timeout=timeout,
+            **extra,
         )
     return std_requests.get(
         url, headers=headers or {}, cookies=cookies or None, timeout=timeout,
+        **extra,
     )
 
 

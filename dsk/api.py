@@ -2,6 +2,10 @@ from curl_cffi import requests
 from typing import Optional, Dict, Any, Generator, Literal
 import json
 from .pow import DeepSeekPOW
+try:  # optional outbound proxy rotation (dsk/proxies.py)
+    from . import proxies as _proxies
+except ImportError:  # pragma: no cover - standalone use
+    import proxies as _proxies
 import sys
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -140,6 +144,7 @@ class DeepSeekAPI:
                     pow_response = self.pow_solver.solve_challenge(challenge)
                     headers = self._get_headers(pow_response)
 
+                proxy_kw = _proxies.proxies_kwargs(url)
                 response = requests.request(
                     method=method,
                     url=url,
@@ -147,7 +152,8 @@ class DeepSeekAPI:
                     json=json_data,
                     cookies=self.cookies,
                     impersonate='chrome120',
-                    timeout=None
+                    timeout=None,
+                    **proxy_kw
                 )
 
                 # Check if we hit Cloudflare protection
@@ -174,6 +180,7 @@ class DeepSeekAPI:
                     raise APIError("Empty or non-JSON response from server", response.status_code)
 
             except requests.exceptions.RequestException as e:
+                _proxies.mark_failure(proxy_kw.get('proxies', {}).get('https'))
                 raise NetworkError(f"Network error occurred: {str(e)}")
             except json.JSONDecodeError:
                 raise APIError("Invalid JSON response from server")
@@ -249,6 +256,7 @@ class DeepSeekAPI:
                 )
             )
 
+            proxy_kw = _proxies.proxies_kwargs(f"{self.BASE_URL}/chat/completion")
             response = requests.post(
                 f"{self.BASE_URL}/chat/completion",
                 headers=headers,
@@ -256,7 +264,8 @@ class DeepSeekAPI:
                 cookies=self.cookies,  # Add cookies
                 impersonate='chrome120',
                 stream=True,
-                timeout=None
+                timeout=None,
+                **proxy_kw
             )
 
             if response.status_code != 200:

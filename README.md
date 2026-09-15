@@ -247,6 +247,14 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_FALLBACKS` | *(none)* | JSON map of per-model fallback chains, e.g. `{"deepseek-chat": ["deepseek-reasoner"]}` |
 | `DSF_DEFAULT_FALLBACKS` | *(none)* | Comma-separated fallbacks applied to every route |
 | `COOKIES_DIR` | *(none)* (Docker: `/data`) | Directory where provider cookie files are persisted |
+| `DSF_PROXY_TOR` | `false` | Route provider traffic through the local Tor SOCKS5 proxy |
+| `DSF_PROXY_TOR_URL` | `socks5h://torproxy:9050` | Tor proxy URL (docker-network service name) |
+| `DSF_PROXY` / `DSF_PROXIES` | *(none)* | Single / comma-separated proxy URLs |
+| `DSF_PROXY_LIST_URL` | *(none)* | URL fetching a dynamic proxy list (text/JSON), TTL-refreshed |
+| `DSF_PROXY_LIST_TTL` | `3600` | Seconds between dynamic proxy list refreshes |
+| `DSF_PROXY_MODE` | `random` | Proxy selection: `random`, `round`, or `single` |
+| `DSF_PROXY_EXCLUDE` | *(none)* | Providers that always go direct (e.g. `deepseek`) |
+| `DSF_PROXY_COOLDOWN` | `120` | Seconds a failing proxy is skipped |
 
 ---
 
@@ -258,6 +266,31 @@ In normal operation cookies are fetched and refreshed automatically. If you hit 
 2. In Docker the `./data` directory (bind-mounted to `/data`) persists cookies at `/data/cookies.json` across restarts — `dsk/api.py` picks them up automatically.
 
 You only need this when you see Cloudflare challenges, your `cf_clearance` cookie expired, or you get "Please wait a few minutes before trying again".
+
+---
+
+## 🔀 Proxy rotation (rate-limit friendly)
+
+All outbound provider traffic can be routed through one or more **outbound proxies** to spread requests across exit IPs and soften per-IP rate limiting. Configure in `.env`:
+
+```bash
+# Use the local Tor proxy (the compose file attaches the container to the
+# shared "ai-mcp" docker network where the torproxy container runs):
+DSF_PROXY_TOR=true
+
+# Or any single proxy / comma-separated list:
+DSF_PROXY=socks5h://torproxy:9050
+DSF_PROXIES=socks5://1.2.3.4:1080,http://5.6.7.8:8080
+
+# Or fetch a dynamic proxy list from the web (plain text or JSON), refreshed hourly:
+DSF_PROXY_LIST_URL=https://example.com/proxy-list.txt
+```
+
+Selection is `random` by default (`DSF_PROXY_MODE=round|single` also available). A proxy that fails is put on cooldown (`DSF_PROXY_COOLDOWN`, 120s) and traffic falls back to direct, so a dead proxy never breaks the service. Providers that misbehave behind proxies (e.g. bot-protection false positives) can be pinned to direct with `DSF_PROXY_EXCLUDE=deepseek`.
+
+Sanity-check your setup from the host: `DSF_PROXY_TOR=true DSF_PROXY_TOR_URL=socks5h://127.0.0.1:9050 python -m dsk.proxies` — it prints each proxy and the exit IP it reaches.
+
+> Note: DeepSeek rate limits are mostly **per-account**, so Tor helps most for the Gemini/ChatGPT web providers and for IP-level throttling. Tor exit nodes are also sometimes blocked by bot protection — use `DSF_PROXY_EXCLUDE` to tune per provider.
 
 ---
 

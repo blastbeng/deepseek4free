@@ -28,8 +28,24 @@ services:
       - DSF_MODELS_TTL=${DSF_MODELS_TTL:-300}
       - DSF_FALLBACKS=${DSF_FALLBACKS:-}
       - DSF_DEFAULT_FALLBACKS=${DSF_DEFAULT_FALLBACKS:-}
+      # Outbound proxy rotation (dsk/proxies.py): Tor + arbitrary proxy lists
+      - DSF_PROXY=${DSF_PROXY:-}
+      - DSF_PROXIES=${DSF_PROXIES:-}
+      - DSF_PROXY_TOR=${DSF_PROXY_TOR:-false}
+      - DSF_PROXY_TOR_URL=${DSF_PROXY_TOR_URL:-socks5h://torproxy:9050}
+      - DSF_PROXY_LIST_URL=${DSF_PROXY_LIST_URL:-}
+      - DSF_PROXY_LIST_TTL=${DSF_PROXY_LIST_TTL:-3600}
+      - DSF_PROXY_MODE=${DSF_PROXY_MODE:-random}
+      - DSF_PROXY_EXCLUDE=${DSF_PROXY_EXCLUDE:-}
+      - DSF_PROXY_COOLDOWN=${DSF_PROXY_COOLDOWN:-120}
       - DOCKERMODE=true
+    networks:
+      # Reaches the torproxy container (SOCKS5) running on this shared network
+      - ai-mcp
     volumes:
       # Persist cf_clearance cookies across container restarts (local ./data dir)
       - ./data:/data
     shm_size: "1gb"
+networks:
+  ai-mcp:
+    external: true

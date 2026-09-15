@@ -8,3 +8,4 @@ uvicorn[standard]
 pydantic
 python-dotenv
 pyvirtualdisplay
+pysocks
