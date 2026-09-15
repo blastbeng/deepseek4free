@@ -30,6 +30,7 @@ Configuration (env):
     DSF_DEFAULT_FALLBACKS  comma list applied to routes without explicit fallbacks
 """
 
+import importlib
 import json
 import logging
 import os
@@ -48,8 +49,47 @@ from .base import (
 from .deepseek_provider import DeepSeekProvider
 from .gemini_provider import GeminiWebProvider
 from .chatgpt_provider import ChatGPTProvider
+from .claude_provider import ClaudeWebProvider
+from .grok_provider import GrokProvider
+from .mistral_provider import MistralProvider
+from .qwen_provider import QwenProvider
+from .kimi_provider import KimiProvider
+from .copilot_provider import CopilotProvider
+from .perplexity_provider import PerplexityProvider
+from .glm_provider import GlmProvider
 
 logger = logging.getLogger('dsk.router')
+
+# Registry master list: name -> (module, provider class). Both __init__ and
+# the self-healing reload walk this single map so no provider can be wired
+# in one place and forgotten in the other.
+PROVIDER_MODULES = (
+    ('deepseek', '.deepseek_provider', 'DeepSeekProvider'),
+    ('gemini', '.gemini_provider', 'GeminiWebProvider'),
+    ('chatgpt', '.chatgpt_provider', 'ChatGPTProvider'),
+    ('claude', '.claude_provider', 'ClaudeWebProvider'),
+    ('grok', '.grok_provider', 'GrokProvider'),
+    ('mistral', '.mistral_provider', 'MistralProvider'),
+    ('qwen', '.qwen_provider', 'QwenProvider'),
+    ('kimi', '.kimi_provider', 'KimiProvider'),
+    ('copilot', '.copilot_provider', 'CopilotProvider'),
+    ('perplexity', '.perplexity_provider', 'PerplexityProvider'),
+    ('glm', '.glm_provider', 'GlmProvider'),
+)
+
+OWNED_BY = {
+    'deepseek': 'deepseek4free',
+    'gemini': 'google',
+    'chatgpt': 'openai',
+    'claude': 'anthropic',
+    'grok': 'xai',
+    'mistral': 'mistral',
+    'qwen': 'alibaba',
+    'kimi': 'moonshot',
+    'copilot': 'microsoft',
+    'perplexity': 'perplexity',
+    'glm': 'zai',
+}
 
 MAX_RETRIES = int(os.getenv('DSF_MAX_RETRIES', '2'))
 RETRY_BACKOFF = float(os.getenv('DSF_RETRY_BACKOFF', '2.0'))
@@ -89,9 +129,8 @@ class Router:
 
     def __init__(self) -> None:
         self.providers: Dict[str, Provider] = {
-            'deepseek': DeepSeekProvider(),
-            'gemini': GeminiWebProvider(),
-            'chatgpt': ChatGPTProvider(),
+            name: getattr(importlib.import_module(module, __package__), cls)()
+            for name, module, cls in PROVIDER_MODULES
         }
         self.routes: Dict[str, Route] = {}
         self._lock = threading.Lock()
@@ -203,19 +242,12 @@ class Router:
         under the lock, then re-bootstraps DeepSeek's config-derived routes
         and forces a full re-discovery of the web providers.
         """
-        import importlib
         with self._lock:
             new_providers = {}
-            for name, module_name in (
-                ('deepseek', '.deepseek_provider'),
-                ('gemini', '.gemini_provider'),
-                ('chatgpt', '.chatgpt_provider'),
-            ):
+            for name, module_name, class_name in PROVIDER_MODULES:
                 module = importlib.import_module(module_name, __package__)
                 importlib.reload(module)
-                new_providers[name] = module.DeepSeekProvider() if name == 'deepseek' \
-                    else module.GeminiWebProvider() if name == 'gemini' \
-                    else module.ChatGPTProvider()
+                new_providers[name] = getattr(module, class_name)()
             self.providers = new_providers
             self._refreshed_at = 0.0
         changed = False
@@ -262,10 +294,8 @@ class Router:
                 'id': r.model_id,
                 'object': 'model',
                 'created': 1700000000,
-                'owned_by': {'deepseek': 'deepseek4free',
-                             'gemini': 'google',
-                             'chatgpt': 'openai'}.get(r.provider_name,
-                                                      r.provider_name),
+                'owned_by': OWNED_BY.get(r.provider_name,
+                                         r.provider_name),
                 'context_length': r.context_length,
                 'max_model_len': r.context_length,
                 'max_completion_tokens': r.max_output_tokens,

@@ -164,6 +164,7 @@ black.py
 test.py
 dsk/cookies.json
 cookies.json
+dsk/*_cookies.json
 data/
 .aider*
 .playwright-mcp/

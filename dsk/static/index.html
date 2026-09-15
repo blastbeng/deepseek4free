@@ -89,6 +89,15 @@
   .badge { font-size: 10px; padding: 1px 6px; border-radius: 8px;
            border: 1px solid var(--border); color: var(--muted); }
   .badge.on { color: var(--ok); border-color: var(--ok); }
+  #health { cursor: default; max-width: 220px; overflow: hidden;
+            text-overflow: ellipsis; white-space: nowrap; }
+  #health.ok { color: var(--ok); border-color: var(--ok); }
+  #health.bad { color: var(--err); border-color: var(--err); }
+  #health.wait { color: var(--warn); border-color: var(--warn); }
+  #empty { align-self: center; text-align: center; color: var(--muted);
+           padding: 30px 20px; }
+  #empty .sugg { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+  #empty .sugg button { font-size: 12px; }
   #stats { font-size: 11px; color: var(--muted); font-family: var(--mono); min-height: 15px; }
   #stats .pulse { color: var(--accent); animation: blink 1s infinite; }
   @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: .2; } }
@@ -124,7 +133,10 @@
   <h1>deepseek4free <span>· playground</span></h1>
   <select id="model" title="Model (from GET /v1/models)"></select>
   <span id="flags"></span>
+  <span id="health" class="badge wait" title="GET /health">health…</span>
   <div class="grow"></div>
+  <button id="regen" title="Regenerate the last reply" disabled>↺ retry</button>
+  <button id="export" title="Export conversation as markdown">⬇</button>
   <button id="gear" class="gear" title="Settings">⚙ settings</button>
   <button id="refresh" title="Reload model list">↻ models</button>
   <button id="clear" title="Clear conversation">✕ clear</button>
@@ -183,7 +195,7 @@ let messages = [];          // {role, content} — content: string | [{type:text
 let pendingImages = [];     // data URLs awaiting send
 let controller = null;      // AbortController for the active stream
 let modelInfo = {};         // id -> {thinking_enabled, search_enabled, vision, ...}
-let statTimer = null, statT0 = 0, statChunks = 0;
+let statTimer = null, statT0 = 0, statChunks = 0, statChars = 0;
 
 $('baseurl').textContent = location.origin;
 
@@ -200,7 +212,8 @@ function contentText(c) {
   return '';
 }
 
-// Minimal markdown: fenced code (with language label), inline code, **bold**.
+// Minimal markdown: fenced code (with language label), inline code,
+// bold/italic, links, headings, lists, hr — all escaped first, so no XSS.
 function renderMd(text) {
   const parts = String(text).split(/```/);
   let html = '';
@@ -215,13 +228,45 @@ function renderMd(text) {
       html += '<pre>' + (lang ? '<div class="lang">' + esc(lang) + '</div>' : '') +
               '<code>' + esc(seg.replace(/\n$/, '')) + '</code></pre>';
     } else {
-      let t = esc(parts[i]);
-      t = t.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-      t = t.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
-      html += t;
+      const lines = esc(parts[i]).split('\n');
+      let out = '', inList = null;           // null | 'ul' | 'ol'
+      const closeList = () => { if (inList) { out += '</' + inList + '>'; inList = null; } };
+      for (const line of lines) {
+        let t = line;
+        let li = null;
+        let m;
+        if (/^\s*$/.test(t)) { closeList(); continue; }
+        if (/^\s*(-{3,}|\*{3,})\s*$/.test(t)) { closeList(); out += '<hr>'; continue; }
+        if ((m = t.match(/^\s*(#{1,4})\s+(.*\S)\s*$/))) {
+          closeList();
+          const lvl = m[1].length;
+          out += '<b style="font-size:' + (17 - lvl) + 'px">' + inline(m[2]) + '</b>';
+          continue;
+        }
+        if ((m = t.match(/^(\s*)[-*+]\s+(.*\S)\s*$/))) { li = 'ul'; }
+        else if ((m = t.match(/^(\s*)\d+[.)]\s+(.*\S)\s*$/))) { li = 'ol'; }
+        if (li) {
+          if (inList !== li) { closeList(); out += '<' + li + ' style="margin:4px 0;padding-left:22px">'; inList = li; }
+          out += '<li>' + inline(m[2]) + '</li>';
+          continue;
+        }
+        closeList();
+        out += inline(t) + '<br>';
+      }
+      closeList();
+      html += out.replace(/(<br>)+$/, '');
     }
   }
   return html;
+
+  function inline(t) {
+    t = t.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+    t = t.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+    t = t.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, '$1<i>$2</i>');
+    t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    return t;
+  }
 }
 
 function setRaw(body, text) {
@@ -330,18 +375,23 @@ function setBusy(busy) {
 }
 
 function startStatus() {
-  statT0 = performance.now(); statChunks = 0;
+  statT0 = performance.now(); statChunks = 0; statChars = 0;
   statTimer = setInterval(() => {
     const s = ((performance.now() - statT0) / 1000).toFixed(1);
-    $('stats').innerHTML = '<span class="pulse">●</span> ' + s + 's · ' + statChunks + ' chunks';
+    $('stats').innerHTML = '<span class="pulse">●</span> ' + s + 's · ' +
+      statChunks + ' chunks · ' + statChars + ' chars';
   }, 200);
 }
 
 function stopStatus(kind) {
   if (statTimer) { clearInterval(statTimer); statTimer = null; }
   const secs = ((performance.now() - statT0) / 1000).toFixed(1);
-  if (kind === 'done' && statChunks > 0) $('stats').textContent = 'last: ' + secs + 's · ~' + statChunks + ' chunks';
-  else if (kind === 'stop') $('stats').textContent = 'stopped: ' + secs + 's · ' + statChunks + ' chunks';
+  const cps = secs > 0 ? Math.round(statChars / secs) : 0;
+  if (kind === 'done' && statChunks > 0) $('stats').textContent =
+    'last: ' + secs + 's · ~' + statChunks + ' chunks · ' + statChars +
+    ' chars · ' + cps + ' chars/s';
+  else if (kind === 'stop') $('stats').textContent =
+    'stopped: ' + secs + 's · ' + statChunks + ' chunks · ' + statChars + ' chars';
   else if (kind === 'error') $('stats').textContent = 'failed: ' + secs + 's';
 }
 
@@ -460,7 +510,12 @@ async function send() {
     errorBubble('Model "' + modelSel.value + '" does not support vision — image(s) dropped. Pick a 📷-flagged model.', 'client', 'model_does_not_support_vision');
     return;
   }
+  await runCompletion();
+}
 
+// Stream one assistant turn from the current `messages` tail. Shared by
+// send() and the ↺ retry button.
+async function runCompletion() {
   const b = addBubble('bot');
   const think = { el: null, text: '' };
   let answer = '';
@@ -522,7 +577,7 @@ async function send() {
         }
         if (delta.content) {
           answer += delta.content;
-          statChunks++;
+          statChunks++; statChars += delta.content.length;
           setRaw(b.body, answer);
           chat.scrollTop = chat.scrollHeight;
         }
@@ -547,6 +602,7 @@ async function send() {
     setBusy(false);
     controller = null;
     persist();
+    refreshRegen();
   }
 }
 
@@ -579,12 +635,102 @@ $('temp').addEventListener('input', () => {
   $('tempVal').textContent = parseFloat($('temp').value).toFixed(2);
 });
 
+// ---------- health pill (GET /health every 30s) ----------
+async function pollHealth() {
+  const el = $('health');
+  try {
+    const r = await fetch('/health', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const h = await r.json();
+    const ok = h.status === 'ok';
+    el.className = 'badge ' + (ok ? 'ok' : 'bad');
+    el.title = 'GET /health\n' +
+      'status: ' + JSON.stringify(h.status) + '\n' +
+      'proxy: ' + JSON.stringify(h.proxy) + '\n' +
+      'selfheal: ' + JSON.stringify(h.selfheal) + '\n' +
+      'refresher: ' + JSON.stringify(h.refresher);
+    el.textContent = ok ? 'healthy' : 'degraded';
+  } catch (e) {
+    el.className = 'badge bad';
+    el.textContent = 'unreachable';
+    el.title = 'GET /health failed: ' + e.message;
+  }
+}
+setInterval(pollHealth, 30000);
+pollHealth();
+
+// ---------- regenerate last reply ----------
+function canRegen() {
+  return !controller && messages.some(m => m.role === 'user') &&
+    messages[messages.length - 1]?.role === 'assistant';
+}
+function refreshRegen() { $('regen').disabled = !canRegen(); }
+$('regen').onclick = async () => {
+  if (!canRegen()) return;
+  while (messages.length && messages[messages.length - 1].role === 'assistant') messages.pop();
+  const bubbles = chat.querySelectorAll('.msg.bot, .msg.error');
+  for (const b of bubbles) b.remove();
+  persist();
+  await runCompletion();
+};
+
+// ---------- export conversation as markdown ----------
+$('export').onclick = () => {
+  if (!messages.length) return;
+  const lines = ['# deepseek4free conversation', '',
+    '*model:* ' + (modelSel.value || '?') + ' · *exported:* ' +
+    new Date().toISOString(), ''];
+  for (const m of messages) {
+    lines.push('## ' + (m.role === 'assistant' ? 'Assistant' :
+      m.role === 'user' ? 'User' : 'System'), '');
+    lines.push(typeof m.content === 'string' ? m.content : contentText(m.content), '');
+  }
+  const blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'deepseek4free-' + new Date().toISOString().slice(0, 19)
+    .replace(/[:T]/g, '-') + '.md';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+};
+
+// ---------- empty state ----------
+const SUGGESTIONS = [
+  'Explain the Byzantine Generals problem like I am five',
+  'Write a Python script that watches a folder and syncs it to S3',
+  'Summarize the trade-offs between SQLite and Postgres',
+];
+function refreshEmpty() {
+  let el = $('empty');
+  const need = messages.length === 0 && !controller;
+  if (need && !el) {
+    el = document.createElement('div');
+    el.id = 'empty';
+    el.innerHTML = '<div style="font-size:34px">🐋</div>' +
+      '<div>Pick a model and start chatting — replies stream live.</div>' +
+      '<div class="sugg"></div>';
+    const box = el.querySelector('.sugg');
+    for (const s of SUGGESTIONS) {
+      const b = document.createElement('button');
+      b.textContent = s;
+      b.onclick = () => { $('prompt').value = s; autoGrow(); $('prompt').focus(); };
+      box.appendChild(b);
+    }
+    chat.appendChild(el);
+  } else if (!need && el) el.remove();
+}
+const _refreshEmptyObserver = new MutationObserver(refreshEmpty);
+_refreshEmptyObserver.observe(chat, { childList: true });
+refreshEmpty();
+
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') $('settings').classList.remove('open');
 });
 
 restore();
 loadModels();
+refreshRegen();
+chat.addEventListener('DOMSubtreeModified', refreshRegen);
 </script>
 </body>
 </html>

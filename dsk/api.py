@@ -2,6 +2,7 @@ from curl_cffi import requests
 from typing import Optional, Dict, Any, Generator, Literal
 import json
 from .pow import DeepSeekPOW
+from .providers.base import ProviderAuthError, ProviderRateLimitError
 try:  # optional outbound proxy rotation (dsk/proxies.py)
     from . import proxies as _proxies
 except ImportError:  # pragma: no cover - standalone use
@@ -20,12 +21,12 @@ class DeepSeekError(Exception):
     """Base exception for all DeepSeek API errors"""
     pass
 
-class AuthenticationError(DeepSeekError):
-    """Raised when authentication fails"""
+class AuthenticationError(ProviderAuthError, DeepSeekError):
+    """Raised when authentication fails (also a ProviderAuthError)."""
     pass
 
-class RateLimitError(DeepSeekError):
-    """Raised when API rate limit is exceeded"""
+class RateLimitError(ProviderRateLimitError, DeepSeekError):
+    """Raised when the DeepSeek API rate limits (also ProviderRateLimit)."""
     pass
 
 class NetworkError(DeepSeekError):

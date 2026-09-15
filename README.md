@@ -119,6 +119,15 @@ The result: aider, **AiderDesk agent mode**, and every other function-calling cl
 | `dsk/providers/deepseek_provider.py` | DeepSeek web provider (PoW + Cloudflare bypass) |
 | `dsk/providers/gemini_provider.py` | Gemini web-chat provider (`gemini.google.com` session cookies, no official API) |
 | `dsk/providers/chatgpt_provider.py` | ChatGPT web provider (`chatgpt.com/backend-api` session cookies, no official API) |
+| `dsk/providers/jar.py` | Shared bot-managed cookie-jar helpers (`<name>_cookies.json` + `<NAME>_COOKIES` env fallback) |
+| `dsk/providers/claude_provider.py` | Claude web provider (`claude.ai` temporary conversations, `sessionKey` cookie) |
+| `dsk/providers/grok_provider.py` | Grok web provider (`grok.com` REST app-chat, `sso` cookie, auto image-gen via Aurora) |
+| `dsk/providers/mistral_provider.py` | Mistral Le Chat provider (`chat.mistral.ai`, single create-mode stream call; session-token gated) |
+| `dsk/providers/qwen_provider.py` | Qwen web provider (`chat.qwen.ai` api/v2, bundled `bx-ua` anti-bot fingerprint) |
+| `dsk/providers/kimi_provider.py` | Kimi web provider (`kimi.com` connect+json gRPC-web frames) |
+| `dsk/providers/copilot_provider.py` | Microsoft Copilot provider (`copilot.microsoft.com` websocket, anonymous by default) |
+| `dsk/providers/perplexity_provider.py` | Perplexity provider (`perplexity.ai` SSE ask, Sonar-backed routes) |
+| `dsk/providers/glm_provider.py` | GLM provider (dual backend: anonymous `chat.z.ai` + `chatglm.cn` signed stream) |
 | `dsk/providers/router.py` | Dynamic model discovery (TTL cache) + retry/fallback orchestration |
 | `dsk/static/index.html` | llama.cpp-style playground web UI (served at `/` and `/playground`) |
 | `dsk/wasm/` | DeepSeek's SHA3 WASM module used for PoW |
@@ -127,12 +136,12 @@ The result: aider, **AiderDesk agent mode**, and every other function-calling cl
 
 ## 🔀 Providers (all reverse-engineered — no official API keys)
 
-Three free providers are supported. Each one borrows the credentials of a
-normal browser session — no API keys, no payments. Providers without
-configured credentials are simply skipped; the server runs with whichever
-are available. Configure them in `.env` (see `cp .env.example .env`) and
-restart the stack (`sudo systemctl restart docker-compose@deepseek4free`
-or `docker compose up -d`).
+Eleven free providers are supported. Each one borrows the credentials of a
+normal browser session (or runs fully anonymous) — no API keys, no payments.
+Providers without configured credentials are simply skipped; the server runs
+with whichever are available. Configure them in `.env` (see
+`cp .env.example .env`) and restart the stack
+(`sudo systemctl restart docker-compose@deepseek4free` or `docker compose up -d`).
 
 ### 1. DeepSeek (`deepseek-chat`, `deepseek-reasoner`, `deepseek-search`)
 
@@ -193,6 +202,80 @@ automatically):
 3. Alternatively drop the jar as a file into the `./data` volume as
    `chatgpt_cookies.json`.
 4. Models are discovered live via `/backend-api/models`.
+
+### 4. Claude web (`claude.ai`)
+
+Borrows the `sessionKey` cookie of a logged-in browser session. Every request
+runs in an ephemeral *temporary* conversation that is never persisted to your
+account history.
+
+1. Log in at [claude.ai](https://claude.ai).
+2. DevTools (F12) → **Application** → Cookies → `https://claude.ai` → copy `sessionKey`.
+3. Put it in `.env`: `CLAUDE_SESSION_KEY=sk-ant-sid01-...` (or
+   `CLAUDE_COOKIES={"sessionKey": "..."}`).
+4. Models: `claude-sonnet-4-6`, `claude-opus-4-6`, `claude-haiku-4-5` (thinking included).
+
+### 5. Grok web (`grok.com`)
+
+Borrows the `sso` cookie of a logged-in X/Grok session.
+
+1. Log in at [grok.com](https://grok.com).
+2. DevTools → **Application** → Cookies → `https://grok.com` → copy `sso`.
+3. Put it in `.env`: `GROK_SSO=<value>` (or `GROK_COOKIES={"sso": "..."}`).
+4. Models: `grok-4`, `grok-4-reasoning`, `grok-4-heavy`, `grok-3`, `grok-3-mini`,
+   `grok-deepsearch`; image generation is available via Aurora.
+
+### 6. Mistral Le Chat (`chat.mistral.ai`) — session token required
+
+Anonymous access is now **account-gated upstream** (it returns an "An account
+is now required" upsell instead of model output), so a Le Chat session token
+is **required**: DevTools (F12) → Application → Cookies →
+`https://chat.mistral.ai` → `session_token` → set
+`MISTRAL_SESSION_TOKEN=<value>`. The provider makes a single `POST /api/chat`
+`mode: 'create'` call that both starts the conversation and streams the answer
+(upstream model `mistral-large-2411`, exposed as route `mistral-large`).
+
+### 7. Qwen web (`chat.qwen.ai`)
+
+Borrows the Bearer token of a logged-in session:
+
+1. Log in at [chat.qwen.ai](https://chat.qwen.ai).
+2. DevTools → **Network** → send any message → open an `api/v2/*` request →
+   copy the `Authorization` header value without `Bearer `.
+3. Put it in `.env`: `QWEN_TOKEN=<value>`.
+4. Models: `qwen3.7-max`, `qwen3.6-plus`, `qwen3-coder-plus`, `qwen3.6-35b-a3b`,
+   `qwen3.6-27b`. The bundled `bx-ua` anti-bot fingerprint is configurable via
+   `QWEN_BX_UA`/`QWEN_UMID` if Alibaba changes it.
+
+### 8. Kimi web (`kimi.com`)
+
+Borrows the `token` cookie of a logged-in session:
+
+1. Log in at [kimi.com](https://www.kimi.com).
+2. DevTools → **Application** → Cookies → `https://www.kimi.com` → copy `token`.
+3. Put it in `.env`: `KIMI_TOKEN=<value>` (or `KIMI_COOKIES={"token": "..."}`).
+4. Models: `kimi-k2.6`, `kimi-k2.5` (thinking included).
+
+### 9. Microsoft Copilot (`copilot.microsoft.com`) — anonymous
+
+Works with **zero credentials** (anonymous tier with synthetic device
+cookies, generated and persisted automatically). Paste a whole cookie jar
+JSON for authenticated quality: `COPILOT_COOKIES=<JSON>`. Models:
+`copilot-chat`, `copilot-think`, `copilot-smart` (streams over websocket).
+
+### 10. Perplexity (`perplexity.ai`) — anonymous
+
+Works with **zero credentials** (anonymous search-backed answers). Paste a
+logged-in cookie jar JSON for pro-tier models: `PERPLEXITY_COOKIES=<JSON>`.
+Models: `perplexity-turbo`, `perplexity-pro`, `perplexity-reasoning`,
+`perplexity-gpt5`, `perplexity-claude-4.5-sonnet`, `perplexity-o3`.
+
+### 11. GLM — Z.ai / ChatGLM (`chat.z.ai`, `chatglm.cn`)
+
+Dual backend, anonymous by default: z.ai serves `glm-4.5` and
+`glm-4.5-thinking` with no setup (the access token is fetched automatically).
+Setting `GLM_REFRESH_TOKEN` (chatglm.cn → DevTools → Application → Local
+Storage → `refresh_token`) unlocks `glm-4.6` and `glm-4.6-thinking` routes.
 
 ### Verifying a provider
 
@@ -319,6 +402,17 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `GEMINI_1PSIDTS` | *(none)* | `__Secure-1PSIDTS` cookie from `gemini.google.com` |
 | `CHATGPT_ACCESS_TOKEN` | *(none)* | ChatGPT web `accessToken` (from `/api/auth/session`) |
 | `CHATGPT_SESSION_COOKIES` | *(none)* | ChatGPT session cookie jar as JSON (preferred over the raw token; auto-refresh) |
+| `CLAUDE_SESSION_KEY` | *(none)* | `sessionKey` cookie from `claude.ai` (enables the Claude web provider) |
+| `GROK_SSO` | *(none)* | `sso` cookie from `grok.com` (enables the Grok web provider) |
+| `MISTRAL_SESSION_TOKEN` | *(none)* | `session_token` cookie from `chat.mistral.ai` (**required** — anonymous access is account-gated) |
+| `QWEN_TOKEN` | *(none)* | Bearer token from `chat.qwen.ai` (enables the Qwen web provider) |
+| `QWEN_UMID` / `QWEN_BX_UA` | *(bundled)* | Override Qwen's anti-bot fingerprint headers if upstream changes them |
+| `KIMI_TOKEN` | *(none)* | `token` cookie from `kimi.com` (enables the Kimi web provider) |
+| `COPILOT_COOKIES` | *(none)* | Cookie jar JSON for `copilot.microsoft.com` (anonymous works without it) |
+| `PERPLEXITY_COOKIES` | *(none)* | Cookie jar JSON for `perplexity.ai` (anonymous works without it) |
+| `GLM_REFRESH_TOKEN` | *(none)* | `refresh_token` from `chatglm.cn` (unlocks glm-4.6 routes; z.ai anonymous always on) |
+| `<PROVIDER>_COOKIES` | *(none)* | Generic JSON cookie-jar fallback for every provider (e.g. `CLAUDE_COOKIES`) |
+| `DSF_<PROVIDER>_CONTEXT_LENGTH` / `DSF_<PROVIDER>_MAX_OUTPUT` | *(per-provider defaults)* | Advertised limits for claude/grok/mistral/qwen/kimi/copilot/perplexity/glm routes |
 | `DSF_MODELS_TTL` | `300` | Seconds between dynamic model re-discovery across providers |
 | `DSF_FALLBACKS` | *(none)* | JSON map of per-model fallback chains, e.g. `{"deepseek-chat": ["deepseek-reasoner"]}` |
 | `DSF_DEFAULT_FALLBACKS` | *(none)* | Comma-separated fallbacks applied to every route |

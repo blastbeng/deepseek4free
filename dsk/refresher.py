@@ -89,7 +89,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _data_dir() -> Path:
-    base = os.getenv('COOKIES_DIR') or os.getenv('DSF_SELFHEAL_DIR') or str(_BASE)
+    base = (os.getenv('COOKIES_DIR') or os.getenv('DSF_SELFHEAL_DIR')
+            or str(_BASE.parent / 'data'))
     path = Path(base)
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -109,7 +110,11 @@ def _max_renews() -> int:
 
 def _jar_path(name: str) -> Path:
     files = {'gemini': 'gemini_cookies.json', 'chatgpt': 'chatgpt_cookies.json',
-             'deepseek': 'cookies.json'}
+             'deepseek': 'cookies.json', 'claude': 'claude_cookies.json',
+             'grok': 'grok_cookies.json', 'mistral': 'mistral_cookies.json',
+             'qwen': 'qwen_cookies.json', 'kimi': 'kimi_cookies.json',
+             'copilot': 'copilot_cookies.json',
+             'perplexity': 'perplexity_cookies.json', 'glm': 'glm_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -163,6 +168,16 @@ def _load_jar(name: str) -> Dict[str, str]:
         jar.setdefault('__Secure-1PSIDTS',
                        (os.getenv('GEMINI_1PSIDTS', '') or
                         os.getenv('GEMINI_COOKIES_1PSIDTS', '')).strip())
+    else:
+        # Token providers keep their primary credential in one env var; merge
+        # it so _has_creds and the live verifiers below agree on one source.
+        primary = {'claude': ('sessionKey', 'CLAUDE_SESSION_KEY'),
+                   'grok': ('sso', 'GROK_SSO'),
+                   'kimi': ('token', 'KIMI_TOKEN'),
+                   'mistral': ('session_token', 'MISTRAL_SESSION_TOKEN'),
+                   'qwen': ('token', 'QWEN_TOKEN')}.get(name)
+        if primary:
+            jar.setdefault(primary[0], (os.getenv(primary[1], '') or '').strip())
     return {k: v for k, v in jar.items() if k and v and k != 'cookies'}
 
 
@@ -234,6 +249,25 @@ def _has_creds(name: str) -> bool:
         if os.getenv('CHATGPT_SESSION_COOKIES', '').strip():
             return True
         return bool(_load_jar('chatgpt'))
+    if name in ('claude', 'grok', 'qwen', 'kimi'):
+        env_key = {'claude': 'CLAUDE_SESSION_KEY', 'grok': 'GROK_SSO',
+                   'qwen': 'QWEN_TOKEN', 'kimi': 'KIMI_TOKEN'}[name]
+        if os.getenv(env_key, '').strip():
+            return True
+        jar = _load_jar(name)
+        if name == 'claude':
+            return bool(jar.get('sessionKey'))
+        if name == 'grok':
+            return bool(jar.get('sso') or jar.get('sso-rw'))
+        if name == 'kimi':
+            return bool(jar.get('token') or jar.get('jwt'))
+        return bool(jar.get('token'))
+    if name in ('copilot', 'perplexity', 'glm'):
+        return True  # anonymous reverse-engineered modes always available
+    if name == 'mistral':
+        if os.getenv('MISTRAL_SESSION_TOKEN', '').strip():
+            return True
+        return bool((_load_jar('mistral') or {}).get('session_token'))
     return bool(_load_jar('gemini'))          # jar already merges env 1PSID
 
 
@@ -333,8 +367,120 @@ def refresh_deepseek() -> Tuple[bool, str]:
         return False, f'probe failed: {e}'
 
 
+def _manual_only(provider: str, hint: str):
+    """Refresher/sign-up stub for token-based RE providers that have no
+    automated account creation: their credential is a manually exported
+    cookie/token, so the bot only reports how to set it."""
+    def _f() -> Tuple[bool, str]:
+        return False, f'{provider}: no automated signup — {hint}'
+    return _f
+
+
+def _anonymous(provider: str):
+    """Refresher stub for providers that need no credential at all."""
+    def _f() -> Tuple[bool, str]:
+        return True, f'{provider}: anonymous access — nothing to refresh'
+    return _f
+
+
+def refresh_claude() -> Tuple[bool, str]:
+    """claude.ai sessionKey cannot be rotated over HTTP; verify it live."""
+    if not _has_creds('claude'):
+        return False, 'no claude credentials — set CLAUDE_SESSION_KEY or claude_cookies.json'
+    try:
+        resp = _http_get('https://claude.ai/api/organizations',
+                         {'sessionKey': _load_jar('claude').get('sessionKey', '')})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code == 200:
+        return True, 'session valid'
+    if resp.status_code in (401, 403):
+        return False, 'sessionKey rejected — re-export from claude.ai'
+    return False, f'HTTP {resp.status_code}'
+
+
+def refresh_grok() -> Tuple[bool, str]:
+    if not _has_creds('grok'):
+        return False, 'no grok credentials — set GROK_SSO or grok_cookies.json'
+    jar = _load_jar('grok')
+    cookies = {k: v for k, v in jar.items() if k in ('sso', 'sso-rw')}
+    try:
+        resp = _http_get('https://grok.com/rest/rate-limits', cookies)
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code == 200:
+        return True, 'session valid'
+    if resp.status_code in (401, 403):
+        return False, 'sso cookie rejected — re-export from grok.com'
+    if resp.status_code == 429:
+        return True, 'session valid (rate limited)'
+    return False, f'HTTP {resp.status_code}'
+
+
+def refresh_qwen() -> Tuple[bool, str]:
+    if not _has_creds('qwen'):
+        return False, 'no qwen credentials — set QWEN_TOKEN or qwen_cookies.json'
+    import requests
+    try:
+        resp = requests.get(
+            'https://chat.qwen.ai/api/v1/auths',
+            headers={'Authorization': f"Bearer {_load_jar('qwen').get('token', '')}",
+                     'User-Agent': _UA},
+            timeout=30, **_proxies_kwargs('https://chat.qwen.ai'))
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code == 200:
+        return True, 'token valid'
+    if resp.status_code == 401:
+        return False, 'token rejected — re-export from chat.qwen.ai'
+    return False, f'HTTP {resp.status_code}'
+
+
+def refresh_kimi() -> Tuple[bool, str]:
+    """Lightweight liveness check; the authoritative probe runs at request time."""
+    if not _has_creds('kimi'):
+        return False, 'no kimi credentials — set KIMI_TOKEN or kimi_cookies.json'
+    jar = _load_jar('kimi')
+    token = jar.get('token') or jar.get('jwt') or ''
+    try:
+        resp = _http_get('https://www.kimi.com/', {'token': token})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (401, 403):
+        return False, 'token rejected — re-export from kimi.com'
+    return True, f'session reachable (HTTP {resp.status_code})'
+
+
+def refresh_mistral() -> Tuple[bool, str]:
+    """Best-effort token check: Ory Kratos whoami, lenient when unverifiable.
+
+    The authoritative validation runs at request time (the provider raises
+    on a rejected token), so an unavailable whoami endpoint is not an error.
+    """
+    if not _has_creds('mistral'):
+        return False, ('no mistral credentials — set MISTRAL_SESSION_TOKEN '
+                       'or mistral_cookies.json')
+    token = (os.getenv('MISTRAL_SESSION_TOKEN', '') or '').strip()
+    if not token:
+        token = (_load_jar('mistral') or {}).get('session_token') or ''
+    try:
+        resp = _http_get('https://auth.mistral.ai/sessions/whoami',
+                         {'ory_kratos_session': token})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code == 200:
+        return True, 'session valid'
+    if resp.status_code in (401, 403):
+        return False, 'session token rejected — re-export from chat.mistral.ai'
+    return True, (f'whoami unavailable (HTTP {resp.status_code}) — '
+                  'token unverified (validated at request time)')
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
-           'deepseek': refresh_deepseek}
+           'deepseek': refresh_deepseek, 'claude': refresh_claude,
+           'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
+           'mistral': refresh_mistral, 'copilot': _anonymous('copilot'),
+           'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm')}
 
 
 # ------------------------------------------------------------------ IMAP OTP
@@ -425,11 +571,45 @@ def _mail_body(msg) -> str:
 
 
 # ------------------------------------------------------------ browser layer
-def _browser():
+def _signup_proxy() -> Optional[str]:
+    """Egress for signup browsers.
+
+    DeepSeek (CloudFront) blocks some datacenter/host IPs outright, so
+    signups prefer an explicit ``DSF_SIGNUP_PROXY`` or the Tor SOCKS5 exit
+    (when DSF_PROXY_TOR is enabled). Returns None = direct connection.
+    """
+    explicit = os.getenv('DSF_SIGNUP_PROXY', '').strip()
+    if explicit:
+        return explicit
+    if _env_bool('DSF_PROXY_TOR', False):
+        try:
+            from . import proxies as _proxies
+            return (os.getenv('DSF_PROXY_TOR_URL', '').strip()
+                    or _proxies.TOR_DEFAULT_URL)
+        except Exception:  # pragma: no cover
+            return None
+    return None
+
+
+def _browser(proxy: Optional[str] = None):
     from DrissionPage import ChromiumPage, ChromiumOptions
     options = ChromiumOptions().auto_port()
     options.set_argument('--no-sandbox')
     options.set_argument('--disable-gpu')
+    if proxy:
+        if proxy.startswith('socks'):
+            # DrissionPage's set_proxy only speaks HTTP; chromium itself
+            # handles SOCKS via the command line. Chromium accepts the
+            # plain "socks5://" scheme only ("socks5h://" is a curl-ism
+            # and yields ERR_NO_SUPPORTED_PROXIES); DNS is forced through
+            # the proxy with a resolver rule so the exit stays consistent.
+            scheme, _, hostport = proxy.partition('://')
+            host = hostport.split('/')[0].split(':')[0]
+            options.set_argument(f'--proxy-server=socks5://{hostport}')
+            options.set_argument(
+                f'--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE {host}')
+        else:
+            options.set_proxy(proxy)
     if _env_bool('DSF_REFRESHER_HEADLESS', True):
         options.headless(True)
     return ChromiumPage(addr_or_opts=options)
@@ -504,7 +684,10 @@ def _export_cookies(page, name: str, domains: Tuple[str, ...]) -> int:
 def _creds(name: str) -> Tuple[str, str]:
     """Login credentials: env first, then accounts the bot created itself
     (data/accounts.json, written by the signup rungs)."""
-    prefix = {'deepseek': 'DEEPSEEK', 'chatgpt': 'CHATGPT', 'gemini': 'GEMINI'}[name]
+    prefix = {'deepseek': 'DEEPSEEK', 'chatgpt': 'CHATGPT', 'gemini': 'GEMINI',
+              'claude': 'CLAUDE', 'grok': 'GROK', 'mistral': 'MISTRAL',
+              'qwen': 'QWEN', 'kimi': 'KIMI', 'copilot': 'COPILOT',
+              'perplexity': 'PERPLEXITY', 'glm': 'GLM'}[name]
     email = os.getenv(f'{prefix}_LOGIN_EMAIL', '').strip()
     password = os.getenv(f'{prefix}_LOGIN_PASSWORD', '').strip()
     if email and password:
@@ -590,6 +773,15 @@ def browser_login(name: str) -> Tuple[bool, str]:
             pass
 
 
+def _pool_proxy() -> Optional[str]:
+    """A random egress from the dynamic free-proxy pool (when enabled)."""
+    try:
+        from . import proxies as _proxies
+        return _proxies.get_proxy('deepseek-signup')
+    except Exception:  # pragma: no cover
+        return None
+
+
 def signup_deepseek() -> Tuple[bool, str]:
     """Create a fresh DeepSeek account — fully autonomous when possible.
 
@@ -611,45 +803,64 @@ def signup_deepseek() -> Tuple[bool, str]:
             return False, f'autogen mailbox unavailable: {err}'
         email, password = session['address'], session['password']
         generated = True
-    try:
-        page = _browser()
-    except Exception as e:  # noqa: BLE001
-        return False, f'browser unavailable: {e}'
-    try:
-        page.get('https://chat.deepseek.com/sign_up')
-        time.sleep(5)
-        if not _fill_first(page, _DEEPSEEK_EMAIL_SELECTORS, email):
-            return False, 'email field not found'
-        _fill_first(page, _PASSWORD_SELECTORS, password)
-        _click_any(page, ['Send Code', 'Send code', '获取验证码'])
-        if generated:
-            code = mailgen.fetch_otp(session, max_wait_s=180)
-            if not code:
-                # fall back to the plain IMAP poller (no recipient filter)
-                code = imap_otp(max_wait_s=30)
-        else:
-            code = imap_otp(max_wait_s=180)
-        if not code:
-            return False, 'signup code email not found in mailbox'
-        if not _fill_first(page, ['@placeholder:code', '@placeholder:Code',
-                                  'css:input[name=code]'], code):
-            return False, 'code field not found'
-        _click_any(page, ['Sign Up', 'Sign up', '注册'])
-        token = _wait_token(page)
-        _export_cookies(page, 'deepseek', ('deepseek.com',))
-        if token:
-            _save_deepseek_token(token)
-            via = f'account created (autogen {session["backend"]}: {email})' \
-                if generated else 'account created'
-            return True, f'{via}, userToken captured'
-        return False, 'signup finished but no userToken appeared'
-    except Exception as e:  # noqa: BLE001
-        return False, f'signup flow failed: {type(e).__name__}: {e}'
-    finally:
+    # egress ladder: signup egress (DSF_SIGNUP_PROXY/Tor when enabled) first,
+    # then the dynamic free-proxy pool, then direct — DeepSeek's CloudFront
+    # blocks many datacenter/host IPs outright (duplicates are dropped).
+    last_error = ''
+    seen: set = set()
+    ladder = [p for p in (_signup_proxy(), _pool_proxy(), None)
+              if p is None or not (p in seen or seen.add(p))]
+    for proxy in ladder or [None]:
+        page = None
         try:
-            page.quit()
-        except Exception:  # noqa: BLE001
-            pass
+            page = _browser(proxy=proxy)
+            page.get('https://chat.deepseek.com/sign_up')
+            time.sleep(5)
+            body_head = ''
+            try:
+                body_head = page.ele('tag:body').text[:300].lower()
+            except Exception:  # noqa: BLE001
+                pass
+            if ('could not be satisfied' in body_head
+                    or '403 error' in body_head):
+                last_error = f'CloudFront 403 via {proxy or "direct"}'
+                _log_history('deepseek', 'signup-blocked', last_error)
+                continue
+            if not _fill_first(page, _DEEPSEEK_EMAIL_SELECTORS, email):
+                last_error = 'email field not found'
+                continue
+            _fill_first(page, _PASSWORD_SELECTORS, password)
+            _click_any(page, ['Send Code', 'Send code', '获取验证码'])
+            if generated:
+                code = mailgen.fetch_otp(session, max_wait_s=180)
+                if not code:
+                    # fall back to the plain IMAP poller (no recipient filter)
+                    code = imap_otp(max_wait_s=30)
+            else:
+                code = imap_otp(max_wait_s=180)
+            if not code:
+                return False, 'signup code email not found in mailbox'
+            if not _fill_first(page, ['@placeholder:code', '@placeholder:Code',
+                                      'css:input[name=code]'], code):
+                return False, 'code field not found'
+            _click_any(page, ['Sign Up', 'Sign up', '注册'])
+            token = _wait_token(page)
+            _export_cookies(page, 'deepseek', ('deepseek.com',))
+            if token:
+                _save_deepseek_token(token)
+                via = f'account created (autogen {session["backend"]}: {email})' \
+                    if generated else 'account created'
+                return True, f'{via}, userToken captured'
+            return False, 'signup finished but no userToken appeared'
+        except Exception as e:  # noqa: BLE001
+            last_error = f'signup flow failed: {type(e).__name__}: {e}'
+        finally:
+            if page is not None:
+                try:
+                    page.quit()
+                except Exception:  # noqa: BLE001
+                    pass
+    return False, last_error or 'all signup egresses failed'
 
 
 def signup_chatgpt() -> Tuple[bool, str]:
@@ -794,7 +1005,15 @@ def signup_gemini() -> Tuple[bool, str]:
 
 
 SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
-          'gemini': signup_gemini}
+          'gemini': signup_gemini,
+          'claude': _manual_only('claude', 'export the sessionKey cookie into CLAUDE_SESSION_KEY'),
+          'grok': _manual_only('grok', 'export the sso cookie into GROK_SSO'),
+          'qwen': _manual_only('qwen', 'export the Bearer token into QWEN_TOKEN'),
+          'kimi': _manual_only('kimi', 'export the token cookie into KIMI_TOKEN'),
+          'mistral': _manual_only('mistral',
+                                  'export the session token into MISTRAL_SESSION_TOKEN'),
+          'copilot': _anonymous('copilot'),
+          'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm')}
 
 
 # ------------------------------------------------------------------ renew
@@ -886,7 +1105,7 @@ def refresh_cycle() -> Dict[str, Any]:
     if not _env_bool('DSF_REFRESHER', True):
         return {'refresher': 'disabled'}
     out: Dict[str, Any] = {}
-    for name in ('gemini', 'chatgpt', 'deepseek'):
+    for name in tuple(REFRESH):
         if not _has_creds(name):
             if not _env_bool('DSF_REFRESHER_AUTOSIGNUP', True):
                 out[name] = 'skipped (no credentials, autosignup off)'

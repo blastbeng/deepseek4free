@@ -81,18 +81,57 @@ HEALABLE: Dict[str, Path] = {
     'deepseek': _BASE / 'api.py',
     'gemini': _BASE / 'providers' / 'gemini_provider.py',
     'chatgpt': _BASE / 'providers' / 'chatgpt_provider.py',
+    'claude': _BASE / 'providers' / 'claude_provider.py',
+    'grok': _BASE / 'providers' / 'grok_provider.py',
+    'mistral': _BASE / 'providers' / 'mistral_provider.py',
+    'qwen': _BASE / 'providers' / 'qwen_provider.py',
+    'kimi': _BASE / 'providers' / 'kimi_provider.py',
+    'copilot': _BASE / 'providers' / 'copilot_provider.py',
+    'perplexity': _BASE / 'providers' / 'perplexity_provider.py',
+    'glm': _BASE / 'providers' / 'glm_provider.py',
 }
 
 _MODULE_NAMES = {
     'deepseek': 'dsk.api',
     'gemini': 'dsk.providers.gemini_provider',
     'chatgpt': 'dsk.providers.chatgpt_provider',
+    'claude': 'dsk.providers.claude_provider',
+    'grok': 'dsk.providers.grok_provider',
+    'mistral': 'dsk.providers.mistral_provider',
+    'qwen': 'dsk.providers.qwen_provider',
+    'kimi': 'dsk.providers.kimi_provider',
+    'copilot': 'dsk.providers.copilot_provider',
+    'perplexity': 'dsk.providers.perplexity_provider',
+    'glm': 'dsk.providers.glm_provider',
 }
 
 _PROVIDER_MODULES = {
     'deepseek': 'dsk.providers.deepseek_provider',
     'gemini': 'dsk.providers.gemini_provider',
     'chatgpt': 'dsk.providers.chatgpt_provider',
+    'claude': 'dsk.providers.claude_provider',
+    'grok': 'dsk.providers.grok_provider',
+    'mistral': 'dsk.providers.mistral_provider',
+    'qwen': 'dsk.providers.qwen_provider',
+    'kimi': 'dsk.providers.kimi_provider',
+    'copilot': 'dsk.providers.copilot_provider',
+    'perplexity': 'dsk.providers.perplexity_provider',
+    'glm': 'dsk.providers.glm_provider',
+}
+
+# Provider class name inside each module (used by probe/configured).
+_PROVIDER_CLASSES = {
+    'deepseek': 'DeepSeekProvider',
+    'gemini': 'GeminiWebProvider',
+    'chatgpt': 'ChatGPTProvider',
+    'claude': 'ClaudeWebProvider',
+    'grok': 'GrokProvider',
+    'mistral': 'MistralProvider',
+    'qwen': 'QwenProvider',
+    'kimi': 'KimiProvider',
+    'copilot': 'CopilotProvider',
+    'perplexity': 'PerplexityProvider',
+    'glm': 'GlmProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -103,6 +142,23 @@ _EVIDENCE_PATTERNS = {
                 r'require-account', r'/conversation'],
     'gemini': [r'BardChatUi[A-Za-z0-9_/.$\-]{0,80}', r'StreamGenerate',
                r'batchexecute', r'SNlM0e', r'assistant\.lamda\.[A-Za-z]+'],
+    'claude': [r'chat_conversations[A-Za-z0-9_/{}$.\-]{0,60}', r'sessionKey',
+               r'completion[A-Za-z]{0,20}', r'anthropic\-[a-z\-]+',
+               r'content_block_[a-z]+'],
+    'grok': [r'rest/app-chat[A-Za-z0-9_/{}$.\-]{0,60}', r'conversations/new',
+             r'sso\-rw?', r'x\-xai\-[a-z\-]+', r'modeId'],
+    'mistral': [r'trpc[A-Za-z0-9_/{}$.\-]{0,60}', r'message\.newChat',
+                r'/api/chat', r'stable_anon_id'],
+    'qwen': [r'api/v2/chats[A-Za-z0-9_/{}$.\-]{0,60}', r'chat/completions',
+             r'bx\-[a-z]+', r'feature_config'],
+    'kimi': [r'kimi\.gateway\.chat[A-Za-z0-9_.]{0,80}', r'ChatService',
+             r'application/connect\+json', r'multiStage'],
+    'copilot': [r'c/api/chat[A-Za-z0-9_/{}$.\-]{0,60}', r'participantId',
+                r'chainOfThought', r'websocket'],
+    'perplexity': [r'rest/sse/perplexity_ask', r'model_preference',
+                   r'ask_text', r'markdown_block'],
+    'glm': [r'api/chat/completions', r'assistant/stream', r'refresh_token',
+            r'chatglm', r'delta_content'],
 }
 
 
@@ -134,7 +190,8 @@ def _max_incidents() -> int:
 
 
 def _heal_dir() -> Path:
-    base = os.getenv('DSF_SELFHEAL_DIR') or os.getenv('COOKIES_DIR') or str(_BASE)
+    base = (os.getenv('DSF_SELFHEAL_DIR') or os.getenv('COOKIES_DIR')
+            or str(_BASE.parent / 'data'))
     path = Path(base) / 'selfheal'
     (path / 'backups').mkdir(parents=True, exist_ok=True)
     return path
@@ -186,8 +243,7 @@ def _probe_once(name: str) -> Tuple[str, str]:
             api._get_pow_challenge()
             return 'ok', 'pow challenge ok'
         module = importlib.import_module(_PROVIDER_MODULES[name])
-        cls = {'gemini': 'GeminiWebProvider', 'chatgpt': 'ChatGPTProvider'}[name]
-        provider = getattr(module, cls)()
+        provider = getattr(module, _PROVIDER_CLASSES[name])()
         if not provider.available():
             return 'auth', 'no credentials configured'
         models = provider.list_models()
@@ -214,7 +270,8 @@ def _classify(exc: BaseException) -> str:
         pass
     if any(m in low for m in ('401', '403', 'unauthorized', 'forbidden',
                               'no credentials', 'expired', 'sign in',
-                              'session')):
+                              'session', 'authorization', 'authentication',
+                              'invalid token')):
         return 'auth'
     if any(m in low for m in ('429', 'rate limit', 'too many requests')):
         return 'rate'
@@ -228,9 +285,7 @@ def _classify(exc: BaseException) -> str:
 def _provider_configured(name: str) -> bool:
     try:
         module = importlib.import_module(_PROVIDER_MODULES[name])
-        cls = {'deepseek': 'DeepSeekProvider', 'gemini': 'GeminiWebProvider',
-               'chatgpt': 'ChatGPTProvider'}[name]
-        return bool(getattr(module, cls)().available())
+        return bool(getattr(module, _PROVIDER_CLASSES[name])().available())
     except Exception:
         return False
 
@@ -267,7 +322,15 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
     """Fetch the upstream web app and grep its JS for API-path style markers."""
     base = {'deepseek': 'https://chat.deepseek.com',
             'gemini': 'https://gemini.google.com',
-            'chatgpt': 'https://chatgpt.com'}[name]
+            'chatgpt': 'https://chatgpt.com',
+            'claude': 'https://claude.ai',
+            'grok': 'https://grok.com',
+            'mistral': 'https://chat.mistral.ai',
+            'qwen': 'https://chat.qwen.ai',
+            'kimi': 'https://www.kimi.com',
+            'copilot': 'https://copilot.microsoft.com',
+            'perplexity': 'https://www.perplexity.ai',
+            'glm': 'https://chat.z.ai'}[name]
     patterns = [re.compile(p) for p in _EVIDENCE_PATTERNS[name]]
     chunks: List[str] = []
     seen: set = set()
