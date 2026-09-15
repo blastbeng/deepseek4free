@@ -18,9 +18,6 @@ services:
       - DSF_MODEL_SEARCH=${DSF_MODEL_SEARCH:-deepseek-search}
       - DOCKERMODE=true
     volumes:
-      # Persist cf_clearance cookies across container restarts
-      - dsf-data:/data
+      # Persist cf_clearance cookies across container restarts (local ./data dir)
+      - ./data:/data
     shm_size: "1gb"
-
-volumes:
-  dsf-data:

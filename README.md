@@ -44,7 +44,7 @@ The resulting string is the **only credential** this project needs. You can prov
 
 ### 2. Cloudflare bypass (`dsk/bypass.py`, `dsk/CloudflareBypasser.py`)
 
-`chat.deepseek.com` sits behind Cloudflare. If requests start being challenged ("Just a moment…"), the bypass module spins up a real (undetected) Chromium via [DrissionPage](https://github.com/g1879/DrissionPage), visits the site, clicks through the challenge with `CloudflareBypasser`, and captures the resulting `cf_clearance` cookie. The cookie is saved to `cookies.json` (in Docker: `/data/cookies.json` on the persistent `dsf-data` volume) and silently attached to every subsequent API request until it expires.
+`chat.deepseek.com` sits behind Cloudflare. If requests start being challenged ("Just a moment…"), the bypass module spins up a real (undetected) Chromium via [DrissionPage](https://github.com/g1879/DrissionPage), visits the site, clicks through the challenge with `CloudflareBypasser`, and captures the resulting `cf_clearance` cookie. The cookie is saved to `cookies.json` (in Docker: `/data/cookies.json`, bind-mounted to the project's `./data` directory) and silently attached to every subsequent API request until it expires.
 
 You normally don't have to do anything — but if you ever see Cloudflare errors, run the helper once:
 
@@ -213,7 +213,7 @@ aider --model openai/deepseek-chat \
 In normal operation cookies are fetched and refreshed automatically. If you hit persistent Cloudflare errors:
 
 1. Run `python -m dsk.bypass` (outside Docker, or with `DOCKERMODE=true` which uses Xvfb). It opens a browser, solves the challenge and writes `dsk/cookies.json`.
-2. In Docker the `dsf-data` volume persists cookies at `/data/cookies.json` across restarts — `dsk/api.py` picks them up automatically.
+2. In Docker the `./data` directory (bind-mounted to `/data`) persists cookies at `/data/cookies.json` across restarts — `dsk/api.py` picks them up automatically.
 
 You only need this when you see Cloudflare challenges, your `cf_clearance` cookie expired, or you get "Please wait a few minutes before trying again".
 
