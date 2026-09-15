@@ -755,16 +755,25 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         )
 
     # ---- Non-streaming ----
+    def _collect():
+        c_parts: List[str] = []
+        r_parts: List[str] = []
+        for chunk in chunk_gen:
+            if chunk.get("type") == "thinking" and chunk.get("content"):
+                r_parts.append(chunk["content"])
+            elif chunk.get("type") == "image" and chunk.get("content"):
+                c_parts.append(chunk["content"])
+            elif chunk.get("type") == "text" and chunk.get("content"):
+                c_parts.append(chunk["content"])
+        return c_parts, r_parts
+
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
     try:
-        for chunk in chunk_gen:
-            if chunk.get("type") == "thinking" and chunk.get("content"):
-                reasoning_parts.append(chunk["content"])
-            elif chunk.get("type") == "image" and chunk.get("content"):
-                content_parts.append(chunk["content"])
-            elif chunk.get("type") == "text" and chunk.get("content"):
-                content_parts.append(chunk["content"])
+        # Consume the blocking provider stream in a worker thread — pulling
+        # it on the event loop would serialize ALL requests behind this one.
+        content_parts, reasoning_parts = await asyncio.get_running_loop().run_in_executor(
+            None, _collect)
     except ProviderError as e:
         err_type, code, status = _error_status(e)
         return _error_response(str(e), err_type, code, status)
@@ -856,6 +865,21 @@ async def _stream_completion(
     q: "queue.Queue[Optional[str]]" = queue.Queue()
     finish_holder = {"reason": "stop"}
     errored = {"flag": False}
+    stop = threading.Event()
+
+    def _guard():
+        """Provider chunks with a client-disconnect circuit breaker.
+
+        Without this the worker keeps draining the provider (and, for browser
+        transports like z.ai, holds the singleton session lock) long after
+        the client gave up — subsequent requests then queue behind a wedged
+        session. Checking ``stop`` between chunks releases the provider
+        within one poll interval of a disconnect.
+        """
+        for chunk in chunk_gen:
+            if stop.is_set():
+                break
+            yield chunk
 
     def _worker():
         # Tool-call responses are parsed authoritatively at stream end, but
@@ -912,7 +936,7 @@ async def _stream_completion(
                 _emit_upto(len(text))
 
         try:
-            for chunk in chunk_gen:
+            for chunk in _guard():
                 ctype = chunk.get("type", "")
                 content = chunk.get("content", "") or ""
                 if not content:
@@ -985,6 +1009,13 @@ async def _stream_completion(
             _flush_prose()
             q.put(_error_sse(str(e)))
             q.put(None)
+        finally:
+            # Close the provider generator so transports with session locks
+            # (z.ai browser) release them immediately on disconnect/finish.
+            try:
+                chunk_gen.close()
+            except Exception:  # noqa: BLE001 — already closing
+                pass
 
     threading.Thread(target=_worker, daemon=True).start()
     loop = asyncio.get_running_loop()
@@ -1023,6 +1054,7 @@ async def _stream_completion(
                     },
                 })
     finally:
+        stop.set()   # client gone: stop draining the provider promptly
         yield "data: [DONE]\n\n"
 
 

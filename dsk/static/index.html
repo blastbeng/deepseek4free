@@ -116,6 +116,30 @@
     font: inherit; line-height: 1.45;
   }
   .hint { text-align: center; color: var(--muted); font-size: 11px; margin-top: 6px; }
+
+  /* chat-history sidebar (ChatGPT/llama.cpp-style), chats expire after 24 h */
+  #sidebar { width: 250px; border-right: 1px solid var(--border); background: var(--panel);
+             display: flex; flex-direction: column; gap: 10px; padding: 12px 10px; }
+  #sidebar.closed { display: none; }
+  #newchat { width: 100%; }
+  #chatlist { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+  .chatitem { display: flex; align-items: center; gap: 6px; padding: 7px 8px;
+              border: 1px solid transparent; border-radius: 8px; cursor: pointer; }
+  .chatitem:hover { background: #21262d; }
+  .chatitem.active { background: #1f6feb22; border-color: #1f6feb55; }
+  .chatitem .ct { flex: 1; min-width: 0; }
+  .chatitem .t { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chatitem .tm { font-size: 10px; color: var(--muted); }
+  .chatitem .del { padding: 0 6px; font-size: 11px; opacity: 0; }
+  .chatitem:hover .del { opacity: 1; }
+  .sbhint { font-size: 10px; color: var(--muted); text-align: center; }
+  @media (max-width: 900px) {
+    #sidebar { position: fixed; top: 0; left: 0; bottom: 0; width: min(280px, 84vw); z-index: 40;
+               transform: translateX(-105%); transition: transform .18s ease;
+               box-shadow: 10px 0 30px #000a; }
+    #sidebar.open { transform: none; }
+  }
+
   @media (max-width: 760px) {
     .gear { display: inline-block; }
     #settings {
@@ -135,6 +159,7 @@
   <span id="flags"></span>
   <span id="health" class="badge wait" title="GET /health">health…</span>
   <div class="grow"></div>
+  <button id="sbtoggle" title="Toggle chat history">☰</button>
   <button id="regen" title="Regenerate the last reply" disabled>↺ retry</button>
   <button id="export" title="Export conversation as markdown">⬇</button>
   <button id="gear" class="gear" title="Settings">⚙ settings</button>
@@ -142,6 +167,11 @@
   <button id="clear" title="Clear conversation">✕ clear</button>
 </header>
 <main>
+  <aside id="sidebar">
+    <button id="newchat" class="primary">＋ New chat</button>
+    <div id="chatlist"></div>
+    <div class="sbhint">saved in this browser · chats expire after 24 h</div>
+  </aside>
   <div id="chat"></div>
   <aside id="settings">
     <h2>Settings</h2>
@@ -190,8 +220,12 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const chat = $('chat'), modelSel = $('model'), flagsEl = $('flags');
-const LS_KEY = 'dsk_pg_v1';
-let messages = [];          // {role, content} — content: string | [{type:text|image_url}]
+const LS_KEY = 'dsk_pg_v2';      // multi-chat store (sidebar history)
+const LS_LEGACY = 'dsk_pg_v1';   // pre-sidebar single-conversation store
+const CHAT_TTL = 24 * 60 * 60 * 1000;  // saved chats expire after one day
+let messages = [];          // {role, content} — content: string | [{type:text|image_url}] (active chat's array)
+let chats = [];             // [{id, title, created, updated, messages}]
+let activeId = null;
 let pendingImages = [];     // data URLs awaiting send
 let controller = null;      // AbortController for the active stream
 let modelInfo = {};         // id -> {thinking_enabled, search_enabled, vision, ...}
@@ -395,7 +429,7 @@ function stopStatus(kind) {
   else if (kind === 'error') $('stats').textContent = 'failed: ' + secs + 's';
 }
 
-// ---------- persistence (localStorage) ----------
+// ---------- persistence: multi-chat store, chats expire after 24 h ----------
 function settingsSnapshot() {
   return {
     model: modelSel.value,
@@ -408,39 +442,194 @@ function settingsSnapshot() {
   };
 }
 
+function newChatObj() {
+  return {
+    id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+    title: 'New chat', created: Date.now(), updated: Date.now(), messages: [],
+  };
+}
+
+function activeChat() { return chats.find(c => c.id === activeId) || null; }
+
+function firstUserText(msgs) {
+  for (const m of msgs) {
+    if (m.role !== 'user') continue;
+    const t = contentText(m.content).replace(/\s+/g, ' ').trim();
+    if (t) return t.slice(0, 60);
+  }
+  return '';
+}
+
+function prune() {   // drop chats untouched for > CHAT_TTL (a day)
+  const cutoff = Date.now() - CHAT_TTL;
+  chats = chats.filter(c => (c.updated || 0) >= cutoff);
+}
+
+function ensureActive() {
+  if (activeChat()) return;
+  const next = [...chats].sort((a, b) => (b.updated || 0) - (a.updated || 0))[0];
+  if (next) { activeId = next.id; messages = next.messages; }
+  else {
+    const c = newChatObj();
+    chats.push(c); activeId = c.id; messages = c.messages;
+  }
+  redraw();
+}
+
 function persist() {
-  const pack = (msgs, imgs) => JSON.stringify(Object.assign({ messages: msgs, pendingImages: imgs }, settingsSnapshot()));
+  const cur = activeChat();
+  if (cur) {
+    // 'updated' tracks ACTIVITY (message added/removed), not passive views —
+    // otherwise merely opening a chat would keep it alive forever.
+    if (cur.messages !== messages || cur.messages.length !== messages.length) {
+      cur.updated = Date.now();
+    }
+    cur.messages = messages;
+    const t = firstUserText(messages);
+    cur.title = t || (messages.length ? (cur.title || 'New chat') : 'New chat');
+  }
+  prune();
+  ensureActive();
+  const pack = (chs, imgs) => JSON.stringify({
+    v: 2, activeId, pendingImages: imgs, settings: settingsSnapshot(), chats: chs,
+  });
   try {
-    localStorage.setItem(LS_KEY, pack(messages, pendingImages));
+    localStorage.setItem(LS_KEY, pack(chats, pendingImages));
   } catch (_) {
-    try { // quota exceeded: drop image payloads
-      const slim = messages.map(m => typeof m.content === 'string' ? m : { role: m.role, content: contentText(m.content) });
+    try { // quota exceeded: drop image payloads, keep text
+      const slim = chats.map(c => Object.assign({}, c, { messages: c.messages.map(m =>
+        typeof m.content === 'string' ? m : { role: m.role, content: contentText(m.content) }) }));
       localStorage.setItem(LS_KEY, pack(slim, []));
     } catch (_2) {}
   }
+  renderSidebar();
 }
 
-function restore() {
-  let s = null;
-  try { s = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); } catch (_) {}
-  if (!s) return;
-  if (Array.isArray(s.messages)) {
-    messages = s.messages.filter(m => m && m.role && m.content !== undefined);
+function relTime(ts) {
+  const d = Date.now() - (ts || 0);
+  if (d < 60e3) return 'just now';
+  if (d < 3600e3) return Math.round(d / 60e3) + 'm ago';
+  if (d < 86400e3) return Math.round(d / 3600e3) + 'h ago';
+  return Math.round(d / 86400e3) + 'd ago';
+}
+
+function renderSidebar() {
+  const list = $('chatlist');
+  if (!list) return;
+  list.innerHTML = '';
+  const sorted = [...chats].sort((a, b) => (b.updated || 0) - (a.updated || 0));
+  for (const c of sorted) {
+    const it = document.createElement('div');
+    it.className = 'chatitem' + (c.id === activeId ? ' active' : '');
+    const ct = document.createElement('div'); ct.className = 'ct';
+    const t = document.createElement('div'); t.className = 't';
+    t.textContent = c.title || 'New chat';
+    const tm = document.createElement('div'); tm.className = 'tm';
+    tm.textContent = relTime(c.updated);
+    ct.appendChild(t); ct.appendChild(tm);
+    const del = document.createElement('button');
+    del.className = 'del'; del.textContent = '✕'; del.title = 'Delete chat';
+    del.onclick = (e) => { e.stopPropagation(); deleteChat(c.id); };
+    it.appendChild(ct); it.appendChild(del);
+    it.onclick = () => switchChat(c.id);
+    list.appendChild(it);
   }
-  pendingImages = Array.isArray(s.pendingImages) ? s.pendingImages : [];
-  if (typeof s.system === 'string') $('system').value = s.system;
-  if (s.temp !== undefined) { $('temp').value = s.temp; $('tempVal').textContent = parseFloat(s.temp).toFixed(2); }
-  if (s.maxtok !== undefined) $('maxtok').value = s.maxtok;
-  if (typeof s.search === 'boolean') $('search').checked = s.search;
-  if (typeof s.showthink === 'boolean') $('showthink').checked = s.showthink;
-  if (typeof s.noproxy === 'boolean') $('noproxy').checked = s.noproxy;
+}
+
+function redraw() {
+  chat.innerHTML = '';
   for (const m of messages) {
     if (m.role === 'system') continue;
     const b = addBubble(m.role === 'assistant' ? 'bot' : m.role);
     setRaw(b.body, contentText(m.content));
   }
-  if (pendingImages.length) renderThumbs();
-  if (s.model) modelSel.dataset.want = s.model;  // applied after loadModels()
+  refreshEmpty();
+  refreshRegen();
+}
+
+function switchChat(id) {
+  if (controller || id === activeId || !chats.some(c => c.id === id)) return;
+  persist();                       // flush the current chat first
+  activeId = id;
+  messages = chats.find(c => c.id === id).messages;
+  pendingImages = [];
+  chat.innerHTML = '';
+  redraw(); renderThumbs(); persist();
+  $('sidebar').classList.remove('open');
+}
+
+function newChat() {
+  if (controller) return;
+  const cur = activeChat();
+  if (cur && !cur.messages.length) {
+    $('prompt').focus(); $('sidebar').classList.remove('open'); return;
+  }
+  persist();
+  const c = newChatObj();
+  chats.push(c);
+  activeId = c.id;
+  messages = c.messages;
+  pendingImages = [];
+  chat.innerHTML = ''; renderThumbs();
+  $('stats').textContent = '';
+  redraw(); persist();
+  $('prompt').focus();
+  $('sidebar').classList.remove('open');
+}
+
+function deleteChat(id) {
+  if (controller) return;
+  const idx = chats.findIndex(c => c.id === id);
+  if (idx < 0) return;
+  chats.splice(idx, 1);
+  if (id === activeId) {
+    activeId = null;
+    ensureActive();
+    chat.innerHTML = '';
+    redraw(); renderThumbs();
+  }
+  persist();
+}
+
+function restoreAll() {
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); } catch (_) {}
+  if (s && Array.isArray(s.chats)) {
+    chats = s.chats.filter(c => c && Array.isArray(c.messages)).map(c => ({
+      id: c.id || newChatObj().id,
+      title: c.title || 'New chat',
+      created: c.created || Date.now(),
+      updated: c.updated || Date.now(),
+      messages: c.messages.filter(m => m && m.role && m.content !== undefined),
+    }));
+    activeId = (s.activeId && chats.some(c => c.id === s.activeId)) ? s.activeId : null;
+  } else {
+    // migrate the legacy single-conversation store into one chat
+    let old = null;
+    try { old = JSON.parse(localStorage.getItem(LS_LEGACY) || 'null'); } catch (_) {}
+    const c = newChatObj();
+    if (old && Array.isArray(old.messages)) {
+      c.messages = old.messages.filter(m => m && m.role && m.content !== undefined);
+      c.title = firstUserText(c.messages) || 'New chat';
+    }
+    chats = [c];
+    s = { settings: old || {}, pendingImages: (old && old.pendingImages) || [] };
+    try { localStorage.removeItem(LS_LEGACY); } catch (_) {}
+  }
+  ensureActive();
+  messages = activeChat().messages;  // always bind the global view to the active chat
+  pendingImages = (s && Array.isArray(s.pendingImages)) ? s.pendingImages : [];
+  const st = (s && s.settings) || {};
+  if (typeof st.system === 'string') $('system').value = st.system;
+  if (st.temp !== undefined) { $('temp').value = st.temp; $('tempVal').textContent = parseFloat(st.temp).toFixed(2); }
+  if (st.maxtok !== undefined) $('maxtok').value = st.maxtok;
+  if (typeof st.search === 'boolean') $('search').checked = st.search;
+  if (typeof st.showthink === 'boolean') $('showthink').checked = st.showthink;
+  if (typeof st.noproxy === 'boolean') $('noproxy').checked = st.noproxy;
+  redraw();
+  renderThumbs();
+  if (st.model) modelSel.dataset.want = st.model;  // applied after loadModels()
+  persist();
 }
 
 // ---------- image attach ----------
@@ -616,6 +805,12 @@ $('send').onclick = send;
 $('stop').onclick = () => controller && controller.abort();
 $('refresh').onclick = loadModels;
 $('gear').onclick = () => $('settings').classList.toggle('open');
+$('sbtoggle').onclick = () => {
+  const sb = $('sidebar');
+  if (window.matchMedia('(max-width: 900px)').matches) sb.classList.toggle('open');
+  else sb.classList.toggle('closed');
+};
+$('newchat').onclick = newChat;
 $('clear').onclick = () => {
   messages = []; pendingImages = [];
   chat.innerHTML = ''; renderThumbs();
@@ -658,6 +853,9 @@ async function pollHealth() {
 }
 setInterval(pollHealth, 30000);
 pollHealth();
+
+// Expire chats older than a day even while the tab stays open.
+setInterval(() => { prune(); persist(); }, 5 * 60e3);
 
 // ---------- regenerate last reply ----------
 function canRegen() {
@@ -724,10 +922,13 @@ _refreshEmptyObserver.observe(chat, { childList: true });
 refreshEmpty();
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') $('settings').classList.remove('open');
+  if (e.key === 'Escape') {
+    $('settings').classList.remove('open');
+    $('sidebar').classList.remove('open');
+  }
 });
 
-restore();
+restoreAll();
 loadModels();
 refreshRegen();
 chat.addEventListener('DOMSubtreeModified', refreshRegen);

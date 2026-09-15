@@ -32,6 +32,7 @@ from typing import Any, Dict, Generator, List, Optional
 
 from .base import (
     Provider,
+    ProviderAuthError,
     ProviderError,
     ProviderRateLimitError,
     classify_http_error,
@@ -41,6 +42,13 @@ from .base import (
 from .jar import env_cookies, load_jar, save_jar
 
 logger = logging.getLogger('dsk.providers.mistral')
+
+# Mistral's anonymous tier no longer produces model output: the endpoint
+# answers HTTP 200 with a chat message that is actually the account upsell
+# ("## An account is now required to use Vibe  *Sign in...").  Detect it at
+# parse time and surface it as an auth failure so the router falls back and
+# selfheal classifies the provider as needing credentials.
+_AUTH_WALL_RE = re.compile(r'account is now required', re.IGNORECASE)
 
 MISTRAL_BASE_URL = 'https://chat.mistral.ai'
 MISTRAL_AUTH_URL = 'https://auth.mistral.ai'
@@ -193,19 +201,45 @@ class MistralProvider(Provider):
 
     def _iter_chunks(self, response) -> Generator[Dict[str, Any], None, None]:
         """Parse the ``<type_num>:<json>`` line format with an incremental
-        utf-8 decoder (multi-byte characters straddle chunk boundaries)."""
+        utf-8 decoder (multi-byte characters straddle chunk boundaries).
+
+        The account upsell can arrive split across many tiny append deltas
+        ("## ", "An ", "account ", …), so text is HELD until the first 300
+        chars have been matched against the login-wall regex — holding (not
+        just checking) is required, otherwise the deltas emitted before the
+        phrase completes leak to the router and pollute the fallback answer.
+        """
         decoder = codecs.getincrementaldecoder('utf-8')('replace')
         buffer = ''
+        prefix = ''                       # accumulated text head
+        held: List[Dict[str, Any]] = []   # pieces buffered during the window
         for chunk in response.iter_content(chunk_size=None):
             buffer += decoder.decode(chunk or b'')
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
                 for piece in self._parse_line(line.strip()):
+                    if len(prefix) < 300:
+                        head = piece.get('content') \
+                            if piece.get('type') == 'text' else None
+                        if head:
+                            prefix += head
+                            if _AUTH_WALL_RE.search(prefix):
+                                raise ProviderAuthError(
+                                    'mistral anonymous access disabled '
+                                    f'(account upsell): {prefix[:120]}')
+                            held.append(piece)
+                            continue
+                    while held:               # window closed: drain in order
+                        yield held.pop(0)
                     yield piece
         buffer += decoder.decode(b'', final=True)
         if buffer.strip():
             for piece in self._parse_line(buffer.strip()):
+                while held:
+                    yield held.pop(0)
                 yield piece
+        while held:
+            yield held.pop(0)
         yield {'content': '', 'type': 'text', 'finish_reason': 'stop'}
 
     def _parse_line(self, line: str) -> List[Dict[str, Any]]:
@@ -255,10 +289,18 @@ class MistralProvider(Provider):
                 texts = [c.get('text', '') for c in value
                          if isinstance(c, dict) and c.get('type') == 'text']
                 if texts:
+                    if _AUTH_WALL_RE.search(texts[-1][:300]):
+                        raise ProviderAuthError(
+                            'mistral anonymous access disabled (account '
+                            f'upsell): {texts[-1][:120]}')
                     out.append({'content': texts[-1], 'type': 'text',
                                 'finish_reason': None})
             elif op == 'append' and isinstance(value, str) and value:
                 # Delta append — e.g. path ``/contentChunks/0/text``.
+                if _AUTH_WALL_RE.search(value[:300]):
+                    raise ProviderAuthError(
+                        'mistral anonymous access disabled (account '
+                        f'upsell): {value[:120]}')
                 out.append({'content': value, 'type': 'text',
                             'finish_reason': None})
         return out

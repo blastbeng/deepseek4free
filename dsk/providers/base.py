@@ -13,6 +13,7 @@ Error taxonomy (drives the retry/fallback engine in router.py):
 import json
 import base64
 import binascii
+import logging
 import os
 import struct
 import uuid
@@ -44,6 +45,62 @@ def proxy_kwargs_for(url: str, no_proxy: bool = False) -> Dict[str, Any]:
         return _proxies.proxies_kwargs(url=url)
     except Exception:
         return {}
+
+
+logger = logging.getLogger('dsk.providers.base')
+
+# Connect-phase cap for pooled proxies: free proxies die constantly and the
+# OS-level connect can otherwise hang for minutes before the total timeout.
+HTTP_CONNECT_TIMEOUT = int(os.getenv('DSF_HTTP_CONNECT_TIMEOUT', '15'))
+
+
+def _looks_like_network_error(exc: BaseException) -> bool:
+    """True for transport-level failures (connect/timeout/proxy/ssl)."""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if any(k in name for k in ('requestexception', 'connection', 'timeout',
+                               'proxyerror', 'sslerror', 'chunkedencoding')):
+        return True
+    return any(k in text for k in (
+        "couldn't connect", 'failed to connect', 'timed out',
+        'connection reset', 'connection refused', 'connection aborted',
+        'getaddrinfo failed', 'temporary failure in name resolution'))
+
+
+def _resilient_request(url: str, extra: Dict[str, Any], do_request,
+                       pooled: bool = True):
+    """Run ``do_request(extra)``, surviving dead pooled proxies.
+
+    When a pool-assigned proxy fails at the transport level it is put on
+    cooldown (``proxies.mark_failure``) and the request is retried once
+    DIRECT.  Persistent transport failures are re-raised as
+    ProviderUnavailableError so the router can fall back instead of leaking
+    an unhandled 500 (curl_cffi RequestException escaped as 500 before).
+    """
+    proxy = None
+    px = extra.get('proxies') or {}
+    if px:
+        proxy = next(iter(px.values()), None)
+    try:
+        return do_request(extra)
+    except Exception as exc:  # noqa: BLE001 — classification below
+        if not _looks_like_network_error(exc):
+            raise
+        if proxy and pooled:
+            try:
+                _proxies.mark_failure(proxy)
+            except Exception:  # noqa: BLE001 — cooldown is best-effort
+                pass
+            logger.warning('pool proxy %s failed (%s); retrying direct',
+                           proxy, str(exc)[:100])
+            try:
+                return do_request({})
+            except Exception as exc2:  # noqa: BLE001
+                if not _looks_like_network_error(exc2):
+                    raise
+                raise ProviderUnavailableError(
+                    f'upstream unreachable via proxy and direct: {exc2}') from exc2
+        raise ProviderUnavailableError(f'request failed: {exc}') from exc
 
 
 class ProviderError(Exception):
@@ -138,21 +195,28 @@ def http_post_stream(url: str, headers: Optional[Dict[str, str]] = None,
                      no_proxy: bool = False):
     """POST and return a streaming response.
 
-    Uses curl_cffi with a Chrome TLS fingerprint when available — required for
-    Cloudflare-protected hosts (chat.deepseek.com, chatgpt.com).
+    Pooled-proxy connection failures are retried once DIRECT (the dead
+    proxy goes on cooldown); persistent transport errors surface as
+    ProviderUnavailableError so the router falls back cleanly.
     """
     extra = ({'proxies': proxies} if proxies
              else proxy_kwargs_for(url, no_proxy=no_proxy))
-    if cffi_requests is not None:
-        return cffi_requests.post(
-            url, headers=headers or {}, json=json_body,
-            stream=True, impersonate='chrome120', timeout=timeout,
-            **extra,
+
+    def _do(kwargs: Dict[str, Any]):
+        px = bool(kwargs.get('proxies'))
+        eff = (HTTP_CONNECT_TIMEOUT, timeout) if px else timeout
+        if cffi_requests is not None:
+            return cffi_requests.post(
+                url, headers=headers or {}, json=json_body,
+                stream=True, impersonate='chrome120', timeout=eff,
+                **kwargs,
+            )
+        return std_requests.post(
+            url, headers=headers or {}, json=json_body, stream=True,
+            timeout=eff, **kwargs,
         )
-    return std_requests.post(
-        url, headers=headers or {}, json=json_body, stream=True, timeout=timeout,
-        **extra,
-    )
+
+    return _resilient_request(url, extra, _do, pooled=proxies is None)
 
 
 def http_get(url: str, headers: Optional[Dict[str, str]] = None,
@@ -166,16 +230,22 @@ def http_get(url: str, headers: Optional[Dict[str, str]] = None,
     """
     extra = ({'proxies': proxies} if proxies
              else proxy_kwargs_for(url, no_proxy=no_proxy))
-    if cffi_requests is not None:
-        return cffi_requests.get(
+
+    def _do(kwargs: Dict[str, Any]):
+        px = bool(kwargs.get('proxies'))
+        eff = (HTTP_CONNECT_TIMEOUT, timeout) if px else timeout
+        if cffi_requests is not None:
+            return cffi_requests.get(
+                url, headers=headers or {}, cookies=cookies or None,
+                impersonate='chrome120', timeout=eff,
+                **kwargs,
+            )
+        return std_requests.get(
             url, headers=headers or {}, cookies=cookies or None,
-            impersonate='chrome120', timeout=timeout,
-            **extra,
+            timeout=eff, **kwargs,
         )
-    return std_requests.get(
-        url, headers=headers or {}, cookies=cookies or None, timeout=timeout,
-        **extra,
-    )
+
+    return _resilient_request(url, extra, _do, pooled=proxies is None)
 
 
 def parse_sse_data(line: bytes) -> Optional[Dict[str, Any]]:
@@ -250,11 +320,18 @@ def http_post_raw(url: str, data: bytes, headers: Optional[Dict[str, str]] = Non
     """POST a raw body and return the response (Chrome fingerprint)."""
     extra = ({'proxies': proxies} if proxies
              else proxy_kwargs_for(url, no_proxy=no_proxy))
-    if cffi_requests is not None:
-        return cffi_requests.post(url, headers=headers or {}, data=data,
-                                  impersonate='chrome120', timeout=timeout, **extra)
-    return std_requests.post(url, headers=headers or {}, data=data, timeout=timeout,
-                             **extra)
+
+    def _do(kwargs: Dict[str, Any]):
+        px = bool(kwargs.get('proxies'))
+        eff = (HTTP_CONNECT_TIMEOUT, timeout) if px else timeout
+        if cffi_requests is not None:
+            return cffi_requests.post(url, headers=headers or {}, data=data,
+                                      impersonate='chrome120', timeout=eff,
+                                      **kwargs)
+        return std_requests.post(url, headers=headers or {}, data=data,
+                                 timeout=eff, **kwargs)
+
+    return _resilient_request(url, extra, _do, pooled=proxies is None)
 
 
 def http_put_raw(url: str, data: bytes, headers: Optional[Dict[str, str]] = None,
@@ -263,11 +340,18 @@ def http_put_raw(url: str, data: bytes, headers: Optional[Dict[str, str]] = None
     """PUT a raw body and return the response (used for blob uploads)."""
     extra = ({'proxies': proxies} if proxies
              else proxy_kwargs_for(url, no_proxy=no_proxy))
-    if cffi_requests is not None:
-        return cffi_requests.put(url, headers=headers or {}, data=data,
-                                 impersonate='chrome120', timeout=timeout, **extra)
-    return std_requests.put(url, headers=headers or {}, data=data, timeout=timeout,
-                            **extra)
+
+    def _do(kwargs: Dict[str, Any]):
+        px = bool(kwargs.get('proxies'))
+        eff = (HTTP_CONNECT_TIMEOUT, timeout) if px else timeout
+        if cffi_requests is not None:
+            return cffi_requests.put(url, headers=headers or {}, data=data,
+                                     impersonate='chrome120', timeout=eff,
+                                     **kwargs)
+        return std_requests.put(url, headers=headers or {}, data=data,
+                                timeout=eff, **kwargs)
+
+    return _resilient_request(url, extra, _do, pooled=proxies is None)
 
 
 def http_upload_multipart(url: str, *, filename: str, content_type: str,

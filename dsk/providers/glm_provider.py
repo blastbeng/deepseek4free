@@ -61,10 +61,15 @@ GLM_MAX_OUTPUT = int(os.getenv('DSF_GLM_MAX_OUTPUT', '8192'))
 
 # Browser transport tuning (see _ZaiBrowser).
 ZAI_HEADLESS = os.getenv('DSF_ZAI_HEADLESS', '').strip().lower() in ('1', 'true', 'yes')
-ZAI_START_TIMEOUT = int(os.getenv('DSF_ZAI_START_TIMEOUT', '120'))
-ZAI_IDLE_TIMEOUT = int(os.getenv('DSF_ZAI_IDLE_TIMEOUT', '120'))
-ZAI_TOTAL_TIMEOUT = int(os.getenv('DSF_ZAI_TOTAL_TIMEOUT', '600'))
-ZAI_BUSY_TIMEOUT = int(os.getenv('DSF_ZAI_BUSY_TIMEOUT', '60'))
+ZAI_START_TIMEOUT = int(os.getenv('DSF_ZAI_START_TIMEOUT', '90'))
+# Idle/total bounds also cap how long a wedged browser request holds the
+# singleton session lock after a client has already timed out (defaults
+# tuned so the lock frees before typical client timeouts cascade).
+ZAI_IDLE_TIMEOUT = int(os.getenv('DSF_ZAI_IDLE_TIMEOUT', '60'))
+ZAI_TOTAL_TIMEOUT = int(os.getenv('DSF_ZAI_TOTAL_TIMEOUT', '300'))
+# Max time a queued request waits for the browser session slot (FIFO). With
+# concurrency, parallel glm requests queue here instead of failing fast.
+ZAI_BUSY_TIMEOUT = int(os.getenv('DSF_ZAI_BUSY_TIMEOUT', '180'))
 
 # Dynamic z.ai model discovery cache.
 _ZAI_MODELS_TTL = int(os.getenv('DSF_ZAI_MODELS_TTL', '900'))
@@ -339,6 +344,43 @@ return true;
 """
 
 
+class _FifoTicket:
+    """Fair single-slot scheduler: concurrent z.ai requests queue in arrival
+    order instead of a ``threading.Lock``'s unspecified wake-up order (or an
+    immediate 'busy' error). ``acquire(timeout)`` waits in line; expiry just
+    gives the slot back to the next waiter.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._busy = False
+        self._waiters: List[int] = []
+        self._next = 0
+
+    def acquire(self, timeout: float) -> bool:
+        with self._cond:
+            ticket = self._next
+            self._next += 1
+            self._waiters.append(ticket)
+            deadline = time.monotonic() + timeout
+            try:
+                while self._busy or self._waiters[0] != ticket:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._cond.wait(remaining)
+                self._busy = True
+                return True
+            finally:
+                if ticket in self._waiters:
+                    self._waiters.remove(ticket)
+
+    def release(self) -> None:
+        with self._cond:
+            self._busy = False
+            self._cond.notify_all()
+
+
 class _ZaiBrowser:
     """Single lazy Chromium session driving the chat.z.ai web UI.
 
@@ -355,7 +397,7 @@ class _ZaiBrowser:
     def __init__(self) -> None:
         self._page = None
         self._display = None
-        self._busy = threading.Lock()
+        self._busy = _FifoTicket()
 
     @classmethod
     def instance(cls) -> '_ZaiBrowser':

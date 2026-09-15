@@ -150,6 +150,18 @@ def _harvest_browser_cookies() -> Dict[str, str]:
         return {}
 
 
+def _rotate_identity() -> None:
+    """Discard the stale anonymous identity and mint a fresh browser one."""
+    try:
+        save_jar('copilot', {})
+    except Exception:  # noqa: BLE001 — rotation is best-effort
+        pass
+    if not _harvest_browser_cookies():
+        raise ProviderAuthError(
+            'copilot identity rotation failed — browser harvest produced '
+            'no cookies')
+
+
 def _anon_cookies() -> Dict[str, str]:
     """Stable identity: env JSON > jar > real browser harvest > synthetic."""
     cookies = env_cookies('COPILOT')
@@ -237,9 +249,23 @@ class CopilotProvider(Provider):
             if entry['id'] == model:
                 mode = entry['mode']
                 break
-        conversation_id = self._start_conversation(no_proxy=no_proxy)
-        return self._ws_stream(conversation_id, prompt, mode,
-                               image_generation, no_proxy=no_proxy)
+        conversation_id: Optional[str] = None
+        # A rejected anonymous identity triggers ONE automatic rotation:
+        # discard the stale jar, mint a fresh browser identity, retry.
+        last_auth: Optional[ProviderAuthError] = None
+        for attempt in range(2):
+            try:
+                conversation_id = self._start_conversation(no_proxy=no_proxy)
+                return self._ws_stream(conversation_id, prompt, mode,
+                                       image_generation, no_proxy=no_proxy)
+            except ProviderAuthError as e:
+                last_auth = e
+                if attempt or os.getenv('COPILOT_COOKIES'):
+                    raise
+                logger.warning('copilot: identity rejected (%s) — rotating '
+                               'anonymous identity', e)
+                _rotate_identity()
+        raise last_auth or ProviderError('copilot stream failed')
 
     def _headers(self) -> Dict[str, str]:
         return {
