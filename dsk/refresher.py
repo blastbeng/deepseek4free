@@ -659,20 +659,28 @@ def _signup_proxy() -> Optional[str]:
 
 
 def _tor_proxy() -> Optional[str]:
-    """The container-attached Tor SOCKS5 exit (run from dsk.proxies).
+    """Tor SOCKS5 exit for the signup ladder, two mounts.
 
     Tor exits are often CloudFront-allowlisted where datacenter pool IPs
-    are hard-403'd, so the ladder includes ``torproxy:9050`` when that
-    host resolves (same docker network). Returns None when Tor is absent
-    or its exit is currently blocked by DeepSeek.
+    are hard-403'd. Mounts, probed in order:
+      1. docker network alias ``torproxy:9050`` (fastest, when a network
+         attach exists);
+      2. the host-published port ``host.docker.internal:9050`` — resilient
+         to compose teardowns that sever manual network attaches (torproxy
+         publishes 9050 to the host).
+    Returns None when neither answers or the exit is currently blocked.
     """
     import socket
-    try:
-        socket.gethostbyname('torproxy')
-    except OSError:
-        return None
-    proxy = 'socks5://torproxy:9050'
-    return proxy if _ds_egress_ok(proxy) else None
+    for host in ('torproxy', 'host.docker.internal'):
+        proxy = f'socks5://{host}:9050'
+        try:
+            s = socket.create_connection((host, 9050), timeout=3)
+            s.close()
+        except OSError:
+            continue
+        if _ds_egress_ok(proxy):
+            return proxy
+    return None
 
 
 _DISPLAY = None  # pyvirtualdisplay handle kept alive for non-headless runs
