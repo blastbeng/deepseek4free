@@ -57,6 +57,10 @@ GLM_ASSISTANT_ID = '65940acff94777010aa6b796'
 GLM_SIGN_SECRET = '8a1317a7468aa3ad86e997d08f3f31cb'
 
 GLM_CONTEXT_LENGTH = int(os.getenv('DSF_GLM_CONTEXT_LENGTH', '128000'))
+# The z.ai WEB transport (chat.z.ai in a browser) silently stops answering
+# somewhere between 40k and 100k prompt characters — declare a realistic
+# context so llmtrim trims the conversation BEFORE it reaches the page.
+ZAI_WEB_CONTEXT = int(os.getenv('DSF_ZAI_CONTEXT_LENGTH', '10000'))
 GLM_MAX_OUTPUT = int(os.getenv('DSF_GLM_MAX_OUTPUT', '8192'))
 
 # Browser transport tuning (see _ZaiBrowser).
@@ -705,7 +709,8 @@ class GlmProvider(Provider):
 
         def add(entry_id: str, upstream: str, thinking: bool,
                 backend: str, name: Optional[str] = None,
-                vision: bool = False) -> None:
+                vision: bool = False, context_length: int = GLM_CONTEXT_LENGTH
+                ) -> None:
             if entry_id in seen:
                 return
             seen.add(entry_id)
@@ -719,7 +724,7 @@ class GlmProvider(Provider):
                 'search_enabled': False,
                 'vision': bool(vision),
                 'image_gen': False,
-                'context_length': GLM_CONTEXT_LENGTH,
+                'context_length': context_length,
                 'max_output_tokens': GLM_MAX_OUTPUT,
                 'extra': extra,
             })
@@ -729,10 +734,11 @@ class GlmProvider(Provider):
         for entry in dynamic:
             if entry['id'] in preferred:
                 add(entry['id'], entry['upstream'], entry['thinking'], 'zai',
-                    entry.get('name'))
+                    entry.get('name'), context_length=ZAI_WEB_CONTEXT)
         for entry in dynamic:
             add(entry['id'], entry['upstream'], entry['thinking'], 'zai',
-                entry.get('name'), vision=bool(entry.get('vision')))
+                entry.get('name'), vision=bool(entry.get('vision')),
+                context_length=ZAI_WEB_CONTEXT)
         for entry in GLM_MODELS:
             if entry['backend'] == 'chatglm' and not has_chatglm:
                 continue
