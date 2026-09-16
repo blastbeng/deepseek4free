@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Debian's chromium is used because Google's chrome repo does not resolve on
 # Debian trixie (time64 shared-lib variants are incompatible with the deb).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium chromium-driver xvfb xauth dbus ca-certificates \
+    chromium chromium-driver xvfb xauth dbus ca-certificates curl \
     fonts-liberation fonts-noto-color-emoji \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 

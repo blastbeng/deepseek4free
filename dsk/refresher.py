@@ -67,6 +67,7 @@ CLI:
 import imaplib
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -126,6 +127,10 @@ class _State:
         self.results: Dict[str, Dict[str, Any]] = {}
         self.counts: Dict[str, Tuple[str, int]] = {}  # provider -> (day, n)
         self.counts_seeded = False
+        # inline request-path remediation bookkeeping
+        self.inline_counts: Dict[str, Tuple[str, int]] = {}  # provider -> (hour, n)
+        self.inline_last: Dict[str, Tuple[str, float]] = {}  # provider -> (ok|failed, ts)
+        self.inline_threads: Dict[str, threading.Thread] = {}
 
 
 _STATE = _State()
@@ -429,23 +434,79 @@ def refresh_grok() -> Tuple[bool, str]:
     return False, f'HTTP {resp.status_code}'
 
 
-def refresh_qwen() -> Tuple[bool, str]:
-    if not _has_creds('qwen'):
-        return False, 'no qwen credentials — set QWEN_TOKEN or qwen_cookies.json'
+def _qwen_headers() -> Dict[str, str]:
+    """WAF-safe request headers for chat.qwen.ai (static bx-ua fingerprint
+    from the provider module; falls back to a plain UA on import failure)."""
+    try:
+        from .providers.qwen_provider import _headers
+        return _headers()
+    except Exception:  # noqa: BLE001
+        return {'User-Agent': _UA}
+
+
+def _qwen_signin(email: str, password: str) -> Tuple[bool, str]:
+    """HTTP re-login on chat.qwen.ai (OpenWebUI-style /api/v1/auths/signin).
+
+    The signin path is NOT WAF-challenged (unlike /signup, which sits behind
+    an Aliyun slide-captcha), so token renewal needs no browser: exchange the
+    stored email/password for a fresh JWT and persist it in the jar.
+    """
     import requests
     try:
-        resp = requests.get(
-            'https://chat.qwen.ai/api/v1/auths',
-            headers={'Authorization': f"Bearer {_load_jar('qwen').get('token', '')}",
-                     'User-Agent': _UA},
-            timeout=30, **_proxies_kwargs('https://chat.qwen.ai'))
+        resp = requests.post(
+            'https://chat.qwen.ai/api/v1/auths/signin',
+            json={'email': email, 'password': password},
+            headers=_qwen_headers(), timeout=30,
+            **_proxies_kwargs('https://chat.qwen.ai'))
     except Exception as e:  # noqa: BLE001
-        return False, f'verify failed: {type(e).__name__}: {e}'
-    if resp.status_code == 200:
-        return True, 'token valid'
-    if resp.status_code == 401:
-        return False, 'token rejected — re-export from chat.qwen.ai'
-    return False, f'HTTP {resp.status_code}'
+        return False, f'signin failed: {type(e).__name__}: {e}'
+    if resp.status_code != 200:
+        detail = ''
+        try:
+            detail = str((resp.json() or {}).get('detail') or '')[:80]
+        except Exception:  # noqa: BLE001
+            pass
+        return False, (f'signin rejected (HTTP {resp.status_code})'
+                       + (f': {detail}' if detail else ''))
+    try:
+        body = resp.json() or {}
+    except ValueError:
+        return False, 'signin returned a non-JSON body'
+    token = str(body.get('token') or '').strip()
+    if not token:
+        return False, 'signin ok but no token in response'
+    _save_jar('qwen', {'token': token, 'email': email})
+    return True, 're-signed in; fresh qwen token saved'
+
+
+def refresh_qwen() -> Tuple[bool, str]:
+    import requests
+    jar = _load_jar('qwen')
+    token = (jar.get('token') or '').strip()
+    if token:
+        try:
+            resp = requests.get(
+                'https://chat.qwen.ai/api/v1/auths',
+                headers={**_qwen_headers(), 'Authorization': f'Bearer {token}'},
+                timeout=30, **_proxies_kwargs('https://chat.qwen.ai'))
+        except Exception as e:  # noqa: BLE001
+            return False, f'verify failed: {type(e).__name__}: {e}'
+        if resp.status_code == 200:
+            return True, 'token valid'
+        if resp.status_code not in (401, 403):
+            return False, f'HTTP {resp.status_code}'
+    # token missing/rejected -> HTTP re-login from stored credentials
+    # (chat.qwen.ai /signin is not WAF-gated, so no browser is needed)
+    email, password = _creds('qwen')
+    if not email or not password:
+        return False, ('no qwen credentials — set QWEN_TOKEN, or '
+                       'QWEN_LOGIN_EMAIL/QWEN_LOGIN_PASSWORD (or let the '
+                       'qwen signup rung create an account) to enable '
+                       'automatic re-login')
+    ok, detail = _qwen_signin(email, password)
+    if not ok:
+        return False, f'token rejected; {detail}'
+    return True, detail
 
 
 def refresh_kimi() -> Tuple[bool, str]:
@@ -597,11 +658,39 @@ def _signup_proxy() -> Optional[str]:
     return None
 
 
+_DISPLAY = None  # pyvirtualdisplay handle kept alive for non-headless runs
+
+
+def _ensure_display() -> bool:
+    """Best-effort X server for non-headless runs. Returns True when a
+    DISPLAY is available (existing socket, pyvirtualdisplay, or env)."""
+    global _DISPLAY
+    if os.environ.get('DISPLAY'):
+        return True
+    import glob as _glob
+    sockets = sorted(_glob.glob('/tmp/.X11-unix/X[0-9]*'))
+    if sockets:
+        os.environ['DISPLAY'] = f':{sockets[0].rsplit("X", 1)[1]}'
+        return True
+    try:
+        from pyvirtualdisplay import Display
+        _DISPLAY = Display(visible=False, size=(1440, 900))
+        _DISPLAY.start()
+        os.environ['DISPLAY'] = _DISPLAY.new_display_var
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _browser(proxy: Optional[str] = None):
     from DrissionPage import ChromiumPage, ChromiumOptions
     options = ChromiumOptions().auto_port()
     options.set_argument('--no-sandbox')
     options.set_argument('--disable-gpu')
+    # Aliyun's slider scores the client: hide automation and run windowed
+    # (real Chrome under Xvfb) whenever the rung asks for non-headless.
+    options.set_argument('--disable-blink-features=AutomationControlled')
+    options.set_argument('--window-size=1440,900')
     if proxy:
         if proxy.startswith('socks'):
             # DrissionPage's set_proxy only speaks HTTP; chromium itself
@@ -618,6 +707,8 @@ def _browser(proxy: Optional[str] = None):
             options.set_proxy(proxy)
     if _env_bool('DSF_REFRESHER_HEADLESS', True):
         options.headless(True)
+    elif not _ensure_display():
+        options.headless(True)  # no X server obtainable -> degrade quietly
     return ChromiumPage(addr_or_opts=options)
 
 
@@ -723,6 +814,11 @@ def browser_login(name: str) -> Tuple[bool, str]:
     email, password = _creds(name)
     if not email or not password:
         return False, f'{name}: no login credentials configured'
+    if name == 'qwen':
+        # chat.qwen.ai /signin is not WAF-gated -> plain HTTP re-login,
+        # no browser needed (and /signup sits behind an Aliyun slider,
+        # so the API path is strictly more reliable here)
+        return _qwen_signin(email, password)
     proxy = _deepseek_egress() if name == 'deepseek' else None
     try:
         page = _browser(proxy=proxy)
@@ -979,10 +1075,23 @@ def signup_deepseek() -> Tuple[bool, str]:
             send_feedback = _body_head(page).lower()
             send_note = ''
             for needle in ('too many', 'rate limit', 'captcha', 'verify',
-                           'invalid', 'error', 'failed'):
+                           'invalid', 'exist', 'error', 'failed'):
                 if needle in send_feedback:
                     send_note = f' (page feedback: {needle})'
                     break
+            if 'exist' in send_feedback and generated and session:
+                # shared gmail dot/plus variants may already be registered —
+                # mint a fresh mailbox and resend on this rung
+                fresh, _ = mailgen.create_email()
+                if fresh:
+                    session = fresh
+                    email = fresh['address']
+                    password = (fresh.get('password')
+                                or mailgen.gen_password())
+                    _fill_first(page, _DEEPSEEK_EMAIL_SELECTORS, email)
+                    _click_any(page, ['Send Code', 'Send code', '获取验证码'])
+                    time.sleep(4)
+                    send_note += ' (mailbox regenerated)'
             if generated:
                 code = mailgen.fetch_otp(session, max_wait_s=180)
                 if not code:
@@ -992,9 +1101,10 @@ def signup_deepseek() -> Tuple[bool, str]:
                 code = imap_otp(max_wait_s=180)
             if not code:
                 return False, ('signup code email not found in mailbox — '
-                               'DeepSeek silently drops disposable domains; '
-                               'configure DSF_MAIL_DOMAIN + DSF_MAIL_IMAP_HOST '
-                               'with a catch-all inbox for reliable delivery'
+                               'no OTP arrived (gmail + disposable backends '
+                               'tried); configure DSF_MAIL_DOMAIN + '
+                               'DSF_MAIL_IMAP_HOST with a catch-all inbox '
+                               'for guaranteed delivery'
                                + send_note)
             if not _fill_first(page, ['@placeholder:code', '@placeholder:Code',
                                       'css:input[name=code]'], code):
@@ -1154,11 +1264,296 @@ def signup_gemini() -> Tuple[bool, str]:
             pass
 
 
+_QWEN_SIGNUP_URL = 'https://chat.qwen.ai/auth?action=signup'
+_QWEN_NAME_SELECTORS = ['@placeholder:Full Name', 'css:input[type=text]']
+_QWEN_EMAIL_SELECTORS = ['@placeholder:Email', 'css:input[type=email]']
+
+
+def _qwen_slider_pass(page, attempts: int = 10) -> bool:
+    """Solve Aliyun's noCaptcha slider with humanized drags.
+
+    chat.qwen.ai's signup POST is replayed by the WAF once the slider is
+    solved. Scoring is probabilistic — each attempt gets a freshly
+    randomized trajectory; the widget resets in place after a rejection.
+    Returns True when no widget is present (already passed) or a drag was
+    accepted; False when every attempt was rejected.
+    """
+    for _ in range(attempts):
+        slider = None
+        try:
+            slider = page.ele('#aliyunCaptcha-sliding-slider', timeout=4)
+        except Exception:  # noqa: BLE001
+            slider = None
+        if not slider:
+            return True
+        time.sleep(random.uniform(1.5, 3.0))  # let the widget settle
+        try:
+            ac = page.actions
+            mid = slider.rect.midpoint
+            # human approach: two stray hovers before grabbing the handle
+            ac.move(mid[0] - random.randint(18, 40),
+                    mid[1] - random.randint(10, 25), duration=.3)
+            ac.move(mid[0] - random.randint(4, 10),
+                    mid[1] - random.randint(2, 6), duration=.25)
+            time.sleep(random.uniform(.3, .6))
+            ac.move_to(slider).hold()
+            covered = 0
+            # slow start
+            for dx in (random.randint(5, 8), random.randint(8, 12),
+                       random.randint(10, 15), random.randint(12, 18)):
+                ac.move(dx, random.randint(-2, 2),
+                        duration=random.uniform(.07, .15))
+                covered += dx
+            time.sleep(random.uniform(.05, .15))
+            # fast middle until near the track end (~300px)
+            while covered < 235:
+                dx = random.randint(28, 52)
+                ac.move(dx, random.randint(-3, 3),
+                        duration=random.uniform(.04, .08))
+                covered += dx
+            # careful end: creep, overshoot, then correct back
+            for dx in (random.randint(10, 18), random.randint(6, 12),
+                       random.randint(3, 8)):
+                ac.move(dx, random.randint(-2, 2),
+                        duration=random.uniform(.07, .16))
+                covered += dx
+            time.sleep(random.uniform(.1, .25))
+            back = random.randint(10, 20)
+            ac.move(-back, 0, duration=.2)
+            time.sleep(.1)
+            ac.move(-random.randint(2, 6), 0, duration=.25)
+            time.sleep(random.uniform(.2, .4))
+            ac.release()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(3)
+        try:
+            done = page.run_js(
+                'return !!document.querySelector(".nc_ok,[class*=success]")'
+                ' || !document.querySelector("#aliyunCaptcha-sliding-slider");')
+        except Exception:  # noqa: BLE001
+            done = False
+        if done:
+            time.sleep(4)  # let the WAF replay the original POST
+            return True
+        time.sleep(random.uniform(1.5, 3.0))  # widget resets before retry
+    return False
+
+
+def signup_qwen() -> Tuple[bool, str]:
+    """Create a chat.qwen.ai account autonomously.
+
+    chat.qwen.ai is an OpenWebUI-style deployment; the signup form asks for
+    name/email/password (no phone). The signup API sits behind an Aliyun
+    slide-captcha, so this runs in the real browser and solves the slider
+    with humanized drags. The mailbox comes from dsk/mailgen (emailnator's
+    real gmail.com inboxes first). On success the JWT lands in the qwen jar
+    and the credentials in data/accounts.json — every later renewal is then
+    a plain HTTP re-login (see _qwen_signin/refresh_qwen).
+    """
+    email, password = _creds('qwen')
+    session = None
+    if not email or not password:
+        if not mailgen.autogen_enabled():
+            return False, 'no QWEN_LOGIN_EMAIL/PASSWORD and mail autogen off'
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        password = mailgen.gen_password()
+    name = f'DSF {email.split("@")[0][:8]}'.strip()
+    last_error = ''
+    ladder: List[Optional[str]] = [None]
+    try:
+        # slider verdicts are per-IP-reputation: a burned direct IP never
+        # passes, so sample FRESH pool exits directly (latency is irrelevant
+        # for a one-off signup; reachability is pre-probed cheaply)
+        from . import proxies as _proxies
+        _proxies.ensure_pool()
+        raw = list(_proxies.all_proxies())
+        random.shuffle(raw)
+        import requests as _rq
+        for cand in raw[:8]:
+            if len(ladder) >= 4:
+                break
+            if cand in ladder:
+                continue
+            try:
+                _rq.get('https://chat.qwen.ai/', timeout=8,
+                        proxies={'http': cand, 'https': cand},
+                        headers={'User-Agent': _UA})
+                ladder.append(cand)
+            except Exception:  # noqa: BLE001 — dead exit, skip
+                continue
+    except Exception:  # noqa: BLE001 — direct remains the fallback
+        pass
+    def _fill_signup_form(page) -> bool:
+        """Fill name/email/passwords, tick the custom agree widget, click
+        Create Account. Returns False when the form or button is unusable."""
+        if not _fill_first(page, _QWEN_NAME_SELECTORS, name):
+            return False
+        if not _fill_first(page, _QWEN_EMAIL_SELECTORS, email):
+            return False
+        pw_fields = page.eles('css:input[type=password]')
+        if len(pw_fields) < 2:
+            return False
+        pw_fields[0].clear()
+        pw_fields[0].input(password)
+        pw_fields[1].clear()
+        pw_fields[1].input(password)
+        try:
+            # the agree control is a custom widget: ARIA role=checkbox
+            # (element-plus style) — no real input[type=checkbox] exists
+            agreed = False
+            for sel in ('css:[role=checkbox]', 'css:input[type=checkbox]'):
+                try:
+                    cb = page.ele(sel, timeout=2)
+                except Exception:  # noqa: BLE001
+                    cb = None
+                if cb:
+                    try:
+                        cb.click(by_js=False)
+                    except Exception:  # noqa: BLE001
+                        cb.click(by_js=True)
+                    agreed = True
+                    break
+            if not agreed:
+                page.run_js(
+                    'const el=document.querySelector('
+                    '"[role=checkbox],[class*=checkbox],[class*=agree]");'
+                    'if(el) el.click();')
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(1)
+        btn_ready = page.run_js(
+            '[...document.querySelectorAll("button")]'
+            '.filter(b=>/create account/i.test(b.textContent))'
+            '.map(b=>b.disabled)[0]')
+        if btn_ready:
+            return False  # agree toggle failed — button still disabled
+        return bool(_click_any(page,
+                               ['Create Account', 'Create account', '注册']))
+
+    for proxy in ladder:
+        page = None
+        try:
+            page = _browser(proxy=proxy)
+            # slider scoring accumulates per WAF session: a few failed drags
+            # poison the page — so limit drags per load and RELOAD for a
+            # fresh verdict instead of grinding on one widget
+            for round_no in range(3):
+                page.get(_QWEN_SIGNUP_URL)
+                time.sleep(5)
+                if 'qwen' not in (page.url or ''):
+                    page.get(_QWEN_SIGNUP_URL)
+                    time.sleep(4)
+                if not _fill_signup_form(page):
+                    last_error = 'qwen signup form unusable (fields/agree)'
+                    break
+                time.sleep(3)
+                # the signup POST may be intercepted by Aliyun's slider
+                slider_ok = _qwen_slider_pass(page, attempts=4)
+                _log_history('qwen', 'stage',
+                             f'round={round_no} slider_pass={slider_ok}')
+            # the session JWT: scan localStorage for any JWT-shaped value
+            # (the storage key name is fork-specific) and fall back to the
+            # conventional 'token' key / cookies
+            token = ''
+            deadline = time.time() + 90
+            while time.time() < deadline and not token:
+                try:
+                    token = str(page.run_js(
+                        'let hit="";'
+                        'const re=/^[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{20,}'
+                        '\\.[A-Za-z0-9_-]{20,}$/;'
+                        'for(let i=0;i<localStorage.length;i++){'
+                        'const k=localStorage.key(i);'
+                        'const v=localStorage.getItem(k)||"";'
+                        'if(k==="token"&&v){hit=v;break;}'
+                        'if(v.length>80&&re.test(v)){hit=v;break;}}'
+                        'return hit;') or '').strip()
+                except Exception:  # noqa: BLE001
+                    token = ''
+                if not token:
+                    time.sleep(3)
+            # guard against analytics junk that merely LOOKS token-ish:
+            # the session JWT must authenticate against /api/v1/auths
+            import requests as _rq
+            verified = False
+            if token:
+                try:
+                    vcheck = _rq.get(
+                        'https://chat.qwen.ai/api/v1/auths',
+                        headers={**_qwen_headers(),
+                                 'Authorization': f'Bearer {token}'},
+                        timeout=30,
+                        **_proxies_kwargs('https://chat.qwen.ai'))
+                    verified = vcheck.status_code == 200
+                except Exception:  # noqa: BLE001
+                    verified = False
+            _log_history('qwen', 'stage',
+                         f'token={"yes" if token else "no"} verified={verified}'
+                         + (f' body={_body_head(page)[:80]}' if not verified else ''))
+            if not verified:
+                # new accounts are "pending activation": the activation mail
+                # lands in our mailbox — open its link, then re-login via the
+                # WAF-free HTTP signin for a fresh, activated session token
+                pending = 'pending activation' in _body_head(page).lower()
+                if pending and session:
+                    _log_history('qwen', 'stage', 'pending-activation detected')
+                    link = mailgen.fetch_otp(
+                        session, max_wait_s=180, sender_needle='qwen',
+                        code_re=re.compile(r'(https://[^\s"\'<>]+)'))
+                    _log_history('qwen', 'stage',
+                                 'activation link '
+                                 + ('found' if link else 'MISSING'))
+                    if link:
+                        try:
+                            page.get(link)
+                            time.sleep(6)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        ok2, detail2 = _qwen_signin(email, password)
+                        if ok2:
+                            try:
+                                token = (_load_jar('qwen').get('token') or '')
+                                vcheck = _rq.get(
+                                    'https://chat.qwen.ai/api/v1/auths',
+                                    headers={**_qwen_headers(),
+                                             'Authorization':
+                                                 f'Bearer {token}'},
+                                    timeout=30,
+                                    **_proxies_kwargs('https://chat.qwen.ai'))
+                                verified = vcheck.status_code == 200
+                            except Exception:  # noqa: BLE001
+                                verified = False
+            if not verified:
+                last_error = ('qwen signup submitted but no working session '
+                              f'captured via {proxy or "direct"} '
+                              '(slider/WAF rejected the POST, or the '
+                              'activation mail never arrived)')
+                continue
+            _save_jar('qwen', {'token': token, 'email': email})
+            _save_account('qwen', email, password,
+                          (session or {}).get('backend', ''))
+            return True, (f'qwen account created for {email} (mailbox: '
+                          f'{(session or {}).get("backend", "stored creds")})')
+        except Exception as e:  # noqa: BLE001
+            last_error = f'qwen signup failed: {type(e).__name__}: {e}'
+        finally:
+            if page is not None:
+                try:
+                    page.quit()
+                except Exception:  # noqa: BLE001
+                    pass
+    return False, last_error or 'all qwen signup egresses failed'
+
+
 SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'gemini': signup_gemini,
           'claude': _manual_only('claude', 'export the sessionKey cookie into CLAUDE_SESSION_KEY'),
           'grok': _manual_only('grok', 'export the sso cookie into GROK_SSO'),
-          'qwen': _manual_only('qwen', 'export the Bearer token into QWEN_TOKEN'),
+          'qwen': signup_qwen,
           'kimi': _manual_only('kimi', 'export the token cookie into KIMI_TOKEN'),
           'mistral': _manual_only('mistral',
                                   'export the session token into MISTRAL_SESSION_TOKEN'),
