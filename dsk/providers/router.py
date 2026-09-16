@@ -47,17 +47,9 @@ from .base import (
     ProviderUnavailableError,
     provider_enabled,
 )
-from .deepseek_provider import DeepSeekProvider
-from .gemini_provider import GeminiWebProvider
-from .chatgpt_provider import ChatGPTProvider
-from .claude_provider import ClaudeWebProvider
-from .grok_provider import GrokProvider
-from .mistral_provider import MistralProvider
-from .qwen_provider import QwenProvider
-from .kimi_provider import KimiProvider
-from .copilot_provider import CopilotProvider
-from .perplexity_provider import PerplexityProvider
-from .glm_provider import GlmProvider
+
+# Provider classes are imported LAZILY via PROVIDER_MODULES below — a broken
+# module then only disables its own provider instead of crashing startup.
 
 logger = logging.getLogger('dsk.router')
 

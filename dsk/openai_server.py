@@ -11,8 +11,9 @@ ChatGPT for free, plus a built-in llama.cpp-style playground UI:
     GET  /v1/models
     GET  /health
     GET  /selfheal/status      self-maintenance (selfheal + refresher) status
-    POST /selfheal/probe       force a probe cycle (heal/renew on failure)
-    POST /selfheal/refresh     force a credential refresh cycle
+    POST /selfheal/probe       force a probe cycle (heal/renew on failure;
+                               requires DSF_API_KEY when one is set)
+    POST /selfheal/refresh     force a credential refresh cycle (same key rule)
 
 Configuration (env):
     DSF_API_KEY       optional API key clients must send as Bearer token
@@ -901,8 +902,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         ],
         "usage": {
             "prompt_tokens": prompt_len // 4,
-            "completion_tokens": sum(len(p) for p in content_parts) // 4,
-            "total_tokens": (prompt_len + sum(len(p) for p in content_parts)) // 4,
+            "completion_tokens": (sum(len(p) for p in content_parts)
+                                  + sum(len(p) for p in reasoning_parts)) // 4,
+            "total_tokens": (prompt_len + sum(len(p) for p in content_parts)
+                             + sum(len(p) for p in reasoning_parts)) // 4,
         },
     }
 
@@ -1049,6 +1052,7 @@ async def _stream_completion(
                     }))
                     continue
                 if ctype == "thinking":
+                    out_chars["n"] += len(content)  # reasoning bills as completion
                     q.put(_sse({
                         "id": cid, "object": "chat.completion.chunk",
                         "created": created, "model": model,
