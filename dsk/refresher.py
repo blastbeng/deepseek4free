@@ -576,19 +576,13 @@ def _signup_proxy() -> Optional[str]:
     """Egress for signup browsers.
 
     DeepSeek (CloudFront) blocks some datacenter/host IPs outright, so
-    signups prefer an explicit ``DSF_SIGNUP_PROXY`` or the Tor SOCKS5 exit
-    (when DSF_PROXY_TOR is enabled). Returns None = direct connection.
+    signups prefer an explicit ``DSF_SIGNUP_PROXY``; otherwise the ladder
+    falls through to the dynamic pool and finally direct. Tor is NOT used
+    anywhere (slow). Returns None = direct connection.
     """
     explicit = os.getenv('DSF_SIGNUP_PROXY', '').strip()
     if explicit:
         return explicit
-    if _env_bool('DSF_PROXY_TOR', False):
-        try:
-            from . import proxies as _proxies
-            return (os.getenv('DSF_PROXY_TOR_URL', '').strip()
-                    or _proxies.TOR_DEFAULT_URL)
-        except Exception:  # pragma: no cover
-            return None
     return None
 
 

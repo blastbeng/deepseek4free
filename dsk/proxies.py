@@ -4,10 +4,8 @@ Builds a rotating proxy pool from three layers (all optional, all merged
 and deduplicated):
 
   1. Static env proxies
-       DSF_PROXY           single proxy URL, e.g. socks5h://torproxy:9050
+       DSF_PROXY           single proxy URL, e.g. http://user:pass@host:8080
        DSF_PROXIES         comma-separated list of proxy URLs
-       DSF_PROXY_TOR       truthy -> append the Tor SOCKS5 proxy
-       DSF_PROXY_TOR_URL   Tor SOCKS5 URL (default socks5h://torproxy:9050)
 
   2. Automatic free-proxy sources (DSF_PROXY_AUTO=true)
        Aggregates well-known public proxy lists over the web (TheSpeedX,
@@ -62,7 +60,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
-TOR_DEFAULT_URL = 'socks5h://localhost:9050'
+# Pseudo-candidate meaning "no proxy at all" — part of the rotation set so
+# every provider rotates across [no-proxy, proxy1, proxy2, ...].
+DIRECT = '__direct__'
 
 # (default_scheme_or_None, url) — None means the scheme is embedded per line
 # or JSON payload. All URLs verified live (2026-09); sources may vanish, the
@@ -203,6 +203,7 @@ class _State:
         self.lock = threading.Lock()
         self.pool: List[str] = []          # aggregated, capped, shuffled
         self.healthy: Dict[str, float] = {}  # proxy -> lease expiry (epoch)
+        self.latency: Dict[str, float] = {}  # proxy -> last measured ms
         self.fetched_at: float = 0.0
         self.checked_at: float = 0.0
         self.cooldown: Dict[str, float] = {}  # proxy -> retry-after (epoch)
@@ -241,10 +242,6 @@ def _static_proxies() -> List[str]:
             proxies.append(p)
     for entry in os.getenv('DSF_PROXIES', '').split(','):
         p = _normalize(entry)
-        if p:
-            proxies.append(p)
-    if _env_bool('DSF_PROXY_TOR'):
-        p = _normalize(os.getenv('DSF_PROXY_TOR_URL', '').strip() or TOR_DEFAULT_URL)
         if p:
             proxies.append(p)
     return proxies
@@ -290,6 +287,7 @@ def _refresh_pool() -> None:
         _STATE.fetched_at = now
         healthy_keys = set(_STATE.healthy) & set(pool)
         _STATE.healthy = {p: _STATE.healthy[p] for p in healthy_keys}
+        _STATE.latency = {p: ms for p, ms in _STATE.latency.items() if p in set(pool)}
         _STATE.cooldown = {p: t for p, t in _STATE.cooldown.items() if p in set(pool)}
         if errors:
             _STATE.last_error = '; '.join(errors[:3])
@@ -302,12 +300,23 @@ def _refresh_pool() -> None:
               file=__import__('sys').stderr)
 
 
-def _probe(proxy: str, url: str, timeout: float) -> Tuple[str, bool]:
+def _max_latency_ms() -> float:
+    """Fast-proxies-only budget: a proxy slower than this never gets traffic."""
+    return max(50.0, float(os.getenv('DSF_PROXY_MAX_LATENCY', '1200') or 1200))
+
+
+def _direct_rotation() -> bool:
+    """Whether the no-proxy route is part of the rotation set (default on)."""
+    return _env_bool('DSF_PROXY_DIRECT', 'true')
+
+
+def _probe(proxy: str, url: str, timeout: float) -> Tuple[str, bool, float]:
     try:
         from curl_cffi import requests as cffi
     except ImportError:
         cffi = None
     proxies = {'http': proxy, 'https': proxy}
+    t0 = time.monotonic()
     try:
         if cffi is not None:
             resp = cffi.get(url, proxies=proxies, timeout=timeout,
@@ -315,13 +324,16 @@ def _probe(proxy: str, url: str, timeout: float) -> Tuple[str, bool]:
         else:
             import requests as std
             resp = std.get(url, proxies=proxies, timeout=timeout)
-        return proxy, resp.status_code == 200
+        ms = (time.monotonic() - t0) * 1000.0
+        return proxy, resp.status_code == 200, ms
     except Exception:
-        return proxy, False
+        return proxy, False, (time.monotonic() - t0) * 1000.0
 
 
 def _run_check_pass() -> None:
-    """Validate the whole pool concurrently; healthy proxies get a new lease."""
+    """Validate the whole pool concurrently; only proxies that answer within
+    the latency budget (DSF_PROXY_MAX_LATENCY ms) get a healthy lease —
+    fast proxies only, slow exits never receive traffic."""
     url = os.getenv('DSF_PROXY_CHECK_URL',
                     'https://api.ipify.org?format=json').strip()
     timeout = float(os.getenv('DSF_PROXY_CHECK_TIMEOUT', '8') or 8)
@@ -330,18 +342,28 @@ def _run_check_pass() -> None:
         pool = list(_STATE.pool)
     if not pool:
         return
-    results: Dict[str, bool] = {}
+    results: Dict[str, Tuple[bool, float]] = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for proxy, ok in ex.map(lambda p: _probe(p, url, timeout), pool):
-            results[proxy] = ok
+        for proxy, ok, ms in ex.map(lambda p: _probe(p, url, timeout), pool):
+            results[proxy] = (ok, ms)
     now = time.time()
     lease = now + _check_ttl()
+    cap = _max_latency_ms()
     with _STATE.lock:
         _STATE.checked_at = now
-        alive = {p: lease for p, ok in results.items() if ok}
-        _STATE.healthy = alive
-    print(f"[proxies] health pass: {len(alive)}/{len(pool)} alive",
-          file=__import__('sys').stderr)
+        fast = {p: lease for p, (ok, ms) in results.items()
+                if ok and ms <= cap}
+        _STATE.healthy = fast
+        _STATE.latency = {p: ms for p, (ok, ms) in results.items() if ok}
+    if fast:
+        lats = sorted(_STATE.latency[p] for p in fast)
+        median = lats[len(lats) // 2]
+        print(f"[proxies] health pass: {len(fast)}/{len(pool)} fast "
+              f"(<= {cap:.0f} ms, median {median:.0f} ms)",
+              file=__import__('sys').stderr)
+    else:
+        print(f"[proxies] health pass: 0/{len(pool)} fast (<= {cap:.0f} ms) "
+              "— traffic rotates to direct", file=__import__('sys').stderr)
 
 
 def _controller_loop() -> None:
@@ -398,46 +420,55 @@ def get_proxy(provider: Optional[str] = None) -> Optional[str]:
     if not pool:
         return None
     now = time.time()
+    direct = _direct_rotation()
     with _STATE.lock:
         healthy = [p for p in pool if _STATE.healthy.get(p, 0) > now] if _check_enabled() else []
         candidates = healthy or pool  # until first pass, try the whole pool
         cooldown = float(os.getenv('DSF_PROXY_COOLDOWN', '120') or 120)
         alive = [p for p in candidates if _STATE.cooldown.get(p, 0) <= now]
-        # drop assignments that expired or whose proxy is no longer usable
+        # rotation candidate set: [no-proxy, proxy1, proxy2, proxy3, ...]
+        if direct:
+            alive = [DIRECT] + alive
+        # drop assignments that expired or whose route is no longer usable
         _STATE.assignments = {prov: pair for prov, pair in _STATE.assignments.items()
                               if pair[1] > now and pair[0] in alive}
         mode = os.getenv('DSF_PROXY_MODE', 'random').strip().lower()
         if key:
             assigned = _STATE.assignments.get(key)
             if assigned:
-                return assigned[0]
+                return None if assigned[0] == DIRECT else assigned[0]
             if not alive:
                 return None
             if mode == 'single':
-                proxy = alive[0]
+                # one fixed route: prefer a real proxy, direct only when the
+                # pool is empty
+                real = [p for p in alive if p != DIRECT]
+                route = real[0] if real else DIRECT
             else:
-                # randomize between providers: prefer a proxy not yet taken
+                # randomize between providers: prefer a route not yet taken
                 # by another provider; share only if the pool is too small
                 taken = {pair[0] for pair in _STATE.assignments.values()}
                 distinct = [p for p in alive if p not in taken]
-                proxy = random.choice(distinct or alive)
-            _STATE.assignments[key] = (proxy, now + _rotate_ttl())
-            return proxy
+                route = random.choice(distinct or alive)
+            _STATE.assignments[key] = (route, now + _rotate_ttl())
+            return None if route == DIRECT else route
         # provider=None: plain per-request selection (no stickiness)
         if not alive:
             return None
         if mode == 'single':
-            return alive[0]
+            real = [p for p in alive if p != DIRECT]
+            return real[0] if real else None
         if mode == 'round':
-            proxy = alive[_STATE.rr % len(alive)]
+            route = alive[_STATE.rr % len(alive)]
             _STATE.rr += 1
-            return proxy
-        return random.choice(alive)
+            return None if route == DIRECT else route
+        route = random.choice(alive)
+        return None if route == DIRECT else route
 
 
 def mark_failure(proxy: Optional[str]) -> None:
     """Put a proxy on cooldown and release any provider assigned to it."""
-    if not proxy:
+    if not proxy or proxy == DIRECT:
         return
     cooldown = float(os.getenv('DSF_PROXY_COOLDOWN', '120') or 120)
     now = time.time()
@@ -453,8 +484,8 @@ def proxies_kwargs(provider: Optional[str] = None,
                    no_proxy: bool = False) -> Dict[str, Any]:
     """Kwargs to splat into requests/curl_cffi calls for `provider`/`url`.
 
-    ``no_proxy=True`` forces a DIRECT connection ({}), skipping the pool and
-    Tor entirely — used by the per-request ``disable_proxy`` endpoint param.
+    ``no_proxy=True`` forces a DIRECT connection ({}), skipping the pool
+    entirely — used by the per-request ``disable_proxy`` endpoint param.
     """
     if no_proxy:
         return {}
@@ -479,8 +510,9 @@ def active_summary() -> str:
     if _check_enabled():
         parts.append(f"healthy={healthy_n}"
                      + (f" (checked {time.strftime('%H:%M:%S', time.localtime(checked))})" if checked else " (not yet)"))
-    if _env_bool('DSF_PROXY_TOR'):
-        parts.append("tor=on")
+        parts.append(f"max-latency={_max_latency_ms():.0f}ms")
+    if _direct_rotation():
+        parts.append("direct-rotation=on")
     if _env_bool('DSF_PROXY_AUTO'):
         parts.append("auto-sources=on")
     mode = os.getenv('DSF_PROXY_MODE', 'random').strip().lower() or 'random'
@@ -488,8 +520,9 @@ def active_summary() -> str:
     with _STATE.lock:
         assignments = {prov: pair[0] for prov, pair in _STATE.assignments.items()}
     if assignments:
-        parts.append("assigned=" + ','.join(f"{prov}->{p.split('://', 1)[-1]}"
-                                            for prov, p in sorted(assignments.items())))
+        parts.append("assigned=" + ','.join(
+            f"{prov}->{'direct' if p == DIRECT else p.split('://', 1)[-1]}"
+            for prov, p in sorted(assignments.items())))
     if err:
         parts.append(f"last_error={err[:80]}")
     return 'direct' if not pool_n else ', '.join(parts)

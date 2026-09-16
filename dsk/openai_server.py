@@ -39,6 +39,7 @@ Run:  python -m dsk.openai_server
 
 import base64
 import json
+import logging
 import os
 import queue
 import re
@@ -60,6 +61,7 @@ from .providers.base import (
     ProviderError,
     ProviderRateLimitError,
     ProviderUnavailableError,
+    Route,
     fetch_image_bytes,
     parse_data_uri,
 )
@@ -101,6 +103,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="DeepSeek4Free OpenAI-compatible API", lifespan=lifespan)
+logger = logging.getLogger('dsk.openai_server')
 
 
 def _check_api_key(request: Request) -> Optional[str]:
@@ -239,6 +242,28 @@ def _chain_capability(route, key: str) -> Optional[bool]:
     if getattr(route, key, False):
         return True
     return any(getattr(ROUTER.routes[f], key, False) for f in fallbacks)
+
+
+def _llmtrim_stage(messages: List[ChatMessage], route: Route) -> List[ChatMessage]:
+    """LLM CALL -> llmtrim -> proxy rotator -> LLM response.
+
+    Always-on payload trim before the request enters the router/provider
+    layer (whose HTTP calls go through the proxy rotator). Stale history is
+    dropped and oversized messages middle-out truncated so every egress
+    route carries the smallest sufficient payload.
+    """
+    try:
+        from dsk.llmtrim import trim_messages
+        trimmed, stats = trim_messages(messages, route.context_length,
+                                       route.max_output_tokens)
+        if stats.get('trimmed'):
+            logger.info('llmtrim: %s -> %s chars (dropped %s, truncated %s)',
+                        stats.get('in_chars'), stats.get('out_chars'),
+                        stats.get('dropped'), stats.get('truncated'))
+        return trimmed
+    except Exception as e:  # noqa: BLE001 — trimming must never break a call
+        logger.warning('llmtrim stage skipped: %s', e)
+        return messages
 
 
 def _build_prompt(messages: List[ChatMessage]) -> str:
@@ -685,12 +710,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     thinking_override = route.thinking_enabled
     search_override = True if body.search_enabled else None
 
-    prompt = _build_prompt(body.messages)
+    trimmed_messages = _llmtrim_stage(body.messages, route)
+    prompt = _build_prompt(trimmed_messages)
     # Image parts may require downloading remote URLs — keep that off the
     # event loop (no-op scan when the request carries no image parts).
-    if _has_image_parts(body.messages):
+    if _has_image_parts(trimmed_messages):
         images = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: _extract_images(body.messages))
+            None, lambda: _extract_images(trimmed_messages))
     else:
         images: List[Dict[str, Any]] = []
     if images:
@@ -1141,6 +1167,10 @@ async def images_generations(body: ImageGenerationRequest, request: Request):
 def main():
     import uvicorn
 
+    # Surface dsk.* logger.info lines (llmtrim stats, registry updates,
+    # refresher/copyist activity) on stderr alongside uvicorn's own logs.
+    logging.basicConfig(level=logging.INFO,
+                        format='%(levelname)s:%(name)s: %(message)s')
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 

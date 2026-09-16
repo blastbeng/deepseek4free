@@ -55,11 +55,12 @@ services:
       - DSF_MODELS_TTL=${DSF_MODELS_TTL:-300}
       - DSF_FALLBACKS=${DSF_FALLBACKS:-}
       - DSF_DEFAULT_FALLBACKS=${DSF_DEFAULT_FALLBACKS:-glm-4.7}
-      # Outbound proxy rotation (dsk/proxies.py): Tor + automatic free proxies
+      # Outbound proxy rotation (dsk/proxies.py): fast-only free proxies + direct
       - DSF_PROXY=${DSF_PROXY:-}
       - DSF_PROXIES=${DSF_PROXIES:-}
-      - DSF_PROXY_TOR=${DSF_PROXY_TOR:-false}
-      - DSF_PROXY_TOR_URL=${DSF_PROXY_TOR_URL:-socks5h://host.docker.internal:9050}
+      - DSF_PROXY_MAX_LATENCY=${DSF_PROXY_MAX_LATENCY:-1200}
+      - DSF_PROXY_DIRECT=${DSF_PROXY_DIRECT:-true}
+      - DSF_LLMTRIM=${DSF_LLMTRIM:-true}
       - DSF_PROXY_AUTO=${DSF_PROXY_AUTO:-false}
       - DSF_PROXY_SOURCES=${DSF_PROXY_SOURCES:-}
       - DSF_PROXY_MAX_POOL=${DSF_PROXY_MAX_POOL:-250}
@@ -118,8 +119,8 @@ services:
       - DSF_MAIL_OTP_REGEX=${DSF_MAIL_OTP_REGEX:-}
       - DOCKERMODE=true
     extra_hosts:
-      # Tor SOCKS5 is published on the host (0.0.0.0:9050); the container
-      # reaches it through the docker bridge gateway — no shared network.
+      # host-gateway access for host-published operator services (the
+      # proxy pool no longer uses Tor anywhere)
       - "host.docker.internal:host-gateway"
     volumes:
       # Persist cf_clearance cookies across container restarts (local ./data dir)
