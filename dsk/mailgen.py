@@ -361,8 +361,12 @@ class _Emailnator:
         return code, parsed
 
     def generate(self) -> Optional[str]:
-        # 2 = plusGmail, 3 = dotGmail, 8 = googleMail — real gmail.com inbox
-        code, body = self._call('POST', '/api/generate-email', {'ids': [2, 3, 8]})
+        # 3 = dotGmail, 8 = googleMail — real gmail.com inbox variants.
+        # id 2 (plusGmail, user+tag@gmail.com) is deliberately EXCLUDED:
+        # DeepSeek's mail pipeline silently drops plus-addressed recipients,
+        # so the OTP never arrives (verified live 2026-09-16). Dot-variants
+        # and googlemail.com aliases are delivered.
+        code, body = self._call('POST', '/api/generate-email', {'ids': [3, 8]})
         if code == 200 and isinstance(body, dict) \
                 and str(body.get('status') or '') == 'success':
             address = str(body.get('email') or '').strip()

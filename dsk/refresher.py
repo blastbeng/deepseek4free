@@ -649,13 +649,30 @@ def _signup_proxy() -> Optional[str]:
 
     DeepSeek (CloudFront) blocks some datacenter/host IPs outright, so
     signups prefer an explicit ``DSF_SIGNUP_PROXY``; otherwise the ladder
-    falls through to the dynamic pool and finally direct. Tor is NOT used
-    anywhere (slow). Returns None = direct connection.
+    falls through to the dynamic pool, the local Tor exit, and finally
+    direct. Returns None = direct connection.
     """
     explicit = os.getenv('DSF_SIGNUP_PROXY', '').strip()
     if explicit:
         return explicit
     return None
+
+
+def _tor_proxy() -> Optional[str]:
+    """The container-attached Tor SOCKS5 exit (run from dsk.proxies).
+
+    Tor exits are often CloudFront-allowlisted where datacenter pool IPs
+    are hard-403'd, so the ladder includes ``torproxy:9050`` when that
+    host resolves (same docker network). Returns None when Tor is absent
+    or its exit is currently blocked by DeepSeek.
+    """
+    import socket
+    try:
+        socket.gethostbyname('torproxy')
+    except OSError:
+        return None
+    proxy = 'socks5://torproxy:9050'
+    return proxy if _ds_egress_ok(proxy) else None
 
 
 _DISPLAY = None  # pyvirtualdisplay handle kept alive for non-headless runs
@@ -873,20 +890,25 @@ def browser_login(name: str) -> Tuple[bool, str]:
             time.sleep(12)
             n = _export_cookies(page, 'chatgpt', ('chatgpt.com', 'openai.com'))
             return (n > 0), f'{n} session cookies exported'
-        # gemini (Google) — best effort, heavy anti-bot
-        page.get('https://accounts.google.com/ServiceLogin')
-        time.sleep(4)
-        if not _fill_first(page, _GEMINI_EMAIL_SELECTORS, email):
-            return False, 'google email field not found'
-        _click_any(page, ['Next', 'Weiter'])
-        time.sleep(4)
-        _fill_first(page, _PASSWORD_SELECTORS, password)
-        _click_any(page, ['Next', 'Weiter'])
-        time.sleep(12)
-        page.get('https://gemini.google.com/app')
-        time.sleep(6)
-        n = _export_cookies(page, 'gemini', ('google.com',))
-        return (n > 0), f'{n} google cookies exported (2FA/anti-bot may block)'
+        if name == 'gemini':
+            # gemini (Google) — best effort, heavy anti-bot
+            page.get('https://accounts.google.com/ServiceLogin')
+            time.sleep(4)
+            if not _fill_first(page, _GEMINI_EMAIL_SELECTORS, email):
+                return False, 'google email field not found'
+            _click_any(page, ['Next', 'Weiter'])
+            time.sleep(4)
+            _fill_first(page, _PASSWORD_SELECTORS, password)
+            _click_any(page, ['Next', 'Weiter'])
+            time.sleep(12)
+            page.get('https://gemini.google.com/app')
+            time.sleep(6)
+            n = _export_cookies(page, 'gemini', ('google.com',))
+            return (n > 0), f'{n} google cookies exported (2FA/anti-bot may block)'
+        # claude / grok / kimi / mistral: their credentials are HTTP-only
+        # tokens (sessionKey / sso / JWT / Ory session) that no login form
+        # re-issues — nothing to rotate in a browser here.
+        return False, f'{name}: browser re-login not applicable'
     except Exception as e:  # noqa: BLE001
         return False, f'browser flow failed: {type(e).__name__}: {e}'
     finally:
@@ -1009,21 +1031,17 @@ def signup_deepseek() -> Tuple[bool, str]:
         # password independent of the mailbox credentials.
         password = session.get('password') or mailgen.gen_password()
         generated = True
-    # egress ladder: explicit DSF_SIGNUP_PROXY first, then SEVERAL distinct
-    # dynamic-pool exits, then direct (duplicates dropped). DeepSeek's
-    # CloudFront blocks many datacenter/host IPs, and a blocked exit stays
-    # "healthy" for generic checks — so every CloudFront block puts that
-    # proxy on cooldown (mark_failure) and the next rung samples a fresh
-    # exit instead of retrying the same blocked IP.
     # egress ladder: explicit DSF_SIGNUP_PROXY first, then up to 3 distinct
     # dynamic-pool exits that PASS the root-page reachability probe, then
-    # direct (duplicates dropped). CloudFront blocks many datacenter/host
-    # IPs; blocked exits are cooled down so the next rung samples a fresh,
-    # hopefully-working IP instead of retrying the same blocked one.
+    # the local Tor SOCKS5 exit (torproxy:9050 — its exit IPs are not in
+    # CloudFront's datacenter blocklists, unlike pool/host IPs), then
+    # direct (duplicates dropped). Blocked exits are cooled down so the
+    # next rung samples a fresh, hopefully-working IP instead of the same
+    # blocked one.
     ladder: List[Optional[str]] = []
     seen: set = set()
     for p in (([_signup_proxy()] if _signup_proxy() else [])
-              + _pool_egresses() + [None]):
+              + _pool_egresses() + [_tor_proxy(), None]):
         if p is None or p not in seen:
             ladder.append(p)
             if p is not None:
@@ -1110,6 +1128,25 @@ def signup_deepseek() -> Tuple[bool, str]:
                                       'css:input[name=code]'], code):
                 return False, 'code field not found'
             _click_any(page, ['Sign Up', 'Sign up', '注册'])
+            # Harvest: the fresh session's userToken lands in localStorage
+            # once the SPA logs in — quit() without capturing it would throw
+            # the whole signup away. Token + credentials both persisted so
+            # every later renewal re-logs in instead of re-signing-up.
+            time.sleep(8)
+            token = _wait_token(page, timeout_s=90)
+            _export_cookies(page, 'deepseek', ('deepseek.com',))
+            if token:
+                _save_deepseek_token(token)
+                if generated:
+                    _save_account('deepseek', email, password,
+                                  (session or {}).get('backend', ''))
+                _log_history('deepseek', 'signup-token',
+                             f'captured via {proxy or "direct"}')
+                return True, (f'account created and userToken captured '
+                              f'({(session or {}).get("backend", "manual")}: '
+                              f'{email})')
+            return False, ('signup submitted but no userToken in localStorage '
+                           '(verification may still be pending)')
         except Exception as e:  # noqa: BLE001
             last_error = f'signup flow failed: {type(e).__name__}: {e}'
             _log_history('deepseek', 'egress-failed',
@@ -1136,7 +1173,10 @@ def signup_chatgpt() -> Tuple[bool, str]:
     session, err = mailgen.create_email()
     if not session:
         return False, f'autogen mailbox unavailable: {err}'
-    email, password = session['address'], session['password']
+    email = session['address']
+    # token-addressed backends (emailnator, tempmail.lol) carry no mailbox
+    # password: mint a form password independent of the mailbox creds.
+    password = session.get('password') or mailgen.gen_password()
     try:
         page = _browser()
     except Exception as e:  # noqa: BLE001
@@ -1197,7 +1237,10 @@ def signup_gemini() -> Tuple[bool, str]:
     session, err = mailgen.create_email()
     if not session:
         return False, f'autogen mailbox unavailable: {err}'
-    email, password = session['address'], session['password']
+    email = session['address']
+    # token-addressed backends (emailnator, tempmail.lol) carry no mailbox
+    # password: mint a form password independent of the mailbox creds.
+    password = session.get('password') or mailgen.gen_password()
     try:
         page = _browser()
     except Exception as e:  # noqa: BLE001
@@ -1262,6 +1305,266 @@ def signup_gemini() -> Tuple[bool, str]:
             page.quit()
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---------------------------------------------------------------- token signups
+# claude.ai / grok.com / kimi.com / chat.mistral.ai all expose free email+password
+# signup forms; the resulting session lands as an HTTP-only cookie or local JWT
+# that the refresher exports automatically — no human, no cookie export.
+
+
+def signup_claude() -> Tuple[bool, str]:
+    """Create a fresh claude.ai account and harvest the sessionKey cookie.
+
+    claude.ai signup is email + password + emailed OTP; the sessionKey
+    cookie appears in the jar once the SPA lands in the app. Created
+    credentials are persisted for later re-login.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+    session, err = mailgen.create_email()
+    if not session:
+        return False, f'autogen mailbox unavailable: {err}'
+    email = session['address']
+    password = session.get('password') or mailgen.gen_password()
+    page = None
+    try:
+        page = _browser()
+        page.get('https://claude.ai/login')
+        time.sleep(6)
+        if not _click_any(page, ['Sign up', 'Create account']):
+            page.get('https://claude.ai/signup')
+        time.sleep(4)
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found (bot wall?)'
+        _fill_first(page, _PASSWORD_SELECTORS, password)
+        _click_any(page, ['Continue', 'Sign up', 'Create account'])
+        time.sleep(6)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='claude')
+        if not code:
+            return False, 'claude verification email not found (bot wall/OTP)'
+        if not _fill_first(page, ['css:input[name=code]',
+                                  '@placeholder:code', '@placeholder:Code',
+                                  'css:input[inputmode=numeric]'], code):
+            return False, 'code field not found'
+        _click_any(page, ['Verify', 'Continue', 'Sign up'])
+        time.sleep(12)
+        jar_cookies = {}
+        try:
+            for c in (page.cookies(all_domains=True) or []):
+                if 'claude.ai' in str(c.get('domain', '')):
+                    jar_cookies[c['name']] = c['value']
+        except TypeError:
+            for c in (page.cookies() or []):
+                if 'claude.ai' in str(c.get('domain', '')):
+                    jar_cookies[c['name']] = c['value']
+        session_key = jar_cookies.get('sessionKey', '')
+        if session_key:
+            _save_jar('claude', {'sessionKey': session_key})
+            _save_account('claude', email, password, session.get('backend', ''))
+            return True, (f'account created, sessionKey harvested '
+                          f'({session.get("backend")}: {email})')
+        return False, 'signup finished but no sessionKey cookie captured'
+    except Exception as e:  # noqa: BLE001
+        return False, f'claude signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def signup_grok() -> Tuple[bool, str]:
+    """Create a grok.com account (X SSO-less email signup) and export sso."""
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+    session, err = mailgen.create_email()
+    if not session:
+        return False, f'autogen mailbox unavailable: {err}'
+    email = session['address']
+    password = session.get('password') or mailgen.gen_password()
+    page = None
+    try:
+        page = _browser()
+        page.get('https://accounts.x.ai/sign-up')
+        time.sleep(6)
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            if not _click_any(page, ['Sign up', 'Create account', 'Sign in']):
+                return False, 'grok signup entry not found (bot wall?)'
+            time.sleep(4)
+            if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+                return False, 'email field not found'
+        _click_any(page, ['Continue', 'Next'])
+        time.sleep(3)
+        _fill_first(page, _PASSWORD_SELECTORS, password)
+        _click_any(page, ['Continue', 'Sign up'])
+        time.sleep(10)
+        code = mailgen.fetch_otp(session, max_wait_s=240, sender_needle='x.ai')
+        if not code:
+            code = mailgen.fetch_otp(session, max_wait_s=60, sender_needle='')
+        if not code:
+            return False, 'grok verification email not found'
+        if not _fill_first(page, ['css:input[name=code]', '@placeholder:code',
+                                  'css:input[inputmode=numeric]',
+                                  'css:input[type=text]'], code):
+            return False, 'code field not found'
+        _click_any(page, ['Verify', 'Continue'])
+        time.sleep(12)
+        page.get('https://grok.com/')
+        time.sleep(6)
+        jar_cookies = {}
+        try:
+            for c in (page.cookies(all_domains=True) or []):
+                if 'grok.com' in str(c.get('domain', '')):
+                    jar_cookies[c['name']] = c['value']
+        except TypeError:
+            for c in (page.cookies() or []):
+                if 'grok.com' in str(c.get('domain', '')):
+                    jar_cookies[c['name']] = c['value']
+        sso = jar_cookies.get('sso') or jar_cookies.get('sso-rw') or ''
+        if sso:
+            _save_jar('grok', {'sso': sso, 'sso-rw': sso})
+            _save_account('grok', email, password, session.get('backend', ''))
+            return True, (f'account created, sso exported '
+                          f'({session.get("backend")}: {email})')
+        return False, 'signup finished but no sso cookie captured'
+    except Exception as e:  # noqa: BLE001
+        return False, f'grok signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def signup_kimi() -> Tuple[bool, str]:
+    """Create a kimi.com account (phone-free email signup) and save the JWT."""
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+    session, err = mailgen.create_email()
+    if not session:
+        return False, f'autogen mailbox unavailable: {err}'
+    email = session['address']
+    password = session.get('password') or mailgen.gen_password()
+    page = None
+    try:
+        page = _browser()
+        page.get('https://www.kimi.com/')
+        time.sleep(6)
+        if not _click_any(page, ['Sign up', 'Sign Up', '注册', 'Log in', '登录']):
+            return False, 'kimi auth entry not found'
+        time.sleep(4)
+        # prefer email/password over phone (no phone wall for email)
+        _click_any(page, ['Email', '邮箱', 'Password login', '密码登录'])
+        time.sleep(2)
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _fill_first(page, _PASSWORD_SELECTORS, password)
+        _click_any(page, ['Sign up', 'Sign Up', '注册', 'Continue'])
+        time.sleep(10)
+        code = mailgen.fetch_otp(session, max_wait_s=240, sender_needle='kimi')
+        if not code:
+            code = mailgen.fetch_otp(session, max_wait_s=60, sender_needle='')
+        if not code:
+            return False, 'kimi verification email not found'
+        if not _fill_first(page, ['css:input[name=code]', '@placeholder:code',
+                                  'css:input[inputmode=numeric]',
+                                  'css:input[type=text]'], code):
+            return False, 'code field not found'
+        _click_any(page, ['Verify', 'Continue', '确认'])
+        time.sleep(12)
+        token = ''
+        try:
+            token = str(page.run_js(
+                'let hit="";'
+                'for(let i=0;i<localStorage.length;i++){'
+                'const k=localStorage.key(i);const v=localStorage.getItem(k);'
+                'if(v&&v.length>40&&/eyJ[A-Za-z0-9_-]/.test(v)){hit=v;break;}}'
+                'return hit;') or '')
+        except Exception:  # noqa: BLE001
+            pass
+        if token:
+            try:
+                token = str(json.loads(token).get('value') or token)
+            except (ValueError, AttributeError):
+                pass
+            _save_jar('kimi', {'token': token, 'email': email})
+            _save_account('kimi', email, password, session.get('backend', ''))
+            return True, (f'account created, JWT saved '
+                          f'({session.get("backend")}: {email})')
+        return False, 'signup finished but no JWT found in localStorage'
+    except Exception as e:  # noqa: BLE001
+        return False, f'kimi signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def signup_mistral() -> Tuple[bool, str]:
+    """Create a chat.mistral.ai account and export the Ory session cookie."""
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+    session, err = mailgen.create_email()
+    if not session:
+        return False, f'autogen mailbox unavailable: {err}'
+    email = session['address']
+    password = session.get('password') or mailgen.gen_password()
+    page = None
+    try:
+        page = _browser()
+        page.get('https://auth.mistral.ai/ui/registration')
+        time.sleep(6)
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found (bot wall?)'
+        _fill_first(page, _PASSWORD_SELECTORS, password)
+        _fill_first(page, ['css:input[name=reveal_password]',
+                           'css:input[name=confirm_password]'], password)
+        _click_any(page, ['Create an account', 'Sign up', 'Continue'])
+        time.sleep(10)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='mistral')
+        if not code:
+            code = mailgen.fetch_otp(session, max_wait_s=60, sender_needle='')
+        if not code:
+            return False, 'mistral verification email not found'
+        if not _fill_first(page, ['css:input[name=code]', '@placeholder:code',
+                                  'css:input[name=code*]',
+                                  'css:input[inputmode=numeric]',
+                                  'css:input[type=text]'], code):
+            return False, 'code field not found'
+        _click_any(page, ['Verify', 'Continue', 'Submit'])
+        time.sleep(12)
+        page.get('https://chat.mistral.ai/chat')
+        time.sleep(6)
+        jar_cookies = {}
+        try:
+            for c in (page.cookies(all_domains=True) or []):
+                if 'mistral' in str(c.get('domain', '')):
+                    jar_cookies[c['name']] = c['value']
+        except TypeError:
+            for c in (page.cookies() or []):
+                if 'mistral' in str(c.get('domain', '')):
+                    jar_cookies[c['name']] = c['value']
+        if jar_cookies.get('ory_kratos_session'):
+            _save_jar('mistral', jar_cookies)
+            _save_account('mistral', email, password, session.get('backend', ''))
+            return True, (f'account created, session cookie exported '
+                          f'({session.get("backend")}: {email})')
+        return False, 'signup finished but no Ory session cookie captured'
+    except Exception as e:  # noqa: BLE001
+        return False, f'mistral signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 _QWEN_SIGNUP_URL = 'https://chat.qwen.ai/auth?action=signup'
@@ -1551,12 +1854,11 @@ def signup_qwen() -> Tuple[bool, str]:
 
 SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'gemini': signup_gemini,
-          'claude': _manual_only('claude', 'export the sessionKey cookie into CLAUDE_SESSION_KEY'),
-          'grok': _manual_only('grok', 'export the sso cookie into GROK_SSO'),
+          'claude': signup_claude,
+          'grok': signup_grok,
           'qwen': signup_qwen,
-          'kimi': _manual_only('kimi', 'export the token cookie into KIMI_TOKEN'),
-          'mistral': _manual_only('mistral',
-                                  'export the session token into MISTRAL_SESSION_TOKEN'),
+          'kimi': signup_kimi,
+          'mistral': signup_mistral,
           'copilot': _anonymous('copilot'),
           'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm')}
 
@@ -1567,7 +1869,13 @@ def _seed_counts() -> None:
 
     The counts live in memory, so a container restart would otherwise
     bypass the daily attempt cap; today's ``renew-start`` events make the
-    budget continuous across restarts. Runs once per process."""
+    budget continuous across restarts. Runs once per process.
+
+    Only DAEMON-triggered attempts count against the budget: events whose
+    reason starts with ``manual-`` (CLI runs, force-bootstrap) are
+    excluded, so an operator debugging the ladder can never exhaust the
+    bot's own daily quota — the daemon keeps retrying regardless.
+    """
     if _STATE.counts_seeded:
         return
     _STATE.counts_seeded = True
@@ -1582,7 +1890,8 @@ def _seed_counts() -> None:
                 except (ValueError, TypeError):
                     continue
                 if (entry.get('event') == 'renew-start'
-                        and str(entry.get('ts', '')).startswith(today)):
+                        and str(entry.get('ts', '')).startswith(today)
+                        and not str(entry.get('detail', '')).startswith('manual')):
                     counts[entry.get('provider', '')] = \
                         counts.get(entry.get('provider', ''), 0) + 1
         for name, n in counts.items():
@@ -1617,7 +1926,8 @@ def renew(name: str, reason: str = '') -> Dict[str, Any]:
         manual = reason.startswith('manual')
         if n > _max_renews() and not manual:
             return {'renewed': False, 'skipped': 'daily attempt budget exhausted'}
-        _STATE.counts[name] = (day, n)
+        if not manual:  # manual/CLI attempts never consume the daemon budget
+            _STATE.counts[name] = (day, n)
         _STATE.renewing[name] = True
     try:
         return _renew_locked(name, reason)
@@ -1675,6 +1985,52 @@ def _verify(name: str) -> str:
         return status
     except Exception as e:  # noqa: BLE001
         return f'probe-error: {e}'
+
+
+def renew_inline(name: str, detail: str = '') -> Dict[str, Any]:
+    """Request-path remediation: fire a background renewal on an auth error.
+
+    Called from the router the moment a request classified as
+    ``ProviderAuthError`` — the ladder (refresh -> browser re-login ->
+    auto-signup) runs in a background thread so the failing request is
+    not blocked; the NEXT request picks up the fresh credential.
+    Guarded by an hourly per-provider attempt cap (DSF_REFRESHER_INLINE_HOURLY,
+    default 2) and a 60s silence window after a completed attempt so a
+    burst of failing requests cannot spin the ladder.
+    """
+    if not _env_bool('DSF_REFRESHER', True):
+        return {'triggered': False, 'skipped': 'refresher disabled'}
+    if not provider_enabled(name):
+        return {'triggered': False, 'skipped': 'provider disabled'}
+    hourly = max(1, int(os.getenv('DSF_REFRESHER_INLINE_HOURLY', '2') or 2))
+    now = time.time()
+    hour = time.strftime('%Y%m%d%H')
+    with _STATE.lock:
+        if _STATE.renewing.get(name):
+            return {'triggered': False, 'skipped': 'renewal already running'}
+        last = _STATE.inline_last.get(name)
+        if last and now - last[1] < 60:
+            return {'triggered': False, 'skipped': 'inline silence window'}
+        (h, cnt) = _STATE.inline_counts.get(name, (hour, 0))
+        if h == hour and cnt >= hourly:
+            return {'triggered': False, 'skipped': 'inline hourly cap'}
+        _STATE.inline_counts[name] = (hour, cnt + 1 if h == hour else 1)
+
+    def _run() -> None:
+        try:
+            res = renew(name, reason='inline-auth')
+            ok = bool(res.get('renewed'))
+        except Exception:  # noqa: BLE001 — remediation must never raise
+            ok = False
+        with _STATE.lock:
+            _STATE.inline_last[name] = ('ok' if ok else 'failed', time.time())
+
+    t = threading.Thread(target=_run, name=f'inline-renew-{name}', daemon=True)
+    with _STATE.lock:
+        _STATE.inline_threads[name] = t
+    t.start()
+    _log_history(name, 'inline-renew-triggered', detail[:200])
+    return {'triggered': True, 'reason': detail[:120]}
 
 
 # ------------------------------------------------------------------ daemon

@@ -509,6 +509,17 @@ def get_proxy(provider: Optional[str] = None, direct_ok: bool = True) -> Optiona
         return None if route == DIRECT else route
 
 
+def current(provider: Optional[str]) -> Optional[str]:
+    """The provider's sticky assignment, or None when direct/unassigned."""
+    if not provider:
+        return None
+    with _STATE.lock:
+        pair = _STATE.assignments.get(provider)
+    if not pair or pair[0] == DIRECT:
+        return None
+    return pair[0]
+
+
 def mark_failure(proxy: Optional[str]) -> None:
     """Put a proxy on cooldown and release any provider assigned to it."""
     if not proxy or proxy == DIRECT:

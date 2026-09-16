@@ -403,6 +403,13 @@ class Router:
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
                     logger.warning('%s auth failed, skipping to fallback: %s', served_by, e)
+                    # Request-path remediation: fire a background renewal
+                    # ladder so the NEXT request can use fresh credentials.
+                    try:
+                        from dsk import refresher as _refresher
+                        _refresher.renew_inline(target.provider_name, str(e)[:120])
+                    except Exception:  # noqa: BLE001 — never break the request
+                        pass
                     break
                 except ProviderError as e:
                     last_error = e
