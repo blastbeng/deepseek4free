@@ -198,8 +198,13 @@ def trim_messages(messages: List[Any], context_tokens: float,
             if c < 400:            # small turns are not worth mangling
                 continue
             keep_chars = max(200, c - over)
-            kept[k] = (i, _truncate_msg(m, keep_chars))
-            over -= (c - keep_chars)
+            new_msg = _truncate_msg(m, keep_chars)
+            new_c = _chars(new_msg)
+            kept[k] = (i, new_msg)
+            # credit only what was ACTUALLY removed — tool_calls weight is
+            # part of c but never truncatable, so c - keep_chars can
+            # overstate progress on call-heavy, content-light messages.
+            over -= max(0, c - new_c)
             stats['truncated'] += 1
             cur = sum(_chars(m2) for _, m2 in kept)
 

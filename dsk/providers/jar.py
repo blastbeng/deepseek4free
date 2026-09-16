@@ -8,8 +8,20 @@ read/write them through the helpers below.
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict
+
+_LOCKS: Dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _jar_lock(name: str) -> threading.Lock:
+    """One lock per jar name: the refresher daemon and request threads
+    (e.g. copilot identity rotation) save concurrently — without it the
+    load→merge→write sequence loses updates."""
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(name, threading.Lock())
 
 
 def jar_path(name: str) -> Path:
@@ -55,12 +67,13 @@ def env_cookies(name: str) -> Dict[str, str]:
 
 def save_jar(name: str, updates: Dict[str, Any]) -> None:
     """Merge updates into the jar file (atomic replace, best-effort)."""
-    jar = load_jar(name)
-    jar.update({str(k): str(v) for k, v in updates.items() if v})
-    path = jar_path(name)
-    try:
-        tmp = path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(jar, indent=2), encoding='utf-8')
-        tmp.replace(path)
-    except OSError:
-        pass
+    with _jar_lock(name):
+        jar = load_jar(name)
+        jar.update({str(k): str(v) for k, v in updates.items() if v})
+        path = jar_path(name)
+        try:
+            tmp = path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(jar, indent=2), encoding='utf-8')
+            tmp.replace(path)
+        except OSError:
+            pass
