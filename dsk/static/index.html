@@ -15,14 +15,18 @@
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
+  @supports (height: 100dvh) {
+    html, body { height: 100dvh; }  /* mobile browser chrome (address bar) */
+  }
   body {
     margin: 0; background: var(--bg); color: var(--text);
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    display: flex; flex-direction: column;
+    display: flex; flex-direction: column; overflow: hidden;
   }
   header {
     display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
     padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: relative; z-index: 50;  /* gear/☰ stay tappable above the mobile overlays */
   }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; white-space: nowrap; }
   header h1 span { color: var(--muted); font-weight: 400; }
@@ -80,6 +84,14 @@
     width: 290px; border-left: 1px solid var(--border); background: var(--panel);
     padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
   }
+  #settings .shead { display: flex; align-items: center; justify-content: space-between; }
+  #settings .shead h2 { margin: 0; }
+  #setclose { display: none; font-size: 14px; line-height: 1; padding: 6px 10px; }
+  /* dimmed tap-away layer behind both mobile overlays */
+  #backdrop { position: fixed; inset: 0; z-index: 35; background: #0009; border: 0;
+              padding: 0; cursor: pointer; }
+  #sidebar { z-index: 40; }
+  #settings { z-index: 36; }
   #settings h2 { font-size: 12px; margin: 0; color: var(--muted);
                  text-transform: uppercase; letter-spacing: .8px; }
   .field { display: flex; flex-direction: column; gap: 5px; }
@@ -143,12 +155,21 @@
   @media (max-width: 760px) {
     .gear { display: inline-block; }
     #settings {
-      position: fixed; top: 0; right: 0; bottom: 0; width: min(320px, 88vw); z-index: 30;
+      position: fixed; top: 0; right: 0; bottom: 0; width: min(320px, 88vw);
       transform: translateX(105%); transition: transform .18s ease; box-shadow: -10px 0 30px #000a;
     }
     #settings.open { transform: none; }
+    #setclose { display: inline-block; }   /* the only reliable way to close on touch */
+    #flags { display: none; }              /* badges blow up the wrapped header */
+    #model { flex: 1 1 100%; min-width: 0; max-width: none; }  /* own full row */
     .msg { max-width: 95%; }
-    #model { max-width: 44vw; min-width: 0; }
+    /* iOS zooms into inputs with font-size < 16px on focus — reads as glitching */
+    #prompt, #system, #maxtok, select, input[type="text"], input[type="number"] {
+      font-size: 16px;
+    }
+    header { gap: 8px; padding: 8px 10px; }
+    header h1 span { display: none; }
+    #health { max-width: 34vw; }
   }
 </style>
 </head>
@@ -168,6 +189,7 @@
   <button id="clear" title="Clear conversation">✕ clear</button>
 </header>
 <main>
+  <div id="backdrop" hidden></div>
   <aside id="sidebar">
     <button id="newchat" class="primary">＋ New chat</button>
     <div id="chatlist"></div>
@@ -175,7 +197,7 @@
   </aside>
   <div id="chat"></div>
   <aside id="settings">
-    <h2>Settings</h2>
+    <div class="shead"><h2>Settings</h2><button id="setclose" title="Close settings">✕</button></div>
     <div class="field">
       <label for="system">System message</label>
       <textarea id="system" rows="4" placeholder="You are a helpful assistant."></textarea>
@@ -573,14 +595,14 @@ function switchChat(id) {
   pendingImages = [];
   chat.innerHTML = '';
   redraw(); renderThumbs(); persist();
-  $('sidebar').classList.remove('open');
+  closeMobileOverlays();   // slide the drawer away after picking a chat
 }
 
 function newChat() {
   if (controller) return;
   const cur = activeChat();
   if (cur && !cur.messages.length) {
-    $('prompt').focus(); $('sidebar').classList.remove('open'); return;
+    $('prompt').focus(); closeMobileOverlays(); return;
   }
   persist();
   const c = newChatObj();
@@ -592,7 +614,7 @@ function newChat() {
   $('stats').textContent = '';
   redraw(); persist();
   $('prompt').focus();
-  $('sidebar').classList.remove('open');
+  closeMobileOverlays();
 }
 
 function deleteChat(id) {
@@ -694,7 +716,7 @@ async function send() {
   if ((!text && !pendingImages.length) || controller) return;
   $('prompt').value = '';
   autoGrow();
-  $('settings').classList.remove('open');
+  closeMobileOverlays();
 
   if (messages.length === 0 && $('system').value.trim()) {
     messages.push({ role: 'system', content: $('system').value.trim() });
@@ -822,11 +844,31 @@ function autoGrow() {
 $('send').onclick = send;
 $('stop').onclick = () => controller && controller.abort();
 $('refresh').onclick = loadModels;
-$('gear').onclick = () => $('settings').classList.toggle('open');
+
+// ---------- mobile overlays (settings drawer + chat sidebar) ----------
+const isMobile = () => window.matchMedia('(max-width: 760px)').matches;
+const isSidebarMobile = () => window.matchMedia('(max-width: 900px)').matches;
+function syncBackdrop() {
+  $('backdrop').hidden =
+    !(isMobile() && $('settings').classList.contains('open')) &&
+    !(isSidebarMobile() && $('sidebar').classList.contains('open'));
+}
+function closeMobileOverlays() {
+  $('settings').classList.remove('open');
+  $('sidebar').classList.remove('open');
+  syncBackdrop();
+}
+$('gear').onclick = () => {
+  $('settings').classList.toggle('open');
+  syncBackdrop();
+};
+$('setclose').onclick = closeMobileOverlays;
+$('backdrop').onclick = closeMobileOverlays;
 $('sbtoggle').onclick = () => {
   const sb = $('sidebar');
-  if (window.matchMedia('(max-width: 900px)').matches) sb.classList.toggle('open');
+  if (isSidebarMobile()) sb.classList.toggle('open');
   else sb.classList.toggle('closed');
+  syncBackdrop();
 };
 $('newchat').onclick = newChat;
 $('clear').onclick = () => {
@@ -979,10 +1021,7 @@ _refreshEmptyObserver.observe(chat, { childList: true });
 refreshEmpty();
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    $('settings').classList.remove('open');
-    $('sidebar').classList.remove('open');
-  }
+  if (e.key === 'Escape') closeMobileOverlays();
 });
 
 restoreAll();
