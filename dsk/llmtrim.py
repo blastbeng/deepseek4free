@@ -56,9 +56,26 @@ def _text_of(content: Any) -> str:
     return ''
 
 
+def _image_weight(msg: Any) -> int:
+    """Bytes carried by inline image data-URIs (base64 blobs are huge but
+    render as a 7-char '[image]' placeholder — without this the trimmer
+    underweights vision conversations by megabytes)."""
+    content = _content(msg)
+    if not isinstance(content, list):
+        return 0
+    n = 0
+    for p in content:
+        if isinstance(p, dict) and p.get('type') == 'image_url':
+            url = p.get('image_url')
+            url = url.get('url') if isinstance(url, dict) else url
+            if isinstance(url, str) and url.startswith('data:'):
+                n += len(url)
+    return n
+
+
 def _chars(msg: Any) -> int:
-    """Message weight in characters (content + rendered tool calls)."""
-    n = len(_text_of(_content(msg)))
+    """Message weight in characters (content + rendered tool calls + image data)."""
+    n = len(_text_of(_content(msg))) + _image_weight(msg)
     calls = getattr(msg, 'tool_calls', None) if not isinstance(msg, dict) \
         else msg.get('tool_calls')
     if calls:

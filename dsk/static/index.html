@@ -368,6 +368,7 @@ async function loadModels() {
     const data = await r.json();
     modelInfo = {};
     modelSel.innerHTML = '';
+    const groups = {};   // owned_by -> <optgroup> (API order is provider-grouped)
     for (const m of data.data || []) {
       modelInfo[m.id] = m;
       const opt = document.createElement('option');
@@ -378,7 +379,14 @@ async function loadModels() {
       if (m.vision) bits.push('📷');
       if (m.image_gen) bits.push('🎨');
       opt.textContent = m.id + (bits.length ? '  ' + bits.join(' ') : '');
-      modelSel.appendChild(opt);
+      const owner = m.owned_by || 'other';
+      if (!groups[owner]) {
+        const og = document.createElement('optgroup');
+        og.label = owner;
+        groups[owner] = og;
+        modelSel.appendChild(og);
+      }
+      groups[owner].appendChild(opt);
     }
     if (!modelSel.options.length) {
       modelSel.innerHTML = '<option value="">(no models available)</option>';
