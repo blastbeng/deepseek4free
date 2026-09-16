@@ -514,7 +514,7 @@ def imap_otp(max_wait_s: int = 120, to_needle: Optional[str] = None) -> Optional
     deadline = time.time() + max_wait_s
     while time.time() < deadline:
         try:
-            box = imaplib.IMAP4_SSL(host, port)
+            box = imaplib.IMAP4_SSL(host, port, timeout=15)
             box.login(user, password)
             box.select('INBOX')
             since = date.today().strftime('%d-%b-%Y')

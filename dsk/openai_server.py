@@ -861,6 +861,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     except ProviderError as e:
         err_type, code, status = _error_status(e)
         return _error_response(str(e), err_type, code, status)
+    except Exception as e:  # noqa: BLE001 — always answer OpenAI-shaped
+        return _error_response(f'{type(e).__name__}: {e}', 'api_error',
+                               'upstream_error', 502)
     if n_chunks == 0:
         # A completed-but-empty stream would surface as a 200 with an empty
         # message; surface it as an upstream failure instead.
@@ -1213,6 +1216,8 @@ async def images_generations(body: ImageGenerationRequest, request: Request):
                     found.append(chunk["url"])
         except ProviderError as e:
             return e, found
+        except Exception as e:  # noqa: BLE001 — always answer OpenAI-shaped
+            return ProviderError(f'{type(e).__name__}: {e}'), found
         return None, found
 
     error, urls = await asyncio.get_running_loop().run_in_executor(None, _generate)
@@ -1240,6 +1245,9 @@ async def images_generations(body: ImageGenerationRequest, request: Request):
     except ProviderError as e:
         err_type, code, status = _error_status(e)
         return _error_response(str(e), err_type, code, status)
+    except Exception as e:  # noqa: BLE001 — always answer OpenAI-shaped
+        return _error_response(f'{type(e).__name__}: {e}', 'api_error',
+                               'upstream_error', 502)
     return {"created": created, "data": data}
 
 
