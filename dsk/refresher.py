@@ -1871,12 +1871,12 @@ def _seed_counts() -> None:
     bypass the daily attempt cap; today's ``renew-start`` events make the
     budget continuous across restarts. Runs once per process.
 
-    Only DAEMON-triggered PROACTIVE attempts count against the budget:
-    events whose reason is reactive ('auth' from the self-heal probe,
-    'inline-auth' from the request path) or operator-initiated
-    ('manual-*', CLI runs) are excluded — those do not consume the
-    proactive daily quota, so a heavy debug/reactive day can never
-    starve the daemon's own bootstrap retries.
+    Only strict proactive attempts count against the budget: today's
+    ``renew-start`` events whose reason is exactly ``proactive``
+    (the TTL-cadence bootstrap sweep). Reactive attempts ('auth' from
+    the self-heal probe, 'inline-auth' from the request path) and
+    operator-initiated runs ('manual-*', CLI) are excluded — so a heavy
+    debug or reactive day can never starve the daemon's own retries.
     """
     if _STATE.counts_seeded:
         return
@@ -1894,8 +1894,7 @@ def _seed_counts() -> None:
                 reason = str(entry.get('detail', ''))
                 if (entry.get('event') == 'renew-start'
                         and str(entry.get('ts', '')).startswith(today)
-                        and reason not in ('auth', 'inline-auth')
-                        and not reason.startswith('manual')):
+                        and reason == 'proactive'):
                     counts[entry.get('provider', '')] = \
                         counts.get(entry.get('provider', ''), 0) + 1
         for name, n in counts.items():
