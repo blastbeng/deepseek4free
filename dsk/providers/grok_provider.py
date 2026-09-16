@@ -114,7 +114,7 @@ class GrokProvider(Provider):
             'upstream_model': entry['id'],
             'thinking_enabled': entry['thinking'],
             'search_enabled': entry['mode'] == 'deepsearch',
-            'vision': True,
+            'vision': False,  # web attachment upload not implemented
             'image_gen': True,   # Aurora image generation is built into chat
             'context_length': GROK_CONTEXT_LENGTH,
             'max_output_tokens': GROK_MAX_OUTPUT,

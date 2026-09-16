@@ -195,7 +195,11 @@ def _zai_dynamic_models(no_proxy: bool = False) -> List[Dict[str, Any]]:
                 else:
                     caps = set()
                 if 'vision' in caps:
-                    pass  # vision routes still accept text prompts
+                    # Upstream advertises vision, but z.ai's headless file
+                    # upload cannot be automated (see stream()) — the flag
+                    # must stay False so vision requests reject cleanly
+                    # instead of failing after the whole fallback chain.
+                    pass
                 think = 'think' in caps
                 # Prefer the human-readable display name as the exposed id
                 # (e.g. 'GLM-5.3-Flash'); fall back to the raw upstream id.
@@ -207,7 +211,7 @@ def _zai_dynamic_models(no_proxy: bool = False) -> List[Dict[str, Any]]:
                     continue
                 models.append({'id': exposed, 'backend': 'zai',
                                'thinking': think, 'upstream': raw_id,
-                               'vision': 'vision' in caps,
+                               'vision': False,  # upload not automatable headlessly
                                'name': name})
     except Exception as exc:  # noqa: BLE001 — discovery is best effort
         logger.debug('z.ai dynamic model discovery failed: %s', exc)

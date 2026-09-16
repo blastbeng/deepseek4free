@@ -337,7 +337,10 @@ class Router:
             if not capable:
                 what = 'image generation' if image_generation else 'vision'
                 raise ProviderError(
-                    f'No model in the fallback chain of {route.model_id} supports {what}')
+                    f'No model in the fallback chain of {route.model_id} '
+                    f'supports {what} (vision/image-capable providers: '
+                    f'chatgpt, gemini — they need credentials; the bot '
+                    f'creates them automatically when possible)')
             chain = capable
 
         for position, model_id in enumerate(chain):

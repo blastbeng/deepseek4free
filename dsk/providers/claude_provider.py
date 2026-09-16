@@ -60,9 +60,9 @@ _USER_AGENT = (
 # The claude.ai web app exposes a fixed model picker (no discovery endpoint);
 # these are the ids the completion endpoint accepts.
 CLAUDE_MODELS: List[Dict[str, Any]] = [
-    {'id': 'claude-sonnet-4-6', 'thinking': True, 'vision': True},
-    {'id': 'claude-opus-4-6', 'thinking': True, 'vision': True},
-    {'id': 'claude-haiku-4-5', 'thinking': False, 'vision': True},
+    {'id': 'claude-sonnet-4-6', 'thinking': True, 'vision': False},
+    {'id': 'claude-opus-4-6', 'thinking': True, 'vision': False},
+    {'id': 'claude-haiku-4-5', 'thinking': False, 'vision': False},
 ]
 
 

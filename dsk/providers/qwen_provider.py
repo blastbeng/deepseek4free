@@ -109,7 +109,7 @@ class QwenProvider(Provider):
             'upstream_model': entry['id'],
             'thinking_enabled': entry['thinking'],
             'search_enabled': False,
-            'vision': True,
+            'vision': False,  # image input not implemented
             'image_gen': False,
             'context_length': QWEN_CONTEXT_LENGTH,
             'max_output_tokens': QWEN_MAX_OUTPUT,
