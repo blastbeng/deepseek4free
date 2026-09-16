@@ -1107,6 +1107,12 @@ async def _stream_completion(
             _flush_prose()
             q.put(_error_sse(str(e)))
             q.put(None)
+        except Exception as e:  # noqa: BLE001 — unclassified error must not
+            # leave the consumer blocked on q.get forever (no sentinel).
+            errored["flag"] = True
+            _flush_prose()
+            q.put(_error_sse(f'{type(e).__name__}: {e}'))
+            q.put(None)
         finally:
             # Close the provider generator so transports with session locks
             # (z.ai browser) release them immediately on disconnect/finish.

@@ -2,7 +2,8 @@ from curl_cffi import requests
 from typing import Optional, Dict, Any, Generator, Literal
 import json
 from .pow import DeepSeekPOW
-from .providers.base import ProviderAuthError, ProviderRateLimitError
+from .providers.base import (ProviderAuthError, ProviderRateLimitError,
+                             ProviderError, ProviderUnavailableError)
 try:  # optional outbound proxy rotation (dsk/proxies.py)
     from . import proxies as _proxies
 except ImportError:  # pragma: no cover - standalone use
@@ -29,16 +30,17 @@ class RateLimitError(ProviderRateLimitError, DeepSeekError):
     """Raised when the DeepSeek API rate limits (also ProviderRateLimit)."""
     pass
 
-class NetworkError(DeepSeekError):
-    """Raised when network communication fails"""
+class NetworkError(ProviderUnavailableError, DeepSeekError):
+    """Raised when network communication fails (also ProviderUnavailable)."""
     pass
 
-class CloudflareError(DeepSeekError):
-    """Raised when Cloudflare blocks the request"""
+class CloudflareError(ProviderError, DeepSeekError):
+    """Raised when Cloudflare blocks the request (also a ProviderError)."""
     pass
 
-class APIError(DeepSeekError):
-    """Raised when API returns an error response"""
+class APIError(ProviderError, DeepSeekError):
+    """Raised when API returns an error response (also a ProviderError so
+    mid-stream failures classify and never escape the router/fallbacks)."""
     def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
