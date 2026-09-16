@@ -24,7 +24,8 @@ services:
     ports:
       - "${DSF_PORT:-8000}:8000"
     environment:
-      # Your DeepSeek userToken (JSON.parse(localStorage.getItem("userToken")).value)
+      # Optional manual override only — the credential bot creates and renews
+      # accounts automatically; leave empty for fully autonomous operation.
       - DEEPSEEK_AUTH_TOKEN=${DEEPSEEK_AUTH_TOKEN:-}
       # Optional: require clients to send this as their API key
       - DSF_API_KEY=${DSF_API_KEY:-}
