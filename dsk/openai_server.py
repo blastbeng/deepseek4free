@@ -99,6 +99,28 @@ async def lifespan(_app: FastAPI):
         _refresher.start_daemon()
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[refresher] daemon unavailable: {exc}")
+    try:
+        # Pre-warm one z.ai browser session so the FIRST glm request does
+        # not pay the ~30-60s browser spawn + captcha flow. Fire-and-forget.
+        def _prewarm_zai():
+            try:
+                from .providers.glm_provider import _zai_browser
+                b = _zai_browser()
+                # Serialize with real requests: _ensure() is not thread-safe
+                # (it may close/replace the page), so warm up under the
+                # session's own FIFO ticket.
+                if b._busy.acquire(timeout=90):
+                    try:
+                        b._ensure()
+                        print("[z.ai] pre-warm session ready")
+                    finally:
+                        b._busy.release()
+            except Exception as exc:  # noqa: BLE001 — warm-up is best effort
+                print(f"[z.ai] pre-warm skipped: {exc}")
+        threading.Thread(target=_prewarm_zai, name="zai-prewarm",
+                         daemon=True).start()
+    except Exception:  # pragma: no cover - defensive
+        pass
     yield
 
 

@@ -7,6 +7,20 @@ services:
     container_name: deepseek4free
     # Lifecycle managed by systemd (docker-compose@.service)
     restart: no
+    # Container-level health state (visible in `docker ps`); hung processes
+    # are still handled by the systemd unit, which restarts the whole stack.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    # Cap the json-file log so it cannot grow unbounded
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     ports:
       - "${DSF_PORT:-8000}:8000"
     environment:
