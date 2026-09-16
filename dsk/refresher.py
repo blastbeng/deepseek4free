@@ -125,6 +125,7 @@ class _State:
         self.renewing: Dict[str, bool] = {}
         self.results: Dict[str, Dict[str, Any]] = {}
         self.counts: Dict[str, Tuple[str, int]] = {}  # provider -> (day, n)
+        self.counts_seeded = False
 
 
 _STATE = _State()
@@ -1129,6 +1130,37 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
 
 
 # ------------------------------------------------------------------ renew
+def _seed_counts() -> None:
+    """Seed today's per-provider attempt counts from history.jsonl.
+
+    The counts live in memory, so a container restart would otherwise
+    bypass the daily attempt cap; today's ``renew-start`` events make the
+    budget continuous across restarts. Runs once per process."""
+    if _STATE.counts_seeded:
+        return
+    _STATE.counts_seeded = True
+    try:
+        path = _data_dir() / 'refresher' / 'history.jsonl'
+        today = time.strftime('%Y-%m-%d')
+        counts: Dict[str, int] = {}
+        with path.open('r', encoding='utf-8') as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if (entry.get('event') == 'renew-start'
+                        and str(entry.get('ts', '')).startswith(today)):
+                    counts[entry.get('provider', '')] = \
+                        counts.get(entry.get('provider', ''), 0) + 1
+        for name, n in counts.items():
+            _STATE.counts[name] = (today, n)
+        if counts:
+            print(f'[refresher] daily budget seeded from history: {counts}')
+    except OSError:
+        pass  # no history yet
+
+
 def renew(name: str, reason: str = '') -> Dict[str, Any]:
     """Run the full renewal ladder for one provider. Returns a status dict."""
     if not _env_bool('DSF_REFRESHER', True):
@@ -1147,9 +1179,11 @@ def renew(name: str, reason: str = '') -> Dict[str, Any]:
                 and not reason.startswith('manual'):
             return {'renewed': False, 'skipped': 'cooldown'}
         today = time.strftime('%Y-%m-%d')
+        _seed_counts()
         day, n = _STATE.counts.get(name, (today, 0))
         n = n + 1 if day == today else 1
-        if n > _max_renews():
+        manual = reason.startswith('manual')
+        if n > _max_renews() and not manual:
             return {'renewed': False, 'skipped': 'daily attempt budget exhausted'}
         _STATE.counts[name] = (day, n)
         _STATE.renewing[name] = True

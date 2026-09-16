@@ -1,0 +1,16 @@
+# Only requirements.txt + dsk/ are copied by the Dockerfile — keep the build
+# context minimal (the venv alone is ~200 MB).
+.venv/
+venv/
+data/
+.git/
+.gitignore
+.playwright-mcp/
+**/__pycache__/
+*.pyc
+*.md
+.env
+.env.example
+docker-compose.yml
+Dockerfile
+.dockerignore
