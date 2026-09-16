@@ -907,7 +907,11 @@ def signup_deepseek() -> Tuple[bool, str]:
         session, err = mailgen.create_email()
         if not session:
             return False, f'autogen mailbox unavailable: {err}'
-        email, password = session['address'], session['password']
+        email = session['address']
+        # mailbox password: the signup form needs one; tempmail.lol sessions
+        # don't carry one (the inbox is token-addressed), so mint a form
+        # password independent of the mailbox credentials.
+        password = session.get('password') or mailgen.gen_password()
         generated = True
     # egress ladder: explicit DSF_SIGNUP_PROXY first, then SEVERAL distinct
     # dynamic-pool exits, then direct (duplicates dropped). DeepSeek's
@@ -967,6 +971,18 @@ def signup_deepseek() -> Tuple[bool, str]:
                 continue
             _fill_first(page, _PASSWORD_SELECTORS, password)
             _click_any(page, ['Send Code', 'Send code', '获取验证码'])
+            # Capture the form's reaction to the send: a visible error means
+            # the request was refused (rate limit, captcha, domain rejected
+            # with a UI message); a silent accept followed by no OTP means
+            # the mail was delivered nowhere (domain dropped server-side).
+            time.sleep(4)
+            send_feedback = _body_head(page).lower()
+            send_note = ''
+            for needle in ('too many', 'rate limit', 'captcha', 'verify',
+                           'invalid', 'error', 'failed'):
+                if needle in send_feedback:
+                    send_note = f' (page feedback: {needle})'
+                    break
             if generated:
                 code = mailgen.fetch_otp(session, max_wait_s=180)
                 if not code:
@@ -978,7 +994,8 @@ def signup_deepseek() -> Tuple[bool, str]:
                 return False, ('signup code email not found in mailbox — '
                                'DeepSeek silently drops disposable domains; '
                                'configure DSF_MAIL_DOMAIN + DSF_MAIL_IMAP_HOST '
-                               'with a catch-all inbox for reliable delivery')
+                               'with a catch-all inbox for reliable delivery'
+                               + send_note)
             if not _fill_first(page, ['@placeholder:code', '@placeholder:Code',
                                       'css:input[name=code]'], code):
                 return False, 'code field not found'

@@ -5,7 +5,7 @@ is configured: a throwaway mailbox is created on the fly, the verification
 e-mail is fetched from it and the OTP is extracted — so the renewal ladder
 stays fully unmanned with zero mail configuration.
 
-Two backends, tried in order (first that is *configured* wins, then the
+Three backends, tried in order (first that is *configured* wins, then the
 first that *works*):
 
 1. IMAP catch-all (``DSF_MAIL_IMAP_HOST`` + ``DSF_MAIL_DOMAIN``):
@@ -13,11 +13,17 @@ first that *works*):
    (``dsf-<hex8>@<domain>``); the OTP is read through the existing IMAP
    poller. Most reliable — use this when you own a catch-all mailbox.
 
-2. mail.tm (https://mail.tm, free public API, no key): a real throwaway
-   account is created on a public temp-mail domain and its inbox is polled
-   over HTTPS. Works out of the box, but public domains are sometimes
-   rejected by signup forms — the caller treats failures as a normal
-   renewal-ladder miss.
+2. tempmail.lol (https://tempmail.lol, free public API, no key): a mailbox
+   on a rotating pool of obscure domains — the best chance against the
+   disposable-domain blocklists big providers apply to well-known
+   temp-mail services. No signup; the inbox is addressed by an opaque
+   token stored in the session.
+
+3. mail.tm / mail.gw (https://mail.tm, free public API, no key): a real
+   throwaway account is created on a public temp-mail domain and its
+   inbox is polled over HTTPS. Works out of the box, but public domains
+   are sometimes rejected by signup forms (DeepSeek silently drops them)
+   — the caller treats failures as a normal renewal-ladder miss.
 
 Env switches:
     DSF_MAIL_AUTOGEN   master switch for this module (default: true)
@@ -38,6 +44,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 MAILTM_API = 'https://api.mail.tm'
 MAILGW_API = 'https://api.mail.gw'
+TEMPMAIL_API = 'https://api.tempmail.lol'
 _UA = 'deepseek4free-refresher/1.0 (+autonomous credential maintenance)'
 
 
@@ -55,6 +62,12 @@ def _gen_local_part() -> str:
 def _gen_password() -> str:
     # letter + digit prefix keeps even the pickiest signup forms happy
     return f"Aa1{secrets.token_urlsafe(12)}"
+
+
+def gen_password() -> str:
+    """Public alias — signup forms need a password even when the mailbox
+    backend (tempmail.lol) is token-addressed and carries none."""
+    return _gen_password()
 
 
 def _http(method: str, url: str, body: Optional[Dict[str, Any]] = None,
@@ -189,6 +202,56 @@ def _iso_age_min(ts: Any) -> Optional[float]:
         return None
 
 
+# --------------------------------------------------------------- tempmail.lol
+def _tempmail_create() -> Optional[Dict[str, Any]]:
+    """Mint a mailbox on tempmail.lol.
+
+    The service rotates a large pool of obscure domains per mailbox, which
+    dodges the disposable-domain blocklists that DeepSeek (and others) apply
+    to the well-known mail.tm/mail.gw pools. No account signup needed — the
+    inbox is addressed by an opaque token.
+    """
+    code, body = _http('GET', f'{TEMPMAIL_API}/generate')
+    if code != 200 or not isinstance(body, dict):
+        return None
+    address = str(body.get('address') or '').strip()
+    token = str(body.get('token') or '').strip()
+    if not address or not token:
+        return None
+    return {'backend': 'tempmail.lol', 'address': address, 'token': token}
+
+
+def _tempmail_fetch_otp(session: Dict[str, Any], sender_needle: str,
+                        code_re: re.Pattern, max_age_min: float,
+                        deadline: float, seen_ids: set) -> Optional[str]:
+    """Poll the tempmail.lol inbox for the verification code."""
+    token = session.get('token') or ''
+    while time.time() < deadline:
+        code, body = _http('GET', f'{TEMPMAIL_API}/auth/{token}')
+        if code == 200 and isinstance(body, dict):
+            for msg in body.get('email') or []:
+                if not isinstance(msg, dict):
+                    continue
+                mid = str(msg.get('date') or '') + str(msg.get('from') or '') \
+                    + str(msg.get('subject') or '')
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                sender = str(msg.get('from') or '').lower()
+                if sender_needle and sender_needle not in sender:
+                    continue
+                age = _iso_age_min(msg.get('date'))
+                if age is not None and age > max_age_min:
+                    continue
+                text = '\n'.join(str(msg.get(k) or '')
+                                 for k in ('body', 'html', 'subject'))
+                match = code_re.search(text)
+                if match:
+                    return match.group(1) or match.group(0)
+        time.sleep(6)
+    return None
+
+
 # ------------------------------------------------------------- IMAP catch-all
 def _imap_catchall_create() -> Optional[Dict[str, Any]]:
     domain = os.getenv('DSF_MAIL_DOMAIN', '').strip()
@@ -225,10 +288,15 @@ def create_email() -> Tuple[Optional[Dict[str, Any]], str]:
     Session is a dict with backend/address and (for mail.tm) credentials.
     The caller passes ``session`` to :func:`fetch_otp` once the signup form
     has asked for the verification code.
+
+    Backend order: the operator's catch-all IMAP domain (most reliable,
+    needs configuration), then tempmail.lol (rotating obscure domains —
+    best chance against disposable-domain blocklists), then the well-known
+    mail.tm/mail.gw pools (often blocklisted by big providers).
     """
     if not autogen_enabled():
         return None, 'DSF_MAIL_AUTOGEN disabled'
-    backends = (_imap_catchall_create, _mailtm_create)
+    backends = (_imap_catchall_create, _tempmail_create, _mailtm_create)
     errors: List[str] = []
     for make in backends:
         try:
@@ -263,8 +331,9 @@ def fetch_otp(session: Dict[str, Any], max_wait_s: int = 180,
                      or os.getenv('DSF_MAIL_OTP_SENDER', 'deepseek')).strip().lower()
     code_re = code_re or re.compile(os.getenv('DSF_MAIL_OTP_REGEX', r'\b(\d{6})\b'))
     max_age_min = float(os.getenv('DSF_MAIL_OTP_MAX_AGE', str(max_age_min)) or max_age_min)
-    fetcher = _imap_fetch_otp if session['backend'] == 'imap-catchall' \
-        else _mailtm_fetch_otp
+    fetcher = {'imap-catchall': _imap_fetch_otp,
+               'tempmail.lol': _tempmail_fetch_otp}.get(session['backend']) \
+        or _mailtm_fetch_otp
     try:
         return fetcher(session, sender_needle, code_re, max_age_min,
                        time.time() + max_wait_s, set())
