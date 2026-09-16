@@ -193,6 +193,10 @@
         <input type="checkbox" id="search">
       </div>
       <div class="row">
+        <label for="fastmode" title="Send thinking:false — thinking routes skip their reasoning pass and answer much faster">fast mode <span class="badge">no thinking</span></label>
+        <input type="checkbox" id="fastmode">
+      </div>
+      <div class="row">
         <label for="showthink">show thinking</label>
         <input type="checkbox" id="showthink" checked>
       </div>
@@ -725,6 +729,7 @@ async function runCompletion() {
     };
     if (parseInt($('maxtok').value, 10) > 0) payload.max_tokens = parseInt($('maxtok').value, 10);
     if ($('search').checked) payload.search_enabled = true;
+    if ($('fastmode').checked) payload.thinking = false;
     if ($('noproxy').checked) payload.disable_proxy = true;
 
     const res = await fetch('/v1/chat/completions', {

@@ -167,6 +167,11 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     # DeepSeek-specific extras (ignored by standard clients)
     search_enabled: Optional[bool] = None
+    # Per-request thinking toggle (non-standard): None = route default,
+    # True/False forces the mode. Thinking routes (glm-4.7, glm-5v-turbo, …)
+    # spend ~30-60s reasoning before answering; disabling it makes simple
+    # requests several times faster.
+    thinking: Optional[bool] = None
     # Per-request proxy control (non-standard extension): force a DIRECT
     # connection for this request — skips Tor and the rotating free-proxy
     # pool entirely. Useful for fast, low-latency testing.
@@ -750,7 +755,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         None, lambda: ROUTER.resolve(body.model, auth_key=client_key))
 
     # Body-level overrides: search flag stays opt-in via the extra field.
-    thinking_override = route.thinking_enabled
+    # Per-request `thinking` (True/False) overrides the route default;
+    # None keeps the route's advertised mode.
+    thinking_override = (body.thinking if body.thinking is not None
+                         else route.thinking_enabled)
     search_override = True if body.search_enabled else None
 
     _normalize_image_fields(body.messages)

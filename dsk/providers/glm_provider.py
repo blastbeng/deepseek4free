@@ -403,6 +403,7 @@ class _ZaiBrowser:
         self._page = None
         self._display = None
         self._busy = _FifoTicket()
+        self._last_used = 0.0
 
     @classmethod
     def instance(cls) -> '_ZaiBrowser':
@@ -535,10 +536,19 @@ class _ZaiBrowser:
             no_proxy: bool = False,
             image_paths: Optional[List[str]] = None
             ) -> Generator[Dict[str, Any], None, None]:
+        # Anonymous z.ai sessions expire server-side after some idle time;
+        # a stale page fails with 'no content' and costs a full retry.
+        # Proactively recycle pages idle beyond DSF_ZAI_STALE_AFTER.
+        if (self._page is not None and self._last_used > 0
+                and time.time() - self._last_used > _ZAI_STALE_AFTER):
+            logger.debug('z.ai session idle %.0fs — recycling',
+                         time.time() - self._last_used)
+            self.close()
         if not self._busy.acquire(timeout=ZAI_BUSY_TIMEOUT):
             raise ProviderUnavailableError(
                 'z.ai browser session is busy with another request')
         try:
+            self._last_used = time.time()
             yield from self._ask_inner(prompt, upstream, thinking, no_proxy,
                                        retry=True, image_paths=image_paths)
         finally:
@@ -671,6 +681,13 @@ class _ZaiBrowser:
                                            no_proxy, retry=False)
                 return
             raise ProviderError(f'z.ai browser transport failed: {exc}') from exc
+
+
+# Anonymous z.ai pages idle beyond this many seconds are recycled before the
+# next ask (their session expires server-side and would fail with 'no
+# content', costing a full retry cycle).
+_ZAI_STALE_AFTER = max(60.0, float(
+    os.getenv('DSF_ZAI_STALE_AFTER', '600') or 600))
 
 
 def _zai_parallel() -> int:
