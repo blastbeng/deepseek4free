@@ -33,7 +33,6 @@ from .base import (
     ProviderError,
     classify_http_error,
     http_post_raw,
-    proxy_kwargs_for,
 )
 from .jar import env_cookies, load_jar, save_jar
 
@@ -194,24 +193,26 @@ def _cookie_header(cookies: Dict[str, str]) -> str:
     return '; '.join(f'{k}={v}' for k, v in cookies.items() if v)
 
 
-def _ws_proxy_kwargs(no_proxy: bool) -> Dict[str, Any]:
-    """Translate the shared proxy pool into websocket-client arguments."""
-    kwargs = proxy_kwargs_for(COPILOT_BASE_URL, no_proxy=no_proxy) or {}
-    proxies = kwargs.get('proxies') or {}
-    url = proxies.get('https') or proxies.get('http')
-    if not url:
-        return {}
-    parsed = urllib.parse.urlparse(url)
-    scheme = parsed.scheme or 'http'
-    out: Dict[str, Any] = {'http_proxy_host': parsed.hostname,
-                           'http_proxy_port': parsed.port}
-    if parsed.username:
-        out['http_proxy_auth'] = (parsed.username, parsed.password or '')
-    if scheme.startswith('socks'):
-        out['proxy_type'] = scheme
-    else:
-        out['proxy_type'] = 'http'
-    return out
+def _egress_url(no_proxy: bool) -> Optional[str]:
+    """Current pool egress URL for Copilot WS traffic (None = direct)."""
+    if no_proxy:
+        return None
+    try:
+        from .. import proxies as _proxies
+        return _proxies.get_proxy('copilot', direct_ok=True)
+    except Exception:  # noqa: BLE001 — direct remains the fallback
+        return None
+
+
+def _cool_egress(proxy_url: Optional[str]) -> None:
+    """Cooldown a WS egress that failed to connect or was edge-blocked."""
+    if not proxy_url:
+        return
+    try:
+        from .. import proxies as _proxies
+        _proxies.mark_failure(proxy_url)
+    except Exception:  # noqa: BLE001 — rotation is best-effort
+        pass
 
 
 class CopilotProvider(Provider):
@@ -306,6 +307,42 @@ class CopilotProvider(Provider):
             raise ProviderError('copilot /c/api/start returned no conversation')
         return str(conversation)
 
+    def _connect_ws(self, proxy_url: Optional[str]):
+        """Open the Copilot chat websocket over `proxy_url` (None = direct)."""
+        import websocket  # websocket-client
+        kwargs: Dict[str, Any] = {}
+        if proxy_url:
+            parsed = urllib.parse.urlparse(proxy_url)
+            scheme = parsed.scheme or 'http'
+            kwargs = {'http_proxy_host': parsed.hostname,
+                      'http_proxy_port': parsed.port}
+            if parsed.username:
+                kwargs['http_proxy_auth'] = (parsed.username,
+                                             parsed.password or '')
+            kwargs['proxy_type'] = (scheme if scheme.startswith('socks')
+                                    else 'http')
+        return websocket.create_connection(
+            COPILOT_WS_URL,
+            header=[
+                f'Cookie: {_cookie_header(_anon_cookies())}',
+                f'User-Agent: {_USER_AGENT}',
+                f'Origin: {COPILOT_BASE_URL}',
+                'Referer: https://copilot.microsoft.com/',
+                'Accept-Language: en-US,en;q=0.9',
+                'Sec-CH-UA: "Chromium";v="120", "Not_A Brand";v="24", '
+                '"Microsoft Edge";v="120"',
+                'Sec-CH-UA-Mobile: ?0',
+                'Sec-CH-UA-Platform: "Windows"',
+                'Sec-Fetch-Dest: websocket',
+                'Sec-Fetch-Mode: websocket',
+                'Sec-Fetch-Site: same-origin',
+            ],
+            enable_multithread=True,
+            timeout=120,
+            suppress_origin=True,
+            **kwargs,
+        )
+
     def _ws_stream(self, conversation_id: str, prompt: str, mode: str,
                    image_generation: bool,
                    no_proxy: bool = False) -> Generator[Dict[str, Any], None, None]:
@@ -316,40 +353,52 @@ class CopilotProvider(Provider):
                                 'copilot provider (pip install '
                                 'websocket-client)') from e
 
-        try:
-            ws = websocket.create_connection(
-                COPILOT_WS_URL,
-                header=[
-                    f'Cookie: {_cookie_header(_anon_cookies())}',
-                    f'User-Agent: {_USER_AGENT}',
-                    f'Origin: {COPILOT_BASE_URL}',
-                    'Referer: https://copilot.microsoft.com/',
-                    'Accept-Language: en-US,en;q=0.9',
-                    'Sec-CH-UA: "Chromium";v="120", "Not_A Brand";v="24", '
-                    '"Microsoft Edge";v="120"',
-                    'Sec-CH-UA-Mobile: ?0',
-                    'Sec-CH-UA-Platform: "Windows"',
-                    'Sec-Fetch-Dest: websocket',
-                    'Sec-Fetch-Mode: websocket',
-                    'Sec-Fetch-Site: same-origin',
-                ],
-                enable_multithread=True,
-                timeout=120,
-                suppress_origin=True,
-                **_ws_proxy_kwargs(no_proxy),
-            )
-        except websocket.WebSocketBadStatusException as e:
-            status = getattr(e, 'status_code', 0) or 0
-            if status in (401, 403, 440, 460):
+        # Egress ladder for the WS handshake: requested egress, then a FRESH
+        # pool draw (a dead or edge-blocked exit is cooled down first), then
+        # direct. Copilot's edge geo-blocks host/datacenter IPs (WS 460), so
+        # a working proxy exit is often required.
+        ws = None
+        last_auth: Optional[Exception] = None
+        last_connect: Optional[Exception] = None
+        first = _egress_url(no_proxy)
+        ladder: List[Optional[str]] = []
+        if first:
+            ladder.append(first)
+            ladder.append(_egress_url(no_proxy))  # fresh draw after a miss
+        ladder.append(None)  # direct last
+        seen_eg: set = set()
+        for proxy_url in ladder:
+            if proxy_url and proxy_url in seen_eg:
+                continue
+            if proxy_url:
+                seen_eg.add(proxy_url)
+            try:
+                ws = self._connect_ws(proxy_url)
+                break
+            except websocket.WebSocketBadStatusException as e:
+                status = getattr(e, 'status_code', 0) or 0
+                if status in (401, 403, 440, 460):
+                    last_auth = e
+                    if proxy_url:
+                        _cool_egress(proxy_url)
+                    continue
+                raise ProviderError(f'copilot WS handshake failed: {e}') from e
+            except (OSError, websocket.WebSocketException) as e:
+                last_connect = e
+                if proxy_url:
+                    _cool_egress(proxy_url)
+                continue
+        if ws is None:
+            if last_auth is not None and last_connect is None:
                 raise ProviderAuthError(
-                    'copilot anonymous chat refused by the edge '
-                    f'(WS handshake {status}) — anonymous Copilot is '
-                    'geo-blocked in some regions (notably the EU). Provide '
-                    'cookies from a non-EU browser session via '
-                    'COPILOT_COOKIES env JSON or copilot_cookies.json') from e
-            raise ProviderError(f'copilot WS handshake failed: {e}') from e
-        except (OSError, websocket.WebSocketException) as e:
-            raise ProviderError(f'copilot WS connection failed: {e}') from e
+                    'copilot anonymous chat refused by the edge — anonymous '
+                    'Copilot is geo-blocked in some regions (notably the '
+                    'EU). Provide cookies from a non-EU browser session via '
+                    'COPILOT_COOKIES env JSON or copilot_cookies.json'
+                ) from last_auth
+            raise ProviderError(
+                'copilot WS connection failed: '
+                f'{last_connect or last_auth or "all egresses failed"}')
         try:
             ws.send(json.dumps({
                 'event': 'send',

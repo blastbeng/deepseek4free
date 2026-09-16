@@ -9,4 +9,5 @@ pydantic
 python-dotenv
 pyvirtualdisplay
 pysocks
+python-socks
 websocket-client
