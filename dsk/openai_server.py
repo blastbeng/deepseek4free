@@ -54,7 +54,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .providers.base import (
     ProviderAuthError,
@@ -127,6 +127,9 @@ def _check_api_key(request: Request) -> Optional[str]:
 
 
 class ChatMessage(BaseModel):
+    # extra='allow' keeps the common non-standard top-level ``image_url``
+    # field (normalized in _normalize_image_fields) instead of dropping it.
+    model_config = ConfigDict(extra='allow')
     role: str
     content: Any  # str or list of content parts
     tool_calls: Optional[Any] = None  # assistant tool_calls (OpenAI format)
@@ -218,6 +221,24 @@ def _extract_images(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
                 mime = "image/png"
             images.append({"mime": mime, "data": data})
     return images
+
+
+def _normalize_image_fields(messages: List[ChatMessage]) -> None:
+    """Accept the common non-standard top-level ``image_url`` message field.
+
+    Some clients put ``image_url`` on the message object instead of inside a
+    content part; without normalization the image is silently dropped and
+    the request degrades to plain text. Mutates messages in place."""
+    for msg in messages:
+        if msg.role != 'user' or not isinstance(msg.content, str):
+            continue
+        img = getattr(msg, 'image_url', None)  # extra field (extra='allow')
+        if not img:
+            continue
+        url = img.get('url') if isinstance(img, dict) else img
+        if isinstance(url, str) and url.strip():
+            msg.content = [{'type': 'text', 'text': msg.content},
+                           {'type': 'image_url', 'image_url': {'url': url}}]
 
 
 def _has_image_parts(messages: List[ChatMessage]) -> bool:
@@ -710,6 +731,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     thinking_override = route.thinking_enabled
     search_override = True if body.search_enabled else None
 
+    _normalize_image_fields(body.messages)
     trimmed_messages = _llmtrim_stage(body.messages, route)
     prompt = _build_prompt(trimmed_messages)
     # Image parts may require downloading remote URLs — keep that off the
@@ -784,25 +806,34 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     def _collect():
         c_parts: List[str] = []
         r_parts: List[str] = []
+        n_chunks = 0
         for chunk in chunk_gen:
+            n_chunks += 1
             if chunk.get("type") == "thinking" and chunk.get("content"):
                 r_parts.append(chunk["content"])
             elif chunk.get("type") == "image" and chunk.get("content"):
                 c_parts.append(chunk["content"])
             elif chunk.get("type") == "text" and chunk.get("content"):
                 c_parts.append(chunk["content"])
-        return c_parts, r_parts
+        return c_parts, r_parts, n_chunks
 
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
     try:
         # Consume the blocking provider stream in a worker thread — pulling
         # it on the event loop would serialize ALL requests behind this one.
-        content_parts, reasoning_parts = await asyncio.get_running_loop().run_in_executor(
-            None, _collect)
+        content_parts, reasoning_parts, n_chunks = (
+            await asyncio.get_running_loop().run_in_executor(
+                None, _collect))
     except ProviderError as e:
         err_type, code, status = _error_status(e)
         return _error_response(str(e), err_type, code, status)
+    if n_chunks == 0:
+        # A completed-but-empty stream would surface as a 200 with an empty
+        # message; surface it as an upstream failure instead.
+        return _error_response(
+            'upstream returned no content', 'api_error',
+            'upstream_error', 502)
 
     full_text = "".join(content_parts)
     pre_text, calls = full_text, []
