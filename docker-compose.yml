@@ -86,7 +86,7 @@ services:
       # Dynamic model discovery TTL + fallback chains
       - DSF_MODELS_TTL=${DSF_MODELS_TTL:-300}
       - DSF_FALLBACKS=${DSF_FALLBACKS:-}
-      - DSF_DEFAULT_FALLBACKS=${DSF_DEFAULT_FALLBACKS:-glm-4.7}
+      - DSF_DEFAULT_FALLBACKS=${DSF_DEFAULT_FALLBACKS:-}
       # Outbound proxy rotation (dsk/proxies.py): fast-only free proxies + direct
       - DSF_PROXY=${DSF_PROXY:-}
       - DSF_PROXIES=${DSF_PROXIES:-}
