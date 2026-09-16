@@ -77,9 +77,10 @@ API_KEY = os.getenv("DSF_API_KEY", "")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 ROUTER = Router()
-DEFAULT_MODEL = ROUTER.routes[os.getenv("DSF_MODEL_FAST", "deepseek-chat").strip()].model_id \
-    if os.getenv("DSF_MODEL_FAST", "deepseek-chat").strip() in ROUTER.routes \
-    else next(iter(ROUTER.routes))
+# 'auto' smart router (see dsk/providers/router.py): classifies every request
+# and serves it with the best available model, falling back through all the
+# others. Default for requests that omit the model field.
+DEFAULT_MODEL = "auto"
 
 
 @asynccontextmanager

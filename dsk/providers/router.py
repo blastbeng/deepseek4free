@@ -28,12 +28,20 @@ Configuration (env):
     DSF_RETRY_BACKOFF      base backoff seconds, doubled each retry (default 2.0)
     DSF_FALLBACKS          JSON object {model_id: [fallback_id, ...]}
     DSF_DEFAULT_FALLBACKS  comma list applied to routes without explicit fallbacks
+
+The synthetic ``auto`` model is the smart router: every request is classified
+(coding / general / translation / summarize / vision / image generation) and
+served by the best available provider, falling back through all other healthy
+models on rate limits, auth failures (which also trigger an inline credential
+renewal), outages or blocks. ``auto`` is also the default when a client omits
+the model field.
 """
 
 import importlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, Generator, List, Optional
@@ -113,6 +121,62 @@ def _parse_fallbacks() -> Dict[str, List[str]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# 'auto' smart router: request classification + category preference tables.
+# The tables list PREFERRED PROVIDERS per request category (never concrete
+# model ids): whatever each web provider discovers dynamically is picked up
+# automatically. At serve time the chain is filtered by live credential state
+# (available()) and every other discovered model is appended as a safety net.
+# ---------------------------------------------------------------------------
+AUTO_MODEL_ID = 'auto'
+
+AUTO_CATEGORIES: Dict[str, List[str]] = {
+    'image_gen':   ['chatgpt', 'gemini', 'glm'],
+    'vision':      ['chatgpt', 'gemini', 'glm'],
+    'translation': ['gemini', 'chatgpt', 'deepseek', 'glm', 'qwen', 'mistral'],
+    'summarize':   ['chatgpt', 'gemini', 'glm', 'qwen', 'mistral', 'deepseek'],
+    'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt'],
+    'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral', 'kimi'],
+}
+
+_RE_CODE_FENCE = re.compile(
+    r'```|\bdef\s+\w+\s*\(|\bclass\s+\w+\s*[(:]|\bfunction\s+\w+\s*\('
+    r'|\bconsole\.log\s*\(|^\s*(?:import|from)\s+\w+', re.MULTILINE)
+_RE_CODE_HINTS = re.compile(
+    r'\b(?:python|javascript|typescript|golang|rust|sql|regex|json|yaml|html|css|'
+    r'bug|debug|traceback|exception|compile|refactor|npm|pytest|docker|bash|'
+    r'script|snippet|function|algorithm)\b', re.IGNORECASE)
+_RE_TRANSLATE = re.compile(
+    r'\btranslat(?:e|ion|ing)\b|tradu[cz]|\u00fcbersetz|\u7ffb\u8bd1',
+    re.IGNORECASE)
+_RE_SUMMARIZE = re.compile(
+    r'\bsummari[sz]e\b|\bsummary\b|\btldr\b|\btl;dr\b|\bkey points\b'
+    r'|\bin brief\b|\bcondense\b', re.IGNORECASE)
+
+
+def classify_request(prompt: str, has_images: bool = False,
+                     image_generation: bool = False) -> str:
+    """Cheap heuristic classification of a request into an 'auto' category.
+
+    Regex-only (no LLM roundtrip): image payloads win first, then
+    translation/summarization phrasings, code fences/definitions and finally
+    coding keywords (two or more). Everything else is general chat; a wrong
+    guess is harmless because the fallback chain still serves the request.
+    """
+    if image_generation:
+        return 'image_gen'
+    if has_images:
+        return 'vision'
+    text = prompt or ''
+    if _RE_TRANSLATE.search(text):
+        return 'translation'
+    if _RE_SUMMARIZE.search(text):
+        return 'summarize'
+    if _RE_CODE_FENCE.search(text) or len(_RE_CODE_HINTS.findall(text)) >= 2:
+        return 'coding'
+    return 'general'
+
+
 class Router:
     """Registry of providers and routes with retry/fallback orchestration.
 
@@ -138,6 +202,7 @@ class Router:
             self._apply_fallbacks()
         except Exception as e:  # pragma: no cover - defensive
             logger.warning('deepseek route bootstrap failed: %s', e)
+        self._auto_route()
 
     # -------------------------------------------------------------- discovery
     def refresh_models(self, auth_key: Optional[str] = None,
@@ -219,11 +284,89 @@ class Router:
         explicit = _parse_fallbacks()
         default_chain = _csv_env('DSF_DEFAULT_FALLBACKS', '')
         for model_id, route in self.routes.items():
+            if model_id == AUTO_MODEL_ID:
+                continue  # dynamic chain, rebuilt per request
             chain = explicit.get(model_id) or default_chain
             route.fallbacks = []
             for fallback in chain:
                 if fallback != model_id and fallback not in route.fallbacks:
                     route.fallbacks.append(fallback)
+
+    # ----------------------------------------------------------- auto routing
+    def _auto_route(self) -> Route:
+        """Return (registering on first use) the synthetic 'auto' route."""
+        route = self.routes.get(AUTO_MODEL_ID)
+        if route is None:
+            route = Route(
+                model_id=AUTO_MODEL_ID,
+                provider_name='router',
+                upstream_model='auto',
+                vision=True, image_gen=True,
+            )
+            self.routes[AUTO_MODEL_ID] = route
+        return route
+
+    def _auto_chain(self, category: str,
+                    thinking_override: Optional[bool] = None,
+                    search_override: Optional[bool] = None) -> List[str]:
+        """Build the ordered model chain for an 'auto' request.
+
+        Preferred targets for the classified category come first (a provider
+        entry expands to every discovered model of that provider), then every
+        other discovered model as a safety net. Providers without usable
+        credentials (``available() == False``) are demoted out of the front;
+        when nothing is healthy the full ordered list is kept — the stream
+        loop still probes every target and falls back on auth/rate/offline
+        errors. Vision/image-gen requests are restricted to capable targets;
+        explicit thinking/search requests to routes supporting the mode.
+        """
+        ordered: List[str] = []
+
+        def _expand(pref: str) -> None:
+            for model_id, route in self.routes.items():
+                if route.model_id == AUTO_MODEL_ID or model_id in ordered:
+                    continue
+                if (route.provider_name == pref
+                        or route.model_id.startswith(pref + '-')):
+                    ordered.append(model_id)
+
+        for pref in AUTO_CATEGORIES.get(category, AUTO_CATEGORIES['general']):
+            _expand(pref)
+        for model_id in self.routes:
+            if model_id != AUTO_MODEL_ID and model_id not in ordered:
+                ordered.append(model_id)
+
+        for flag, requested in (('thinking_enabled', thinking_override),
+                                ('search_enabled', search_override)):
+            if requested:
+                kept = [mid for mid in ordered
+                        if getattr(self.routes[mid], flag)]
+                if kept:
+                    ordered = kept
+
+        def _healthy(model_id: str) -> bool:
+            route = self.routes.get(model_id)
+            provider = self.providers.get(route.provider_name) if route else None
+            if provider is None:
+                return False
+            try:
+                return bool(provider.available())
+            except Exception:  # noqa: BLE001 — a broken probe means unproven
+                return False
+
+        flags = [(mid, _healthy(mid)) for mid in ordered]
+        # Healthy targets first (category order preserved); credential-less
+        # or offline providers stay at the very back so the stream loop
+        # still probes them — credentials can appear at any moment (the
+        # renewal bot runs continuously).
+        chain = ([mid for mid, ok in flags if ok]
+                 + [mid for mid, ok in flags if not ok])
+        if category in ('vision', 'image_gen'):
+            cap = 'image_gen' if category == 'image_gen' else 'vision'
+            capable = [mid for mid in chain if getattr(self.routes[mid], cap)]
+            if capable:
+                chain = capable
+        return [mid for mid in chain if mid != AUTO_MODEL_ID]
 
     def register(self, route: Route) -> None:
         """Add/replace a route (used by tests and custom setups)."""
@@ -263,8 +406,12 @@ class Router:
         Unknown ids trigger a best-effort re-discovery (the upstream may have
         added models since the last refresh); ids that are still unknown fall
         back to the default fast route, so clients sending an arbitrary name
-        still get served.
+        still get served. An empty id or ``'auto'`` selects the smart router:
+        its serving chain is built per request from live provider state.
         """
+        model_id = (model_id or '').strip().lower()
+        if not model_id or model_id == AUTO_MODEL_ID:
+            return self._auto_route()
         route = self.routes.get(model_id)
         if route is not None:
             return route
@@ -284,7 +431,28 @@ class Router:
 
     def list_models(self) -> List[Dict[str, Any]]:
         """OpenAI-style /v1/models payload with agent-tooling metadata."""
-        return [
+        auto = self.routes.get(AUTO_MODEL_ID)
+        entries: List[Dict[str, Any]] = []
+        if auto is not None:
+            # Listed first: the smart router handles every capability (it
+            # re-routes to a capable model at serve time), so clients must
+            # not pre-gate vision/image requests on its behalf.
+            entries.append({
+                'id': auto.model_id,
+                'object': 'model',
+                'created': 1700000000,
+                'owned_by': 'deepseek4free',
+                'context_length': 131072,
+                'max_model_len': 131072,
+                'max_completion_tokens': 32768,
+                'max_tokens': 32768,
+                'thinking_enabled': True,
+                'search_enabled': True,
+                'vision': True,
+                'image_gen': True,
+                'fallbacks': [],
+            })
+        entries.extend(
             {
                 'id': r.model_id,
                 'object': 'model',
@@ -301,8 +469,9 @@ class Router:
                 'image_gen': r.image_gen,
                 'fallbacks': list(r.fallbacks),
             }
-            for r in self.routes.values()
-        ]
+            for r in self.routes.values() if r.model_id != AUTO_MODEL_ID
+        )
+        return entries
 
     # ---------------------------------------------------------------- serving
     def stream(self, route: Route, prompt: str, *, temperature: Optional[float] = None,
@@ -326,7 +495,23 @@ class Router:
         thinking = route.thinking_enabled if thinking_override is None else thinking_override
         search = route.search_enabled if search_override is None else search_override
 
-        chain = [route.model_id] + [f for f in route.fallbacks if f != route.model_id]
+        if route.model_id == AUTO_MODEL_ID:
+            # Smart router: classify the request and build the chain from
+            # live provider state (preferred category models first, the rest
+            # as safety net). The loop below still handles rate limits, auth
+            # failures (with inline renewal), outages and blocks.
+            category = classify_request(prompt, bool(images), image_generation)
+            chain = self._auto_chain(category, thinking_override,
+                                     search_override)
+            if not chain:
+                raise ProviderError(
+                    'auto router found no available model — providers are '
+                    'still discovering or credentials are being renewed')
+            logger.info('auto router: category=%s chain=%s', category,
+                        ' -> '.join(chain[:5]) + ('…' if len(chain) > 5 else ''))
+        else:
+            chain = [route.model_id] + [f for f in route.fallbacks
+                                        if f != route.model_id]
         last_error: Optional[ProviderError] = None
 
         if images or image_generation:

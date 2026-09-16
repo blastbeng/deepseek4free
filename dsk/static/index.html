@@ -390,8 +390,21 @@ async function loadModels() {
     const data = await r.json();
     modelInfo = {};
     modelSel.innerHTML = '';
+    // 'auto' smart router first, in its own group; it is the default pick.
+    const autoEntry = (data.data || []).find((m) => m.id === 'auto');
+    if (autoEntry) {
+      modelInfo['auto'] = autoEntry;
+      const og = document.createElement('optgroup');
+      og.label = '⚡ smart router';
+      const opt = document.createElement('option');
+      opt.value = 'auto';
+      opt.textContent = '⚡ auto — smart router (best model per request)';
+      og.appendChild(opt);
+      modelSel.appendChild(og);
+    }
     const groups = {};   // owned_by -> <optgroup> (API order is provider-grouped)
     for (const m of data.data || []) {
+      if (m.id === 'auto') continue;
       modelInfo[m.id] = m;
       const opt = document.createElement('option');
       opt.value = m.id;
@@ -415,6 +428,7 @@ async function loadModels() {
     }
     const want = modelSel.dataset.want;
     if (want && modelInfo[want]) modelSel.value = want;
+    else if (modelInfo['auto']) modelSel.value = 'auto';  // default pick
     delete modelSel.dataset.want;
     updateFlags();
   } catch (e) {
