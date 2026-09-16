@@ -216,6 +216,16 @@ class _State:
 _STATE = _State()
 
 
+def _rotate_history(path) -> None:
+    """Keep the JSONL log bounded: over ~1 MB keep only the newest 2000 lines."""
+    try:
+        if path.exists() and path.stat().st_size > 1_000_000:
+            lines = path.read_text(encoding='utf-8').splitlines()
+            path.write_text('\n'.join(lines[-2000:]) + '\n', encoding='utf-8')
+    except OSError:
+        pass
+
+
 def _log_history(provider: str, event: str, detail: Any = '') -> None:
     entry = {'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
              'provider': provider, 'event': event,
@@ -223,6 +233,7 @@ def _log_history(provider: str, event: str, detail: Any = '') -> None:
     with _STATE.lock:
         _STATE.last_heal[provider] = entry
     try:
+        _rotate_history(_history_path())
         with _history_path().open('a', encoding='utf-8') as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + '\n')
     except OSError:
