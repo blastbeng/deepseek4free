@@ -737,7 +737,10 @@ def browser_login(name: str) -> Tuple[bool, str]:
             root_head = ((page.title or '') + ' ' + _body_head(page)).lower()
             if ('could not be satisfied' in root_head
                     or '403 error' in root_head):
-                return False, f'CloudFront 403 via {proxy or "direct"}'
+                return False, (
+                    f'CloudFront 403 via {proxy or "direct"} — DeepSeek '
+                    f'blocks datacenter/host IPs; set DSF_SIGNUP_PROXY to '
+                    f'a RESIDENTIAL proxy to unblock signup')
             if not _click_any(page, ['Log in', 'Login', '登录']):
                 page.get('https://chat.deepseek.com/sign_in')
             time.sleep(4)
@@ -939,7 +942,10 @@ def signup_deepseek() -> Tuple[bool, str]:
             root_head = ((page.title or '') + ' ' + _body_head(page)).lower()
             if ('could not be satisfied' in root_head
                     or '403 error' in root_head):
-                last_error = f'CloudFront 403 via {proxy or "direct"}'
+                last_error = (
+                    f'CloudFront 403 via {proxy or "direct"} — DeepSeek '
+                    f'blocks datacenter/host IPs; set DSF_SIGNUP_PROXY to '
+                    f'a RESIDENTIAL proxy to unblock signup')
                 _log_history('deepseek', 'signup-blocked', last_error)
                 _cool(proxy)  # blocked exit: cooldown + force a fresh one
                 continue
@@ -949,7 +955,10 @@ def signup_deepseek() -> Tuple[bool, str]:
             body_head = _body_head(page)
             if ('could not be satisfied' in body_head
                     or '403 error' in body_head):
-                last_error = f'CloudFront 403 via {proxy or "direct"}'
+                last_error = (
+                    f'CloudFront 403 via {proxy or "direct"} — DeepSeek '
+                    f'blocks datacenter/host IPs; set DSF_SIGNUP_PROXY to '
+                    f'a RESIDENTIAL proxy to unblock signup')
                 _log_history('deepseek', 'signup-blocked', last_error)
                 _cool(proxy)  # blocked exit: cooldown + force a fresh one
                 continue
