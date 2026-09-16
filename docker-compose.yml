@@ -23,7 +23,17 @@ services:
         max-file: "3"
     ports:
       - "${DSF_PORT:-8000}:8000"
+    # Every documented knob in .env reaches the container automatically —
+    # no per-var passthrough maintenance. The environment: block below
+    # takes precedence and pins the container-internal bind points.
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # The container ALWAYS binds 0.0.0.0:8000; the host port comes from
+      # the ports: mapping (${DSF_PORT}). Never let .env leak these.
+      - DSF_PORT=8000
+      - DSF_HOST=0.0.0.0
       # Optional manual override only — the credential bot creates and renews
       # accounts automatically; leave empty for fully autonomous operation.
       - DEEPSEEK_AUTH_TOKEN=${DEEPSEEK_AUTH_TOKEN:-}
