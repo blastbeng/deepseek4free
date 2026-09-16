@@ -725,8 +725,13 @@ async def selfheal_refresh(request: Request):
 @app.get("/")
 @app.get("/playground")
 async def playground():
-    """llama.cpp-style chat playground (static, self-contained, no CDN)."""
-    return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
+    """llama.cpp-style chat playground (static, self-contained, no CDN).
+
+    no-cache forces revalidation (ETag/Last-Modified still yield 304s) so
+    browsers pick up a new UI after every image rebuild instead of pinning
+    a stale cached copy."""
+    return FileResponse(STATIC_DIR / "index.html", media_type="text/html",
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/v1/models")
