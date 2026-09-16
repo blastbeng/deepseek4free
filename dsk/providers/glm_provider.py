@@ -198,6 +198,7 @@ def _zai_dynamic_models(no_proxy: bool = False) -> List[Dict[str, Any]]:
                     continue
                 models.append({'id': exposed, 'backend': 'zai',
                                'thinking': think, 'upstream': raw_id,
+                               'vision': 'vision' in caps,
                                'name': name})
     except Exception as exc:  # noqa: BLE001 — discovery is best effort
         logger.debug('z.ai dynamic model discovery failed: %s', exc)
@@ -528,18 +529,26 @@ class _ZaiBrowser:
 
     # ------------------------------------------------------------------ ask
     def ask(self, prompt: str, upstream: str, thinking: bool,
-            no_proxy: bool = False) -> Generator[Dict[str, Any], None, None]:
+            no_proxy: bool = False,
+            image_paths: Optional[List[str]] = None
+            ) -> Generator[Dict[str, Any], None, None]:
         if not self._busy.acquire(timeout=ZAI_BUSY_TIMEOUT):
             raise ProviderUnavailableError(
                 'z.ai browser session is busy with another request')
         try:
             yield from self._ask_inner(prompt, upstream, thinking, no_proxy,
-                                       retry=True)
+                                       retry=True, image_paths=image_paths)
         finally:
             self._busy.release()
+            for p in (image_paths or []):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     def _ask_inner(self, prompt: str, upstream: str, thinking: bool,
-                   no_proxy: bool, retry: bool = True
+                   no_proxy: bool, retry: bool = True,
+                   image_paths: Optional[List[str]] = None
                    ) -> Generator[Dict[str, Any], None, None]:
         self._ensure()
         try:
@@ -554,10 +563,22 @@ class _ZaiBrowser:
                     logger.warning('z.ai session stale; restarting browser')
                     self.close()
                     yield from self._ask_inner(prompt, upstream, thinking,
-                                               no_proxy, retry=False)
+                                               no_proxy, retry=False,
+                                               image_paths=image_paths)
                     return
                 raise ProviderUnavailableError(
                     'z.ai chat input not found (session dead)')
+            # Attach images through the UI file input BEFORE the prompt is
+            # sent — vision-capable upstreams then receive them with the
+            # message. The hidden input accepts png/jpg/jpeg/bmp/gif.
+            if image_paths:
+                try:
+                    fi = self._page.ele('css:input[type=file]', timeout=8)
+                    fi.input(list(image_paths))
+                    time.sleep(3 + 2 * len(image_paths))  # upload settle
+                except Exception as exc:  # noqa: BLE001
+                    raise ProviderError(
+                        f'z.ai image upload failed: {exc}') from exc
             # Model selection is enforced by rewriting the request body in
             # the fetch hook — clicking selector buttons corrupts UI state.
             self._js(_HOOK_JS % {'completions': ZAI_COMPLETIONS_PATH}, False)
@@ -683,7 +704,8 @@ class GlmProvider(Provider):
             _zai_token()  # cheap anonymous validation, cached in the jar
 
         def add(entry_id: str, upstream: str, thinking: bool,
-                backend: str, name: Optional[str] = None) -> None:
+                backend: str, name: Optional[str] = None,
+                vision: bool = False) -> None:
             if entry_id in seen:
                 return
             seen.add(entry_id)
@@ -695,7 +717,7 @@ class GlmProvider(Provider):
                 'upstream_model': upstream,
                 'thinking_enabled': thinking,
                 'search_enabled': False,
-                'vision': False,
+                'vision': bool(vision),
                 'image_gen': False,
                 'context_length': GLM_CONTEXT_LENGTH,
                 'max_output_tokens': GLM_MAX_OUTPUT,
@@ -710,7 +732,7 @@ class GlmProvider(Provider):
                     entry.get('name'))
         for entry in dynamic:
             add(entry['id'], entry['upstream'], entry['thinking'], 'zai',
-                entry.get('name'))
+                entry.get('name'), vision=bool(entry.get('vision')))
         for entry in GLM_MODELS:
             if entry['backend'] == 'chatglm' and not has_chatglm:
                 continue
@@ -725,8 +747,6 @@ class GlmProvider(Provider):
                image_generation: bool = False,
                no_proxy: bool = False,
                auth_key: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
-        if images:
-            raise ProviderError('glm image input is not supported yet')
         backend, thinking, upstream = 'zai', thinking_enabled, model
         entry = next((e for e in GLM_MODELS if e['id'] == model), None)
         if entry is None and _browser_enabled():
@@ -735,6 +755,15 @@ class GlmProvider(Provider):
         if entry is not None:
             backend, thinking = entry['backend'], entry['thinking']
             upstream = entry.get('upstream', entry['id'])
+        if images:
+            # z.ai's headless UI upload is not reliably automatable (the
+            # file input ignores programmatic DataTransfer/input events and
+            # native dialogs can't be driven), so image input stays
+            # unsupported here; chatgpt/gemini providers handle images.
+            raise ProviderError(
+                'glm image input is not supported yet — z.ai web upload '
+                'cannot be automated headlessly; use a vision-capable '
+                'provider with credentials (chatgpt/gemini)')
         if backend == 'chatglm':
             return self._stream_chatglm(prompt, thinking, no_proxy=no_proxy)
         if not _browser_enabled():
