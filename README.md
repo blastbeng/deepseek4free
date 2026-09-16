@@ -2,7 +2,9 @@
 
 **Free access to DeepSeek, Gemini (Web) and ChatGPT (Web) through their own web APIs — exposed as a standard OpenAI-compatible server, packaged in Docker, and built for agent coding.**
 
-This project talks directly to the chat web apps — `chat.deepseek.com` (account token), `gemini.google.com` (session cookies) and `chatgpt.com` backend-api (session cookies) — instead of any official paid API, then re-exposes them behind the familiar OpenAI endpoints (`/v1/chat/completions`, `/v1/models`). That means any tool that speaks the OpenAI API — [aider](https://aider.chat) / **AiderDesk agent mode**, OpenWebUI, LiteLLM, LibreChat, the `openai` SDK, anything else — can use these models for free.
+This project talks directly to the chat web apps — `chat.deepseek.com`, `gemini.google.com`, `chatgpt.com`, `claude.ai`, `grok.com`, `chat.mistral.ai`, `chat.qwen.ai`, `kimi.com`, `copilot.microsoft.com`, `perplexity.ai` and `chat.z.ai` (GLM) — instead of any official paid API, then re-exposes them behind the familiar OpenAI endpoints (`/v1/chat/completions`, `/v1/models`). That means any tool that speaks the OpenAI API — [aider](https://aider.chat) / **AiderDesk agent mode**, OpenWebUI, LiteLLM, LibreChat, the `openai` SDK, anything else — can use these models for free.
+
+**Zero-credential operation:** a background credential bot *creates every account itself* (auto-signup with auto-generated mailboxes, verification OTPs read automatically), stores the sessions in `./data/` and renews them automatically. Nothing to paste, nothing to maintain.
 
 ```
 ┌──────────────┐   OpenAI API    ┌────────────────────────────┐   web API    ┌──────────────────────────┐
@@ -25,24 +27,30 @@ This project talks directly to the chat web apps — `chat.deepseek.com` (accoun
 > - **tool-calling emulation** so function-calling clients (aider / AiderDesk agent mode) work end-to-end
 > - `reasoning_content` streaming for the thinking model
 > - complete **Docker / docker-compose packaging** with persistent Cloudflare-cookie storage
-> - `.env.example` configuration and a `userToken`-as-API-key auth mode
+> - **autonomous credential bot** (`dsk/refresher.py`): creates accounts with auto-generated
+>   mailboxes (catch-all IMAP or mail.tm throwaways), reads the verification OTPs, stores the
+>   sessions in `./data/` and renews them automatically (refresh → re-login → fresh signup)
+> - **11-provider router** with dynamic model discovery, fallback chains and a
+>   `DSF_PROVIDERS` allowlist; **self-healing** provider patches (`dsk/selfheal.py`)
+> - **llmtrim** request stage (`dsk/llmtrim.py`): LLM CALL → llmtrim → proxy rotator → LLM response
+> - **fast-only proxy rotation** with the no-proxy route as a first-class candidate
+> - a built-in **ChatGPT-style playground** (`/`) with saved chats (24 h expiry)
 
 ---
 
 ## 📖 How it works
 
-This section explains the whole pipeline, from your token to the model's answer.
+This section explains the whole pipeline, from account creation to the model's answer.
 
-### 1. Authentication via `userToken`
+### 1. Credentials are created and renewed automatically
 
-DeepSeek's web app authenticates every request with a bearer token stored in the browser's local storage under the `userToken` key. There is no official API key — we simply reuse that token:
+DeepSeek's web app authenticates every request with a bearer `userToken`; the other providers use session cookies. **You never paste any of them**: the credential bot (`dsk/refresher.py`) runs a renewal ladder on its own —
 
-```js
-// run in the browser console on chat.deepseek.com (while logged in)
-JSON.parse(localStorage.getItem("userToken")).value
-```
+1. **HTTP refresh** of the bot-managed session jars in `./data/` (`deepseek_token`, `gemini_cookies.json`, `chatgpt_cookies.json`, …);
+2. **headless-Chromium re-login** with the accounts the bot created itself (`data/accounts.json`);
+3. **fully automatic signup**: a throwaway mailbox is generated (catch-all IMAP domain via `DSF_MAIL_DOMAIN`, or a mail.tm temp account with zero configuration), the signup form is filled in a real browser, the verification OTP is read from that mailbox and the fresh account is stored.
 
-The resulting string is the **only credential** this project needs. You can provide it either as the `DEEPSEEK_AUTH_TOKEN` environment variable, or directly as the OpenAI API key of the client (the server accepts your `userToken` in place of an API key).
+Credentials therefore live exclusively in the `./data` volume — the `.env` file contains **no LLM credentials at all** (the server still honours a `userToken` sent as the client's API key, and legacy env vars if present, but nothing requires them). Providers whose web apps have no signup flow (claude, grok, qwen, kimi, mistral) stay dormant until one of their tokens exists in `data/`; they never block the other providers, and `DSF_PROVIDERS` can hide them entirely.
 
 ### 2. Cloudflare bypass (`dsk/bypass.py`, `dsk/CloudflareBypasser.py`)
 

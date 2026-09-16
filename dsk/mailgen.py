@@ -229,6 +229,17 @@ def create_email() -> Tuple[Optional[Dict[str, Any]], str]:
             errors.append(f'{make.__name__}: {type(e).__name__}: {e}')
         if session:
             return session, ''
+    # public temp-mail backends rate-limit in bursts: one retry pass after a
+    # short pause usually gets a mailbox without failing the whole signup
+    time.sleep(3.0)
+    for make in backends[1:]:  # retry the non-IMAP backends once
+        try:
+            session = make()
+        except Exception as e:  # noqa: BLE001
+            session = None
+            errors.append(f'{make.__name__} retry: {type(e).__name__}: {e}')
+        if session:
+            return session, ''
     return None, '; '.join(errors) or 'no backend produced a mailbox'
 
 

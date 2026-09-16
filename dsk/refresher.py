@@ -769,10 +769,14 @@ def browser_login(name: str) -> Tuple[bool, str]:
 
 
 def _pool_proxy() -> Optional[str]:
-    """A random egress from the dynamic free-proxy pool (when enabled)."""
+    """A random egress from the dynamic free-proxy pool (when enabled).
+
+    ``direct_ok=False`` — the signup ladder already has its own direct
+    rung, so the pool must never hand back the no-proxy sentinel.
+    """
     try:
         from . import proxies as _proxies
-        return _proxies.get_proxy('deepseek-signup')
+        return _proxies.get_proxy('deepseek-signup', direct_ok=False)
     except Exception:  # pragma: no cover
         return None
 
@@ -798,13 +802,47 @@ def signup_deepseek() -> Tuple[bool, str]:
             return False, f'autogen mailbox unavailable: {err}'
         email, password = session['address'], session['password']
         generated = True
-    # egress ladder: signup egress (DSF_SIGNUP_PROXY/Tor when enabled) first,
-    # then the dynamic free-proxy pool, then direct — DeepSeek's CloudFront
-    # blocks many datacenter/host IPs outright (duplicates are dropped).
-    last_error = ''
+    # egress ladder: explicit DSF_SIGNUP_PROXY first, then SEVERAL distinct
+    # dynamic-pool exits, then direct (duplicates dropped). DeepSeek's
+    # CloudFront blocks many datacenter/host IPs, and a blocked exit stays
+    # "healthy" for generic checks — so every CloudFront block puts that
+    # proxy on cooldown (mark_failure) and the next rung samples a fresh
+    # exit instead of retrying the same blocked IP.
+    def _mark(proxy: Optional[str]) -> None:
+        if not proxy:
+            return
+        try:
+            from . import proxies as _proxies
+            _proxies.mark_failure(proxy)
+        except Exception:  # noqa: BLE001 — rotation is best-effort
+            pass
+
+    pools: List[str] = []
+    seen_p: set = set()
+    try:  # CLI one-shots start with an empty pool — warm it blocking first
+        from . import proxies as _proxies
+        _proxies.ensure_pool()
+    except Exception:  # noqa: BLE001 — direct remains the fallback
+        pass
+    for _ in range(3):  # sample up to 3 distinct pool exits per attempt
+        p = _pool_proxy()
+        if not p:
+            break
+        if p in seen_p:
+            _mark(p)  # sticky assignment: rotate the exit away, re-sample
+            p = _pool_proxy()
+            if not p or p in seen_p:
+                break
+        seen_p.add(p)
+        pools.append(p)
+
+    ladder: List[Optional[str]] = []
     seen: set = set()
-    ladder = [p for p in (_signup_proxy(), _pool_proxy(), None)
-              if p is None or not (p in seen or seen.add(p))]
+    for p in ([_signup_proxy()] if _signup_proxy() else []) + pools + [None]:
+        if p is None or p not in seen:
+            ladder.append(p)
+            if p is not None:
+                seen.add(p)
     for proxy in ladder or [None]:
         page = None
         try:
@@ -820,6 +858,7 @@ def signup_deepseek() -> Tuple[bool, str]:
                     or '403 error' in body_head):
                 last_error = f'CloudFront 403 via {proxy or "direct"}'
                 _log_history('deepseek', 'signup-blocked', last_error)
+                _mark(proxy)  # blocked exit: cooldown + force a fresh one
                 continue
             if not _fill_first(page, _DEEPSEEK_EMAIL_SELECTORS, email):
                 last_error = 'email field not found'
@@ -839,16 +878,10 @@ def signup_deepseek() -> Tuple[bool, str]:
                                       'css:input[name=code]'], code):
                 return False, 'code field not found'
             _click_any(page, ['Sign Up', 'Sign up', '注册'])
-            token = _wait_token(page)
-            _export_cookies(page, 'deepseek', ('deepseek.com',))
-            if token:
-                _save_deepseek_token(token)
-                via = f'account created (autogen {session["backend"]}: {email})' \
-                    if generated else 'account created'
-                return True, f'{via}, userToken captured'
-            return False, 'signup finished but no userToken appeared'
         except Exception as e:  # noqa: BLE001
             last_error = f'signup flow failed: {type(e).__name__}: {e}'
+            _log_history('deepseek', 'egress-failed',
+                         f'{proxy or "direct"}: {last_error}')
         finally:
             if page is not None:
                 try:

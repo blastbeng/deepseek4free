@@ -403,13 +403,57 @@ def all_proxies() -> List[str]:
         return merged
 
 
-def get_proxy(provider: Optional[str] = None) -> Optional[str]:
+def _ensure_timeout() -> float:
+    """Max seconds ensure_pool() waits for its warm-up health pass."""
+    try:
+        return max(15.0, float(os.getenv('DSF_PROXY_ENSURE_TIMEOUT', '90')))
+    except ValueError:
+        return 90.0
+
+
+def ensure_pool() -> int:
+    """Blocking pool warm-up for short-lived processes (CLI one-shots).
+
+    The background controller fills the pool asynchronously; a fresh
+    process would otherwise build its first proxy ladder against an empty
+    pool. Returns the current pool size.
+    """
+    _ensure_controller()
+    with _STATE.lock:
+        empty = not _STATE.pool
+    if empty and (_env_bool('DSF_PROXY_AUTO') or _extra_list_urls()):
+        try:
+            _refresh_pool()
+        except Exception:  # noqa: BLE001 — direct remains the fallback
+            pass
+    # Await one health pass so short-lived processes draw FAST proxies
+    # instead of the unvalidated pool. Bounded: on timeout the caller
+    # proceeds with the raw pool (get_proxy still samples it).
+    if _check_enabled():
+        with _STATE.lock:
+            needs_check = (bool(_STATE.pool)
+                           and not any(t > time.time()
+                                       for t in _STATE.healthy.values()))
+        if needs_check:
+            worker = threading.Thread(target=_run_check_pass,
+                                      name="proxy-ensure", daemon=True)
+            worker.start()
+            worker.join(_ensure_timeout())
+    with _STATE.lock:
+        return len(_STATE.pool)
+
+
+def get_proxy(provider: Optional[str] = None, direct_ok: bool = True) -> Optional[str]:
     """Pick a proxy for `provider` (None -> go direct). Never blocks.
 
     With a provider key the result is a per-provider sticky assignment:
-    a randomly chosen proxy (distinct from other providers' when possible)
+    a randomly chosen route (distinct from other providers' when possible)
     kept for DSF_PROXY_ROTATE_TTL seconds, so traffic is randomized across
-    different providers/exit IPs rather than one shared proxy.
+    different providers/exit IPs rather than one shared route.
+
+    ``direct_ok=False`` (callers that REQUIRE a proxy, e.g. the signup
+    ladder) removes the no-proxy candidate from the draw so the sticky
+    assignment can never silently be 'direct'.
     """
     _ensure_controller()
     key = provider.strip().lower() if provider and provider.strip() else None
@@ -420,7 +464,7 @@ def get_proxy(provider: Optional[str] = None) -> Optional[str]:
     if not pool:
         return None
     now = time.time()
-    direct = _direct_rotation()
+    direct = _direct_rotation() and direct_ok
     with _STATE.lock:
         healthy = [p for p in pool if _STATE.healthy.get(p, 0) > now] if _check_enabled() else []
         candidates = healthy or pool  # until first pass, try the whole pool

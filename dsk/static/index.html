@@ -479,10 +479,15 @@ function ensureActive() {
 function persist() {
   const cur = activeChat();
   if (cur) {
-    // 'updated' tracks ACTIVITY (message added/removed), not passive views —
-    // otherwise merely opening a chat would keep it alive forever.
-    if (cur.messages !== messages || cur.messages.length !== messages.length) {
+    // 'updated' tracks ACTIVITY, not passive views — a content fingerprint
+    // (count + total size) also keeps regenerations (same message count,
+    // different text) from letting an actively-used chat expire.
+    const fp = messages.length + ':' + messages.reduce(
+      (n, m) => n + (typeof m.content === 'string'
+        ? m.content.length : JSON.stringify(m.content || '').length), 0);
+    if (cur.fp !== fp) {
       cur.updated = Date.now();
+      cur.fp = fp;
     }
     cur.messages = messages;
     const t = firstUserText(messages);
