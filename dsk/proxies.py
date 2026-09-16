@@ -468,7 +468,6 @@ def get_proxy(provider: Optional[str] = None, direct_ok: bool = True) -> Optiona
     with _STATE.lock:
         healthy = [p for p in pool if _STATE.healthy.get(p, 0) > now] if _check_enabled() else []
         candidates = healthy or pool  # until first pass, try the whole pool
-        cooldown = float(os.getenv('DSF_PROXY_COOLDOWN', '120') or 120)
         alive = [p for p in candidates if _STATE.cooldown.get(p, 0) <= now]
         # rotation candidate set: [no-proxy, proxy1, proxy2, proxy3, ...]
         if direct:

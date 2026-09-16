@@ -37,6 +37,7 @@ from .base import (
     Provider,
     ProviderAuthError,
     ProviderError,
+    ProviderUnavailableError,
     classify_http_error,
     http_get,
     http_post_stream,

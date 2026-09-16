@@ -42,10 +42,8 @@ from .base import (
     Provider,
     ProviderAuthError,
     ProviderError,
-    ProviderRateLimitError,
     ProviderUnavailableError,
     classify_http_error,
-    http_post_stream,
     http_upload_multipart,
 )
 

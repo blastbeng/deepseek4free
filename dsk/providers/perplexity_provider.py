@@ -25,7 +25,6 @@ Model ids are the upstream ``model_preference`` values the web app offers
 o3 — routed through Perplexity's own search stack).
 """
 
-import json
 import logging
 import os
 import uuid
