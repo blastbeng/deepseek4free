@@ -623,6 +623,14 @@ def _fill_first(page, selectors: List[str], value: str) -> bool:
     return False
 
 
+def _body_head(page) -> str:
+    """First 300 chars of the rendered body (lowercased), '' on failure."""
+    try:
+        return page.ele('tag:body').text[:300].lower()
+    except Exception:  # noqa: BLE001 — detached/blank page
+        return ''
+
+
 def _click_any(page, targets: List[str]) -> bool:
     for t in targets:
         try:
@@ -704,13 +712,23 @@ def browser_login(name: str) -> Tuple[bool, str]:
     email, password = _creds(name)
     if not email or not password:
         return False, f'{name}: no login credentials configured'
+    proxy = _deepseek_egress() if name == 'deepseek' else None
     try:
-        page = _browser()
+        page = _browser(proxy=proxy)
     except Exception as e:  # noqa: BLE001
         return False, f'browser unavailable: {e}'
     try:
         if name == 'deepseek':
-            page.get('https://chat.deepseek.com/sign_in')
+            # Root SPA first: /sign_in document GETs are CloudFront-403'd,
+            # client-side routing is not.
+            page.get('https://chat.deepseek.com/')
+            time.sleep(6)
+            root_head = ((page.title or '') + ' ' + _body_head(page)).lower()
+            if ('could not be satisfied' in root_head
+                    or '403 error' in root_head):
+                return False, f'CloudFront 403 via {proxy or "direct"}'
+            if not _click_any(page, ['Log in', 'Login', '登录']):
+                page.get('https://chat.deepseek.com/sign_in')
             time.sleep(4)
             if not _fill_first(page, _DEEPSEEK_EMAIL_SELECTORS, email):
                 return False, 'email field not found'
@@ -768,6 +786,81 @@ def browser_login(name: str) -> Tuple[bool, str]:
             pass
 
 
+def _cool(proxy: Optional[str]) -> None:
+    """Cooldown a blocked egress (mark_failure); safe on None/direct."""
+    if not proxy:
+        return
+    try:
+        from . import proxies as _proxies
+        _proxies.mark_failure(proxy)
+    except Exception:  # noqa: BLE001 — rotation is best-effort
+        pass
+
+
+def _ds_egress_ok(proxy: Optional[str]) -> bool:
+    """Cheap CloudFront reachability probe for a signup/login egress.
+
+    chat.deepseek.com hard-403s document GETs by IP reputation. A 200 on
+    the root page predicts the browser SPA entry will work; 403/challenge
+    responses mark the exit unusable before we pay browser startup cost.
+    """
+    if not proxy:
+        return False
+    try:
+        from .providers.base import http_get
+        r = http_get('https://chat.deepseek.com/',
+                     proxies={'http': proxy, 'https': proxy}, timeout=12)
+    except Exception:  # noqa: BLE001 — treat as unusable
+        return False
+    if r.status_code == 200:
+        return True
+    # 202 + goku = AWS WAF JS challenge: the BROWSER solves it, so the exit
+    # is usable. Only the hard CloudFront 403 ("could not be satisfied")
+    # means the IP is blocked and the browser would fail too.
+    body = (r.text[:500] or '').lower()
+    return not ('could not be satisfied' in body or '403 error' in body)
+
+
+def _pool_egresses(limit: int = 3, samples: int = 6) -> List[str]:
+    """Up to ``limit`` DISTINCT pool exits that pass the reachability probe.
+
+    Samples the sticky pool, cools down blocked exits, and returns only
+    egresses CloudFront currently lets through."""
+    try:
+        from . import proxies as _proxies
+        _proxies.ensure_pool()
+    except Exception:  # noqa: BLE001 — direct remains the fallback
+        pass
+    out: List[str] = []
+    seen: set = set()
+    for _ in range(samples):
+        if len(out) >= limit:
+            break
+        p = _pool_proxy()
+        if not p:
+            break
+        if p in seen:
+            _cool(p)  # sticky assignment: rotate the exit away, re-sample
+            p = _pool_proxy()
+            if not p or p in seen:
+                break
+        seen.add(p)
+        if _ds_egress_ok(p):
+            out.append(p)
+        else:
+            _cool(p)  # blocked exit: cooldown + force a fresh one
+    return out
+
+
+def _deepseek_egress() -> Optional[str]:
+    """Best single egress for a DeepSeek browser session (login/renewal)."""
+    explicit = _signup_proxy()
+    if explicit and _ds_egress_ok(explicit):
+        return explicit
+    egresses = _pool_egresses(limit=1, samples=4)
+    return egresses[0] if egresses else None
+
+
 def _pool_proxy() -> Optional[str]:
     """A random egress from the dynamic free-proxy pool (when enabled).
 
@@ -808,37 +901,15 @@ def signup_deepseek() -> Tuple[bool, str]:
     # "healthy" for generic checks — so every CloudFront block puts that
     # proxy on cooldown (mark_failure) and the next rung samples a fresh
     # exit instead of retrying the same blocked IP.
-    def _mark(proxy: Optional[str]) -> None:
-        if not proxy:
-            return
-        try:
-            from . import proxies as _proxies
-            _proxies.mark_failure(proxy)
-        except Exception:  # noqa: BLE001 — rotation is best-effort
-            pass
-
-    pools: List[str] = []
-    seen_p: set = set()
-    try:  # CLI one-shots start with an empty pool — warm it blocking first
-        from . import proxies as _proxies
-        _proxies.ensure_pool()
-    except Exception:  # noqa: BLE001 — direct remains the fallback
-        pass
-    for _ in range(3):  # sample up to 3 distinct pool exits per attempt
-        p = _pool_proxy()
-        if not p:
-            break
-        if p in seen_p:
-            _mark(p)  # sticky assignment: rotate the exit away, re-sample
-            p = _pool_proxy()
-            if not p or p in seen_p:
-                break
-        seen_p.add(p)
-        pools.append(p)
-
+    # egress ladder: explicit DSF_SIGNUP_PROXY first, then up to 3 distinct
+    # dynamic-pool exits that PASS the root-page reachability probe, then
+    # direct (duplicates dropped). CloudFront blocks many datacenter/host
+    # IPs; blocked exits are cooled down so the next rung samples a fresh,
+    # hopefully-working IP instead of retrying the same blocked one.
     ladder: List[Optional[str]] = []
     seen: set = set()
-    for p in ([_signup_proxy()] if _signup_proxy() else []) + pools + [None]:
+    for p in (([_signup_proxy()] if _signup_proxy() else [])
+              + _pool_egresses() + [None]):
         if p is None or p not in seen:
             ladder.append(p)
             if p is not None:
@@ -847,18 +918,29 @@ def signup_deepseek() -> Tuple[bool, str]:
         page = None
         try:
             page = _browser(proxy=proxy)
-            page.get('https://chat.deepseek.com/sign_up')
-            time.sleep(5)
-            body_head = ''
-            try:
-                body_head = page.ele('tag:body').text[:300].lower()
-            except Exception:  # noqa: BLE001
-                pass
+            # CloudFront 403s document GETs of /sign_up by IP reputation,
+            # but the root SPA loads and routes to /sign_up CLIENT-SIDE
+            # (no document request -> no WAF block). Root first, click
+            # through; fall back to the direct document GET only if the
+            # SPA entry point is missing.
+            page.get('https://chat.deepseek.com/')
+            time.sleep(6)
+            root_head = ((page.title or '') + ' ' + _body_head(page)).lower()
+            if ('could not be satisfied' in root_head
+                    or '403 error' in root_head):
+                last_error = f'CloudFront 403 via {proxy or "direct"}'
+                _log_history('deepseek', 'signup-blocked', last_error)
+                _cool(proxy)  # blocked exit: cooldown + force a fresh one
+                continue
+            if not _click_any(page, ['Sign up', 'Sign Up', '注册']):
+                page.get('https://chat.deepseek.com/sign_up')
+            time.sleep(4)
+            body_head = _body_head(page)
             if ('could not be satisfied' in body_head
                     or '403 error' in body_head):
                 last_error = f'CloudFront 403 via {proxy or "direct"}'
                 _log_history('deepseek', 'signup-blocked', last_error)
-                _mark(proxy)  # blocked exit: cooldown + force a fresh one
+                _cool(proxy)  # blocked exit: cooldown + force a fresh one
                 continue
             if not _fill_first(page, _DEEPSEEK_EMAIL_SELECTORS, email):
                 last_error = 'email field not found'
@@ -873,7 +955,10 @@ def signup_deepseek() -> Tuple[bool, str]:
             else:
                 code = imap_otp(max_wait_s=180)
             if not code:
-                return False, 'signup code email not found in mailbox'
+                return False, ('signup code email not found in mailbox — '
+                               'DeepSeek silently drops disposable domains; '
+                               'configure DSF_MAIL_DOMAIN + DSF_MAIL_IMAP_HOST '
+                               'with a catch-all inbox for reliable delivery')
             if not _fill_first(page, ['@placeholder:code', '@placeholder:Code',
                                       'css:input[name=code]'], code):
                 return False, 'code field not found'

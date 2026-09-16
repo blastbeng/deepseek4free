@@ -37,6 +37,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 MAILTM_API = 'https://api.mail.tm'
+MAILGW_API = 'https://api.mail.gw'
 _UA = 'deepseek4free-refresher/1.0 (+autonomous credential maintenance)'
 
 
@@ -92,8 +93,8 @@ def _items(body: Any) -> List[Any]:
     return []
 
 
-def _mailtm_domains() -> List[str]:
-    code, body = _http('GET', f'{MAILTM_API}/domains?page=1')
+def _mailtm_domains(api: str) -> List[str]:
+    code, body = _http('GET', f'{api}/domains?page=1')
     if code != 200:
         return []
     return [d['domain'] for d in _items(body)
@@ -118,30 +119,38 @@ def _mailtm_extract(body: Any, code_re: re.Pattern) -> Optional[str]:
 
 
 def _mailtm_create() -> Optional[Dict[str, Any]]:
-    """Create a throwaway mail.tm account. Returns session dict or None."""
-    for domain in _mailtm_domains()[:3]:
-        address = f"{_gen_local_part()}@{domain}"
-        password = _gen_password()
-        code, body = _http('POST', f'{MAILTM_API}/accounts',
-                           {'address': address, 'password': password})
-        if code in (200, 201) and isinstance(body, dict) and body.get('id'):
-            code2, tok = _http('POST', f'{MAILTM_API}/token',
+    """Create a throwaway account on the first working temp-mail service.
+
+    mail.tm and mail.gw expose the same API shape but run different domain
+    pools; ESP blocklists often cover one pool and not the other, so both
+    are tried. The chosen service's API base is stored in the session so
+    fetch_otp polls the right inbox.
+    """
+    for backend, api in (('mail.tm', MAILTM_API), ('mail.gw', MAILGW_API)):
+        for domain in _mailtm_domains(api)[:3]:
+            address = f"{_gen_local_part()}@{domain}"
+            password = _gen_password()
+            code, body = _http('POST', f'{api}/accounts',
                                {'address': address, 'password': password})
-            if code2 == 200 and isinstance(tok, dict) and tok.get('token'):
-                return {'backend': 'mail.tm', 'address': address,
-                        'password': password, 'token': tok['token'],
-                        'account_id': body.get('id')}
-        # rate-limited / domain rejected → try the next domain
-        time.sleep(1.5)
+            if code in (200, 201) and isinstance(body, dict) and body.get('id'):
+                code2, tok = _http('POST', f'{api}/token',
+                                   {'address': address, 'password': password})
+                if code2 == 200 and isinstance(tok, dict) and tok.get('token'):
+                    return {'backend': backend, 'api': api, 'address': address,
+                            'password': password, 'token': tok['token'],
+                            'account_id': body.get('id')}
+            # rate-limited / domain rejected → try the next domain
+            time.sleep(1.5)
     return None
 
 
 def _mailtm_fetch_otp(session: Dict[str, Any], sender_needle: str,
                       code_re: re.Pattern, max_age_min: float,
                       deadline: float, seen_ids: set) -> Optional[str]:
-    """Poll the mail.tm inbox until a fresh OTP shows up."""
+    """Poll the temp-mail inbox (mail.tm or mail.gw) until a fresh OTP shows."""
+    api = str(session.get('api') or MAILTM_API)
     while time.time() < deadline:
-        code, body = _http('GET', f'{MAILTM_API}/messages?page=1',
+        code, body = _http('GET', f'{api}/messages?page=1',
                            token=session['token'])
         if code == 200:
             for msg in _items(body):
@@ -157,7 +166,7 @@ def _mailtm_fetch_otp(session: Dict[str, Any], sender_needle: str,
                     continue
                 # need the full message for the body
                 mcode, full = _http('GET',
-                                    f"{MAILTM_API}/messages/{msg.get('id')}",
+                                    f"{api}/messages/{msg.get('id')}",
                                     token=session['token'])
                 if mcode == 200:
                     otp = _mailtm_extract(full, code_re)
