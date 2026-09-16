@@ -14,3 +14,6 @@ data/
 docker-compose.yml
 Dockerfile
 .dockerignore
+# Live session cookies are host-side artifacts (bot writes fresh jars to the
+# /data volume in-container) — never bake them into the pushed image.
+dsk/*.json

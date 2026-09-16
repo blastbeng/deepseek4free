@@ -897,8 +897,7 @@ function refreshRegen() {
 $('regen').onclick = async () => {
   if (!canRegen()) return;
   while (messages.length && messages[messages.length - 1].role === 'assistant') messages.pop();
-  const bubbles = chat.querySelectorAll('.msg.bot, .msg.error');
-  for (const b of bubbles) b.remove();
+  redraw();  // rebuild DOM from messages[] — never strip bubbles selectively
   persist();
   await runCompletion();
 };
@@ -907,11 +906,9 @@ $('regen').onclick = async () => {
 $('edit').onclick = () => {
   if (controller) return;
   while (messages.length && messages[messages.length - 1].role === 'assistant') messages.pop();
-  for (const b of chat.querySelectorAll('.msg.bot, .msg.error')) b.remove();
   if (!messages.length || messages[messages.length - 1].role !== 'user') { refreshRegen(); return; }
   const m = messages.pop();
-  const ubs = chat.querySelectorAll('.msg.user');
-  if (ubs.length) ubs[ubs.length - 1].remove();
+  redraw();  // rebuild DOM from messages[] — earlier turns keep their replies
   pendingImages = [];
   if (Array.isArray(m.content)) {
     for (const part of m.content) {
