@@ -363,6 +363,8 @@ class Router:
                     )
                     for chunk in gen:
                         emitted = True
+                        if isinstance(chunk, dict):
+                            chunk.setdefault('served_by', served_by)
                         yield chunk
                     return
                 except ProviderRateLimitError as e:

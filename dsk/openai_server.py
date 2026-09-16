@@ -840,22 +840,25 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         c_parts: List[str] = []
         r_parts: List[str] = []
         n_chunks = 0
+        served = {"by": None}
         for chunk in chunk_gen:
             n_chunks += 1
+            served["by"] = chunk.get("served_by") or served["by"]
             if chunk.get("type") == "thinking" and chunk.get("content"):
                 r_parts.append(chunk["content"])
             elif chunk.get("type") == "image" and chunk.get("content"):
                 c_parts.append(chunk["content"])
             elif chunk.get("type") == "text" and chunk.get("content"):
                 c_parts.append(chunk["content"])
-        return c_parts, r_parts, n_chunks
+        return c_parts, r_parts, n_chunks, served["by"]
 
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
+    served_by: Optional[str] = None
     try:
         # Consume the blocking provider stream in a worker thread — pulling
         # it on the event loop would serialize ALL requests behind this one.
-        content_parts, reasoning_parts, n_chunks = (
+        content_parts, reasoning_parts, n_chunks, served_by = (
             await asyncio.get_running_loop().run_in_executor(
                 None, _collect))
     except ProviderError as e:
@@ -891,7 +894,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         } for c in calls]
         finish_reason = "tool_calls"
 
-    return {
+    response = {
         "id": _chunk_id(),
         "object": "chat.completion",
         "created": created,
@@ -911,6 +914,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                              + sum(len(p) for p in reasoning_parts)) // 4,
         },
     }
+    if served_by:
+        response["served_by"] = served_by
+    return response
 
 
 async def _stream_completion(
@@ -959,6 +965,7 @@ async def _stream_completion(
     # for cross-thread put_nowait and can deadlock the event loop).
     q: "queue.Queue[Optional[str]]" = queue.Queue()
     finish_holder = {"reason": "stop"}
+    served_holder = {"by": None}
     errored = {"flag": False}
     stop = threading.Event()
     out_chars = {"n": 0}   # completion characters (for include_usage stats)
@@ -1038,6 +1045,8 @@ async def _stream_completion(
             for chunk in _guard():
                 ctype = chunk.get("type", "")
                 content = chunk.get("content", "") or ""
+                if not served_holder["by"] and chunk.get("served_by"):
+                    served_holder["by"] = chunk["served_by"]
                 if not content:
                     continue
                 if ctype == "image":
@@ -1146,6 +1155,8 @@ async def _stream_completion(
                     {"index": 0, "delta": {}, "finish_reason": finish_holder["reason"]}
                 ],
             }
+            if served_holder["by"]:
+                done["served_by"] = served_holder["by"]
             yield _sse(done)
             if include_usage:
                 completion = out_chars["n"] // 4
