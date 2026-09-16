@@ -1871,10 +1871,12 @@ def _seed_counts() -> None:
     bypass the daily attempt cap; today's ``renew-start`` events make the
     budget continuous across restarts. Runs once per process.
 
-    Only DAEMON-triggered attempts count against the budget: events whose
-    reason starts with ``manual-`` (CLI runs, force-bootstrap) are
-    excluded, so an operator debugging the ladder can never exhaust the
-    bot's own daily quota — the daemon keeps retrying regardless.
+    Only DAEMON-triggered PROACTIVE attempts count against the budget:
+    events whose reason is reactive ('auth' from the self-heal probe,
+    'inline-auth' from the request path) or operator-initiated
+    ('manual-*', CLI runs) are excluded — those do not consume the
+    proactive daily quota, so a heavy debug/reactive day can never
+    starve the daemon's own bootstrap retries.
     """
     if _STATE.counts_seeded:
         return
