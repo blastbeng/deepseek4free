@@ -153,7 +153,7 @@ class DeepSeekAPI:
                     json=json_data,
                     cookies=self.cookies,
                     impersonate='chrome120',
-                    timeout=None,
+                    timeout=120,   # small JSON calls — never hang a worker
                     **proxy_kw
                 )
 
@@ -284,7 +284,7 @@ class DeepSeekAPI:
                 cookies=self.cookies,  # Add cookies
                 impersonate='chrome120',
                 stream=True,
-                timeout=None,
+                timeout=(10, 600),   # connect, total — matches base.py streams
                 **proxy_kw
             )
 

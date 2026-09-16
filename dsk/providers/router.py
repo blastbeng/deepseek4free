@@ -351,6 +351,7 @@ class Router:
             attempt = 0
             while True:
                 attempt += 1
+                emitted = False
                 try:
                     gen = provider.stream(
                         prompt, model=target.upstream_model,
@@ -361,10 +362,13 @@ class Router:
                         auth_key=auth_key,
                     )
                     for chunk in gen:
+                        emitted = True
                         yield chunk
                     return
                 except ProviderRateLimitError as e:
                     last_error = e
+                    if emitted:
+                        raise  # mid-stream failure: fallback would duplicate output
                     if attempt <= MAX_RETRIES:
                         wait = min(e.retry_after if e.retry_after
                                    else RETRY_BACKOFF * (2 ** (attempt - 1)), RETRY_CAP)
@@ -377,6 +381,8 @@ class Router:
                     break
                 except ProviderUnavailableError as e:
                     last_error = e
+                    if emitted:
+                        raise  # mid-stream failure: fallback would duplicate output
                     if attempt <= MAX_RETRIES:
                         wait = min(RETRY_BACKOFF * (2 ** (attempt - 1)), RETRY_CAP)
                         logger.warning('%s unavailable (attempt %d/%d), retrying in %.1fs: %s',
@@ -389,10 +395,14 @@ class Router:
                 except ProviderAuthError as e:
                     # Credentials rejected/missing: retrying cannot help.
                     last_error = e
+                    if emitted:
+                        raise  # mid-stream failure: fallback would duplicate output
                     logger.warning('%s auth failed, skipping to fallback: %s', served_by, e)
                     break
                 except ProviderError as e:
                     last_error = e
+                    if emitted:
+                        raise  # mid-stream failure: fallback would duplicate output
                     logger.warning('%s failed, skipping to fallback: %s', served_by, e)
                     break
 
