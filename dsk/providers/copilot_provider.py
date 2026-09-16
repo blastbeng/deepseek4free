@@ -122,12 +122,18 @@ def _harvest_browser_cookies() -> Dict[str, str]:
                     out[name] = value
             if anon:
                 out['__Host-copilot-anon'] = anon
-            if out.get('MUID') or anon:
+            if anon:
+                # Only a jar WITH the anon token is a valid identity —
+                # persisting MUID-only jars leaves 460-prone fallbacks.
                 save_jar('copilot', out)
                 _log.info('copilot: harvested %d browser cookies '
                           '(anon token present: %s)', len(out), bool(anon))
                 return out
-            _log.warning('copilot: browser harvest produced no anon token')
+            if out.get('MUID'):
+                _log.warning('copilot: browser harvest got MUID but no '
+                             'anon token — jar left untouched')
+            else:
+                _log.warning('copilot: browser harvest produced no anon token')
             return {}
         except Exception as e:  # pragma: no cover - browser flakiness
             _log.warning('copilot: browser harvest failed: %s', e)
@@ -149,15 +155,17 @@ def _harvest_browser_cookies() -> Dict[str, str]:
 
 
 def _rotate_identity() -> None:
-    """Discard the stale anonymous identity and mint a fresh browser one."""
-    try:
-        save_jar('copilot', {})
-    except Exception:  # noqa: BLE001 — rotation is best-effort
-        pass
-    if not _harvest_browser_cookies():
+    """Discard the stale anonymous identity and mint a fresh browser one.
+
+    The harvest runs BEFORE the old jar is discarded and only a fresh
+    identity that actually carries an anon token replaces it — a flaky
+    browser run must never leave a tokenless (460-prone) identity behind.
+    """
+    fresh = _harvest_browser_cookies()
+    if not fresh.get('__Host-copilot-anon'):
         raise ProviderAuthError(
             'copilot identity rotation failed — browser harvest produced '
-            'no cookies')
+            'no anon token; keeping the previous identity')
 
 
 def _anon_cookies() -> Dict[str, str]:

@@ -149,17 +149,39 @@ def trim_messages(messages: List[Any], context_tokens: float,
         stats['out_chars'] = total
         return messages, stats
 
-    # 1) drop OLDEST droppable messages (system + the final message are kept)
+    # 1) drop OLDEST droppable groups (system + the final message are kept).
+    #    An assistant message with tool_calls and its immediately-following
+    #    tool results form an ATOMIC group: dropping only part leaves orphan
+    #    tool results (or calls without results) that upstreams reject.
     last = len(messages) - 1
-    droppable = [i for i, m in enumerate(messages)
-                 if i != last and _role(m) != 'system']
+
+    def _has_calls(m: Any) -> bool:
+        calls = getattr(m, 'tool_calls', None) if not isinstance(m, dict) \
+            else m.get('tool_calls')
+        return bool(calls)
+
+    groups: List[Tuple[int, int]] = []  # inclusive (start, end) indexes
+    gi = 0
+    while gi <= last:
+        gj = gi
+        if _role(messages[gi]) == 'assistant' and _has_calls(messages[gi]):
+            while gj + 1 <= last and _role(messages[gj + 1]) == 'tool':
+                gj += 1
+        groups.append((gi, gj))
+        gi = gj + 1
+
     drop: set = set()
     cur = total
-    for i in droppable:  # oldest first
+    for gs, ge in groups:  # oldest first
         if cur <= budget:
             break
-        cur -= sizes[i]
-        drop.add(i)
+        if ge >= last:  # group contains the protected final message
+            continue
+        if any(_role(messages[k]) == 'system' for k in range(gs, ge + 1)):
+            continue
+        for k in range(gs, ge + 1):
+            drop.add(k)
+        cur -= sum(sizes[gs:ge + 1])
     kept = [(i, m) for i, m in enumerate(messages) if i not in drop]
     stats['dropped'] = len(drop)
 

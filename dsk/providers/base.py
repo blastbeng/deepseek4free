@@ -69,16 +69,20 @@ def provider_enabled(name: str) -> bool:
 
 
 def _looks_like_network_error(exc: BaseException) -> bool:
-    """True for transport-level failures (connect/timeout/proxy/ssl)."""
+    """True for transport-level failures (connect/timeout/proxy/ssl/tls)."""
     name = type(exc).__name__.lower()
     text = str(exc).lower()
     if any(k in name for k in ('requestexception', 'connection', 'timeout',
-                               'proxyerror', 'sslerror', 'chunkedencoding')):
+                               'proxyerror', 'sslerror', 'chunkedencoding',
+                               'curlerror')):
         return True
     return any(k in text for k in (
         "couldn't connect", 'failed to connect', 'timed out',
         'connection reset', 'connection refused', 'connection aborted',
-        'getaddrinfo failed', 'temporary failure in name resolution'))
+        'getaddrinfo failed', 'temporary failure in name resolution',
+        # curl_cffi reports every transport failure as "curl: (<code>) ..."
+        # — (7) connect refused, (28) timeout, (35/51/60) ssl/tls, (56) reset.
+        'curl: (', 'ssl', 'certificate', 'handshake'))
 
 
 def _resilient_request(url: str, extra: Dict[str, Any], do_request,

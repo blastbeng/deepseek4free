@@ -955,6 +955,7 @@ async def _stream_completion(
     finish_holder = {"reason": "stop"}
     errored = {"flag": False}
     stop = threading.Event()
+    out_chars = {"n": 0}   # completion characters (for include_usage stats)
 
     def _guard():
         """Provider chunks with a client-disconnect circuit breaker.
@@ -988,6 +989,7 @@ async def _stream_completion(
             nonlocal emitted
             if upto <= emitted:
                 return
+            out_chars["n"] += upto - emitted
             data = {
                 "id": cid, "object": "chat.completion.chunk",
                 "created": created, "model": model,
@@ -1002,6 +1004,8 @@ async def _stream_completion(
 
         def _tool_deltas(calls: List[Dict[str, str]]) -> None:
             for i, call in enumerate(calls):
+                out_chars["n"] += len(str(call.get("name", ""))) + \
+                    len(str(call.get("arguments", "")))
                 q.put(_sse({
                     "id": cid, "object": "chat.completion.chunk",
                     "created": created, "model": model,
@@ -1033,6 +1037,7 @@ async def _stream_completion(
                 if ctype == "image":
                     # Generated image (markdown): emitted immediately — URLs
                     # never contain the tool-call marker, so no holdback.
+                    out_chars["n"] += len(content)
                     q.put(_sse({
                         "id": cid, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -1130,6 +1135,7 @@ async def _stream_completion(
             }
             yield _sse(done)
             if include_usage:
+                completion = out_chars["n"] // 4
                 yield _sse({
                     "id": cid,
                     "object": "chat.completion.chunk",
@@ -1138,8 +1144,8 @@ async def _stream_completion(
                     "choices": [],
                     "usage": {
                         "prompt_tokens": prompt_len // 4,
-                        "completion_tokens": 0,
-                        "total_tokens": prompt_len // 4,
+                        "completion_tokens": completion,
+                        "total_tokens": prompt_len // 4 + completion,
                     },
                 })
     finally:
