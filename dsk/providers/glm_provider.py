@@ -62,6 +62,11 @@ GLM_CONTEXT_LENGTH = int(os.getenv('DSF_GLM_CONTEXT_LENGTH', '128000'))
 # context so llmtrim trims the conversation BEFORE it reaches the page.
 ZAI_WEB_CONTEXT = int(os.getenv('DSF_ZAI_CONTEXT_LENGTH', '10000'))
 GLM_MAX_OUTPUT = int(os.getenv('DSF_GLM_MAX_OUTPUT', '8192'))
+# The z.ai WEB transport generates freely (no upstream output cap is
+# enforced), so reserving GLM_MAX_OUTPUT from the small 10k-token context
+# would leave almost no room for the conversation. Reserve a modest
+# completion window instead.
+ZAI_WEB_MAX_OUTPUT = int(os.getenv('DSF_ZAI_MAX_OUTPUT', '2048'))
 
 # Browser transport tuning (see _ZaiBrowser).
 ZAI_HEADLESS = os.getenv('DSF_ZAI_HEADLESS', '').strip().lower() in ('1', 'true', 'yes')
@@ -793,7 +798,8 @@ class GlmProvider(Provider):
 
         def add(entry_id: str, upstream: str, thinking: bool,
                 backend: str, name: Optional[str] = None,
-                vision: bool = False, context_length: int = GLM_CONTEXT_LENGTH
+                vision: bool = False, context_length: int = GLM_CONTEXT_LENGTH,
+                max_output: int = GLM_MAX_OUTPUT
                 ) -> None:
             if entry_id in seen:
                 return
@@ -809,7 +815,7 @@ class GlmProvider(Provider):
                 'vision': bool(vision),
                 'image_gen': False,
                 'context_length': context_length,
-                'max_output_tokens': GLM_MAX_OUTPUT,
+                'max_output_tokens': max_output,
                 'extra': extra,
             })
 
@@ -818,11 +824,12 @@ class GlmProvider(Provider):
         for entry in dynamic:
             if entry['id'] in preferred:
                 add(entry['id'], entry['upstream'], entry['thinking'], 'zai',
-                    entry.get('name'), context_length=ZAI_WEB_CONTEXT)
+                    entry.get('name'), context_length=ZAI_WEB_CONTEXT,
+                    max_output=ZAI_WEB_MAX_OUTPUT)
         for entry in dynamic:
             add(entry['id'], entry['upstream'], entry['thinking'], 'zai',
                 entry.get('name'), vision=bool(entry.get('vision')),
-                context_length=ZAI_WEB_CONTEXT)
+                context_length=ZAI_WEB_CONTEXT, max_output=ZAI_WEB_MAX_OUTPUT)
         for entry in GLM_MODELS:
             if entry['backend'] == 'chatglm' and not has_chatglm:
                 continue

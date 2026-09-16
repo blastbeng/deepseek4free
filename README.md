@@ -446,6 +446,7 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_ZAI_CONTEXT_LENGTH` | `10000` | Prompt budget (tokens) for the z.ai web transport — its browser input silently fails beyond ~40k characters |
 | `DSF_ZAI_PARALLEL` | `1` | Independent z.ai browser sessions (2-4 enable parallel streams; each spawns a Chromium only when requests overlap) |
 | `DSF_ZAI_STALE_AFTER` | `600` | s — idle z.ai pages are recycled proactively (anonymous sessions expire server-side) |
+| `DSF_ZAI_MAX_OUTPUT` | `2048` | Output reservation advertised for z.ai routes — keeps most of the 10k-token context for the conversation (llmtrim budget) |
 
 **Per-request flags** (chat + image endpoints, non-standard): `"thinking": false` skips a thinking route's reasoning pass (much faster for simple tasks — the playground's *fast mode* toggle sends it), `"search_enabled": true` forces web search, `"disable_proxy": true` connects directly.
 
