@@ -407,6 +407,16 @@ class Router:
                         raise  # mid-stream failure: fallback would duplicate output
                     logger.warning('%s failed, skipping to fallback: %s', served_by, e)
                     break
+                except Exception as e:  # noqa: BLE001 — unclassified provider
+                    # crash (upstream format change, provider bug): keep the
+                    # request alive by falling through the chain. Mid-stream
+                    # failures still re-raise: output was already emitted.
+                    if emitted:
+                        raise
+                    last_error = ProviderError(f'{type(e).__name__}: {e}')
+                    logger.warning('%s crashed, skipping to fallback: %s',
+                                   served_by, e)
+                    break
 
             if position < len(chain) - 1:
                 logger.info('falling back: %s -> %s', route.model_id, chain[position + 1])
