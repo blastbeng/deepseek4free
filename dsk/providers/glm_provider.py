@@ -406,11 +406,10 @@ class _ZaiBrowser:
 
     @classmethod
     def instance(cls) -> '_ZaiBrowser':
+        """Legacy single-session accessor (kept for compatibility)."""
         with cls._instance_lock:
             if cls._instance is None:
-                browser = cls()
-                atexit.register(browser.close)
-                cls._instance = browser
+                cls._instance = cls()
             return cls._instance
 
     # ------------------------------------------------------------- lifecycle
@@ -674,16 +673,84 @@ class _ZaiBrowser:
             raise ProviderError(f'z.ai browser transport failed: {exc}') from exc
 
 
-_ZAI_BROWSER: Optional[_ZaiBrowser] = None
-_ZAI_BROWSER_LOCK = threading.Lock()
+def _zai_parallel() -> int:
+    """Number of independent z.ai browser sessions (1 = serialized).
+
+    Two concurrent sessions from one IP were verified to stream
+    simultaneously; each extra session costs one Chromium (~400 MB), and
+    pages are only spawned when requests actually overlap."""
+    try:
+        return max(1, min(4, int(os.getenv('DSF_ZAI_PARALLEL', '1'))))
+    except ValueError:
+        return 1
 
 
-def _zai_browser() -> _ZaiBrowser:
-    global _ZAI_BROWSER
-    with _ZAI_BROWSER_LOCK:
-        if _ZAI_BROWSER is None:
-            _ZAI_BROWSER = _ZaiBrowser.instance()
-        return _ZAI_BROWSER
+_ZAI_POOL: List[_ZaiBrowser] = []
+_ZAI_POOL_LOCK = threading.Lock()
+_ZAI_POOL_NEXT = [0]
+
+
+def _zai_browser() -> '_ZaiBrowser':
+    """Next browser session from the parallel pool (round-robin)."""
+    n = _zai_parallel()
+    with _ZAI_POOL_LOCK:
+        while len(_ZAI_POOL) < n:
+            _ZAI_POOL.append(_ZaiBrowser())
+        idx = _ZAI_POOL_NEXT[0] % n
+        _ZAI_POOL_NEXT[0] = idx + 1
+        return _ZAI_POOL[idx]
+
+
+def _close_zai_pool() -> None:
+    with _ZAI_POOL_LOCK:
+        for b in _ZAI_POOL:
+            try:
+                b.close()
+            except Exception:  # noqa: BLE001 — shutdown best effort
+                pass
+        _ZAI_POOL.clear()
+
+
+atexit.register(_close_zai_pool)
+
+
+def _zai_ask(prompt: str, upstream: str, thinking: bool,
+             no_proxy: bool = False,
+             image_paths: Optional[List[str]] = None
+             ) -> Generator[Dict[str, Any], None, None]:
+    """Run one z.ai ask across the session pool with stale-session retry.
+
+    Sessions idle between requests and z.ai anonymous pages occasionally
+    come back dead ('no content'). While NOTHING has been streamed to the
+    client yet, the ask is retried on the next pool session (each retry
+    internally restarts its browser); once chunks are flowing, a failure is
+    surfaced — mid-stream retries would duplicate output.
+    """
+    attempts = max(2, _zai_parallel() + 1)
+    used: set = set()
+    emitted = False
+    last_err: Optional[Exception] = None
+    for attempt in range(attempts):
+        b = _zai_browser()
+        if id(b) in used and attempt < attempts - 1:
+            continue
+        used.add(id(b))
+        try:
+            for chunk in b.ask(prompt, upstream, thinking, no_proxy=no_proxy,
+                               image_paths=image_paths):
+                emitted = True
+                yield chunk
+            return
+        except ProviderError as exc:
+            last_err = exc
+            if emitted:
+                raise
+            logger.warning('z.ai session %d returned no usable stream '
+                           '(%s) — retrying on the next session',
+                           attempt, exc)
+    if last_err is not None:
+        raise last_err
+    raise ProviderError('z.ai browser transport failed')
 
 
 class GlmProvider(Provider):
@@ -775,7 +842,7 @@ class GlmProvider(Provider):
         if not _browser_enabled():
             raise ProviderUnavailableError(
                 'z.ai browser transport is disabled (DSF_ZAI_BROWSER=false)')
-        return _zai_browser().ask(prompt, upstream, thinking, no_proxy=no_proxy)
+        return _zai_ask(prompt, upstream, thinking, no_proxy=no_proxy)
 
     # ------------------------------------------------------------- chatglm.cn
     def _stream_chatglm(self, prompt: str, thinking: bool,

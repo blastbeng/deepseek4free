@@ -444,6 +444,7 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_PROXY_DIRECT` | `true` | Include the no-proxy route in the rotation (`round` mode: direct first) |
 | `DSF_PROXY_ENSURE_TIMEOUT` | `90` | Seconds CLI one-shots wait for the warm-up health pass |
 | `DSF_ZAI_CONTEXT_LENGTH` | `10000` | Prompt budget (tokens) for the z.ai web transport — its browser input silently fails beyond ~40k characters |
+| `DSF_ZAI_PARALLEL` | `1` | Independent z.ai browser sessions (2-4 enable parallel streams; each spawns a Chromium only when requests overlap) |
 
 ---
 
