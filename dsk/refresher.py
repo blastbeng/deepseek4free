@@ -1889,9 +1889,11 @@ def _seed_counts() -> None:
                     entry = json.loads(line)
                 except (ValueError, TypeError):
                     continue
+                reason = str(entry.get('detail', ''))
                 if (entry.get('event') == 'renew-start'
                         and str(entry.get('ts', '')).startswith(today)
-                        and not str(entry.get('detail', '')).startswith('manual')):
+                        and reason not in ('auth', 'inline-auth')
+                        and not reason.startswith('manual')):
                     counts[entry.get('provider', '')] = \
                         counts.get(entry.get('provider', ''), 0) + 1
         for name, n in counts.items():
