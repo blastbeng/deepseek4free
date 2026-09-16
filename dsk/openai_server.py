@@ -695,9 +695,10 @@ async def selfheal_status():
 
 
 @app.post("/selfheal/probe")
-async def selfheal_probe():
+async def selfheal_probe(request: Request):
     """Force a probe cycle now: structural failures trigger LLM auto-patching,
     auth failures trigger credential renewal (on-demand, daemon-independent)."""
+    _check_api_key(request)
     try:
         from . import selfheal as _selfheal
         results = await asyncio.get_running_loop().run_in_executor(
@@ -708,8 +709,9 @@ async def selfheal_probe():
 
 
 @app.post("/selfheal/refresh")
-async def selfheal_refresh():
+async def selfheal_refresh(request: Request):
     """Force a credential refresh cycle now (HTTP cookie/token refresh rung)."""
+    _check_api_key(request)
     try:
         from . import refresher as _refresher
         results = await asyncio.get_running_loop().run_in_executor(

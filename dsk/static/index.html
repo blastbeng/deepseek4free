@@ -161,6 +161,7 @@
   <div class="grow"></div>
   <button id="sbtoggle" title="Toggle chat history">☰</button>
   <button id="regen" title="Regenerate the last reply" disabled>↺ retry</button>
+  <button id="edit" title="Load the last user message back into the composer" disabled>✎ edit</button>
   <button id="export" title="Export conversation as markdown">⬇</button>
   <button id="gear" class="gear" title="Settings">⚙ settings</button>
   <button id="refresh" title="Reload model list">↻ models</button>
@@ -211,8 +212,8 @@
 <footer>
   <div id="thumbs"></div>
   <div id="composer">
-    <button id="attach" title="Attach image(s)">📎</button>
-    <textarea id="prompt" placeholder="Send a message… (Enter to send, Shift+Enter for newline)"></textarea>
+    <button id="attach" title="Attach image(s) — or paste from clipboard">📎</button>
+    <textarea id="prompt" placeholder="Send a message… (Enter to send, Shift+Enter for newline, paste/attach images)"></textarea>
     <button id="stop" class="danger" disabled>■ stop</button>
     <button id="send" class="primary">Send</button>
     <input type="file" id="file" accept="image/*" multiple hidden>
@@ -695,19 +696,18 @@ async function send() {
     content = [{ type: 'text', text: text || 'Describe the image(s).' }];
     for (const url of pendingImages) content.push({ type: 'image_url', image_url: { url: url } });
   }
+  const model = modelInfo[modelSel.value] || {};
+  if (pendingImages.length && model.vision === false) {
+    errorBubble('Model "' + modelSel.value + '" does not support vision — image(s) kept. Pick a 📷-flagged model.', 'client', 'model_does_not_support_vision');
+    return;  // keep pendingImages so the user can switch models and resend
+  }
+
   messages.push({ role: 'user', content });
   const ub = addBubble('user');
   ub.body.textContent = text + (pendingImages.length ? '\n🖼 ' + pendingImages.length + ' image(s)' : '');
   ub.body.dataset.raw = ub.body.textContent;
   persist();
 
-  const model = modelInfo[modelSel.value] || {};
-  if (pendingImages.length && model.vision === false) {
-    pendingImages = []; renderThumbs();
-    messages.pop();
-    errorBubble('Model "' + modelSel.value + '" does not support vision — image(s) dropped. Pick a 📷-flagged model.', 'client', 'model_does_not_support_vision');
-    return;
-  }
   await runCompletion();
 }
 
@@ -831,6 +831,24 @@ $('prompt').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $('prompt').addEventListener('input', autoGrow);
+
+// ---------- clipboard image paste (vision testing without 📎) ----------
+$('prompt').addEventListener('paste', (e) => {
+  const files = Array.from((e.clipboardData && e.clipboardData.files) || [])
+    .filter(f => f.type && f.type.startsWith('image/'));
+  if (!files.length) return;
+  e.preventDefault();
+  let chain = Promise.resolve();
+  for (const f of files) {
+    chain = chain.then(() => new Promise((res) => {
+      const r = new FileReader();
+      r.onload = () => { pendingImages.push(r.result); res(); };
+      r.onerror = res;
+      r.readAsDataURL(f);
+    }));
+  }
+  chain.then(() => { renderThumbs(); persist(); });
+});
 modelSel.addEventListener('change', () => { updateFlags(); persist(); });
 for (const id of ['system', 'temp', 'maxtok', 'search', 'showthink', 'noproxy']) {
   $(id).addEventListener('change', persist);
@@ -872,7 +890,10 @@ function canRegen() {
   return !controller && messages.some(m => m.role === 'user') &&
     messages[messages.length - 1]?.role === 'assistant';
 }
-function refreshRegen() { $('regen').disabled = !canRegen(); }
+function refreshRegen() {
+  $('regen').disabled = !canRegen();
+  $('edit').disabled = !!controller || !messages.some(m => m.role === 'user');
+}
 $('regen').onclick = async () => {
   if (!canRegen()) return;
   while (messages.length && messages[messages.length - 1].role === 'assistant') messages.pop();
@@ -880,6 +901,27 @@ $('regen').onclick = async () => {
   for (const b of bubbles) b.remove();
   persist();
   await runCompletion();
+};
+
+// ---------- edit last user message (tweak + resend) ----------
+$('edit').onclick = () => {
+  if (controller) return;
+  while (messages.length && messages[messages.length - 1].role === 'assistant') messages.pop();
+  for (const b of chat.querySelectorAll('.msg.bot, .msg.error')) b.remove();
+  if (!messages.length || messages[messages.length - 1].role !== 'user') { refreshRegen(); return; }
+  const m = messages.pop();
+  const ubs = chat.querySelectorAll('.msg.user');
+  if (ubs.length) ubs[ubs.length - 1].remove();
+  pendingImages = [];
+  if (Array.isArray(m.content)) {
+    for (const part of m.content) {
+      if (part && part.type === 'image_url' && part.image_url && part.image_url.url)
+        pendingImages.push(part.image_url.url);
+    }
+  }
+  $('prompt').value = typeof m.content === 'string' ? m.content : contentText(m.content);
+  renderThumbs(); autoGrow(); persist(); refreshRegen();
+  $('prompt').focus();
 };
 
 // ---------- export conversation as markdown ----------
