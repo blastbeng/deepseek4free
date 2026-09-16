@@ -45,6 +45,7 @@ from .base import (
     ProviderError,
     ProviderRateLimitError,
     ProviderUnavailableError,
+    provider_enabled,
 )
 from .deepseek_provider import DeepSeekProvider
 from .gemini_provider import GeminiWebProvider
@@ -131,6 +132,7 @@ class Router:
         self.providers: Dict[str, Provider] = {
             name: getattr(importlib.import_module(module, __package__), cls)()
             for name, module, cls in PROVIDER_MODULES
+            if provider_enabled(name)
         }
         self.routes: Dict[str, Route] = {}
         self._lock = threading.Lock()
@@ -138,8 +140,9 @@ class Router:
         # The DeepSeek modes are configuration-derived (no network involved),
         # so the registry is never empty, even before web discovery completes.
         try:
-            self._apply_provider_models(
-                'deepseek', self.providers['deepseek'].list_models())
+            if 'deepseek' in self.providers:
+                self._apply_provider_models(
+                    'deepseek', self.providers['deepseek'].list_models())
             self._apply_fallbacks()
         except Exception as e:  # pragma: no cover - defensive
             logger.warning('deepseek route bootstrap failed: %s', e)

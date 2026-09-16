@@ -54,6 +54,20 @@ logger = logging.getLogger('dsk.providers.base')
 HTTP_CONNECT_TIMEOUT = int(os.getenv('DSF_HTTP_CONNECT_TIMEOUT', '15'))
 
 
+def provider_enabled(name: str) -> bool:
+    """DSF_PROVIDERS allowlist (comma-separated provider names).
+
+    Lets the operator run only a subset of providers (e.g. ``deepseek,glm``)
+    with zero code changes: disabled providers get no routes on /v1/models,
+    no health probes and no credential-bot signup attempts. Empty/unset (or
+    ``all``/``*``) enables every provider.
+    """
+    raw = (os.getenv('DSF_PROVIDERS', '') or '').strip().lower()
+    if not raw or raw in ('all', '*'):
+        return True
+    return name.strip().lower() in {p.strip() for p in raw.split(',') if p.strip()}
+
+
 def _looks_like_network_error(exc: BaseException) -> bool:
     """True for transport-level failures (connect/timeout/proxy/ssl)."""
     name = type(exc).__name__.lower()

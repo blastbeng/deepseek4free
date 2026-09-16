@@ -77,6 +77,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import mailgen
+from .providers.base import provider_enabled
 
 _BASE = Path(__file__).resolve().parent
 
@@ -1021,6 +1022,8 @@ def renew(name: str, reason: str = '') -> Dict[str, Any]:
     """Run the full renewal ladder for one provider. Returns a status dict."""
     if not _env_bool('DSF_REFRESHER', True):
         return {'renewed': False, 'skipped': 'refresher disabled'}
+    if not provider_enabled(name):
+        return {'renewed': False, 'skipped': 'provider disabled (DSF_PROVIDERS)'}
     excl = {e.strip().lower() for e in
             os.getenv('DSF_REFRESHER_EXCLUDE', '').split(',') if e.strip()}
     if name in excl:
@@ -1106,6 +1109,8 @@ def refresh_cycle() -> Dict[str, Any]:
         return {'refresher': 'disabled'}
     out: Dict[str, Any] = {}
     for name in tuple(REFRESH):
+        if not provider_enabled(name):
+            continue  # disabled via DSF_PROVIDERS: no routes, no probes, no bot
         if not _has_creds(name):
             if not _env_bool('DSF_REFRESHER_AUTOSIGNUP', True):
                 out[name] = 'skipped (no credentials, autosignup off)'
@@ -1131,6 +1136,9 @@ def bootstrap_all() -> Dict[str, Any]:
     none (CLI / manual trigger; bypasses the per-provider cooldown)."""
     out: Dict[str, Any] = {}
     for name in REFRESH:
+        if not provider_enabled(name):
+            out[name] = {'renewed': False, 'skipped': 'provider disabled (DSF_PROVIDERS)'}
+            continue
         if _has_creds(name):
             out[name] = {'renewed': False, 'skipped': 'credentials present'}
             continue
@@ -1163,6 +1171,7 @@ def status() -> Dict[str, Any]:
     with _STATE.lock:
         results = dict(_STATE.results)
         started = _STATE.started
+    enabled = [p for p in REFRESH if provider_enabled(p)]
     return {'enabled': _env_bool('DSF_REFRESHER', True),
             'daemon': started,
             'ttl': _ttl(),
@@ -1171,10 +1180,12 @@ def status() -> Dict[str, Any]:
             'autosignup_providers': sorted(SIGNUP),
             'mail_autogen': mailgen.autogen_enabled(),
             'mail_configured': bool(os.getenv('DSF_MAIL_IMAP_HOST', '').strip()),
+            'providers': {'enabled': enabled,
+                          'disabled': [p for p in REFRESH if p not in enabled]},
             'credentials': {p: bool(all(_creds(p))) for p in REFRESH},
             'has_credentials': {p: _has_creds(p) for p in REFRESH},
             'bootstrap': {'enabled': _env_bool('DSF_REFRESHER_AUTOSIGNUP', True),
-                          'missing': [p for p in REFRESH if not _has_creds(p)]},
+                          'missing': [p for p in enabled if not _has_creds(p)]},
             'last_results': results}
 
 

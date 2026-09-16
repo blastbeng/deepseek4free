@@ -74,6 +74,8 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .providers.base import provider_enabled
+
 _BASE = Path(__file__).resolve().parent
 
 # Files the fixer LLM is allowed to rewrite (everything else is off-limits).
@@ -673,7 +675,8 @@ def probe_cycle() -> Dict[str, Dict[str, Any]]:
     excl = {e.strip().lower() for e in
             os.getenv('DSF_SELFHEAL_EXCLUDE', '').split(',') if e.strip()}
     for name in HEALABLE:
-        if name in excl or not _provider_configured(name):
+        if name in excl or not provider_enabled(name) \
+                or not _provider_configured(name):
             results[name] = {'status': 'skipped'}
             continue
         status, detail = _probe_once(name)

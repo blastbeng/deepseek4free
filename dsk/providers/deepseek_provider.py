@@ -80,8 +80,9 @@ class DeepSeekProvider(Provider):
         token = _resolve_token(auth_key)
         if not token:
             raise ProviderAuthError(
-                'No DeepSeek auth token. Set DEEPSEEK_AUTH_TOKEN, provide a '
-                'cookies.json, or send your userToken as the API key.'
+                'No DeepSeek token yet — the credential bot creates one '
+                'automatically (signup -> data/deepseek_token); until then '
+                'requests fall back, or send your userToken as the API key.'
             )
         with self._lock:
             if self._api is None or token != self._api_token:
