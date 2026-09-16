@@ -343,7 +343,16 @@ function addBubble(role) {
   if (role !== 'error') {
     const who = document.createElement('div');
     who.className = 'who';
-    who.textContent = role;
+    who.append(role);
+    if (role === 'bot') {
+      // Server tags every chunk with the provider/model that actually
+      // answered (fallback chains may swap models mid-flight) — shown as a
+      // small badge next to the role so users know which model responded.
+      const modelTag = document.createElement('span');
+      modelTag.className = 'served-by';
+      modelTag.style.cssText = 'margin-left:8px;font-size:11px;opacity:.65';
+      who.appendChild(modelTag);
+    }
     root.appendChild(who);
   }
   if (role === 'bot' || role === 'user') {
@@ -812,6 +821,10 @@ async function runCompletion() {
             { errType: j.error.type, errCode: j.error.code });
         }
         const delta = j.choices?.[0]?.delta || {};
+        if (j.served_by) {
+          const tag = b.root.querySelector('.served-by');
+          if (tag) tag.textContent = '· ' + j.served_by;
+        }
         if (delta.reasoning_content) {
           if (!think.el) think.el = thinkBlock(b.root);
           think.text += delta.reasoning_content;
