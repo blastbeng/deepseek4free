@@ -145,7 +145,16 @@ _RE_CODE_FENCE = re.compile(
 _RE_CODE_HINTS = re.compile(
     r'\b(?:python|javascript|typescript|golang|rust|sql|regex|json|yaml|html|css|'
     r'bug|debug|traceback|exception|compile|refactor|npm|pytest|docker|bash|'
-    r'script|snippet|function|algorithm)\b', re.IGNORECASE)
+    r'script|snippet|function|algorithm|program|code|api|endpoint|database|'
+    r'java|c\+\+|c#|php|swift|kotlin)\b', re.IGNORECASE)
+_RE_CODE_ASK = re.compile(
+    r'\b(?:write|create|fix|debug|refactor|optimize|implement|generate|convert|'
+    r'explain|review)\b[^.?!]{0,80}\b(?:function|script|class|code|program|'
+    r'query|regex|component|endpoint|algorithm)\b', re.IGNORECASE)
+_RE_EXPLAIN_LANG = re.compile(
+    r'\b(?:explain|how)\b[^.?!]{0,60}\b(?:in|with|using)\s+'
+    r'(?:python|javascript|typescript|java|golang|rust|c\+\+|php|sql|bash)\b',
+    re.IGNORECASE)
 _RE_TRANSLATE = re.compile(
     r'\btranslat(?:e|ion|ing)\b|tradu[cz]|\u00fcbersetz|\u7ffb\u8bd1',
     re.IGNORECASE)
@@ -172,7 +181,9 @@ def classify_request(prompt: str, has_images: bool = False,
         return 'translation'
     if _RE_SUMMARIZE.search(text):
         return 'summarize'
-    if _RE_CODE_FENCE.search(text) or len(_RE_CODE_HINTS.findall(text)) >= 2:
+    if (_RE_CODE_FENCE.search(text) or _RE_CODE_ASK.search(text)
+            or _RE_EXPLAIN_LANG.search(text)
+            or len(_RE_CODE_HINTS.findall(text)) >= 2):
         return 'coding'
     return 'general'
 
