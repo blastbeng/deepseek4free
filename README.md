@@ -95,7 +95,7 @@ This is the main addition of this fork. A FastAPI server translates between the 
 - **Tool-calling emulation** — see the next section.
 - **Compatibility** — standard OpenAI parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `frequency_penalty`, `presence_penalty`, `response_format`, `stream_options.include_usage`, …) are accepted; the ones DeepSeek cannot honour are tolerated and ignored, so exotic clients never get validation errors.
 - **Vision & image generation** — models whose provider supports them accept OpenAI-style multimodal `content` parts (`{"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}}`) and are advertised in `/v1/models` via `vision: true` / `image_gen: true` capability flags. Vision-capable models also power `POST /v1/images/generations` (OpenAI Images API shape, `b64_json` responses). DeepSeek web chat is text-only — sending images to it returns `400 model_does_not_support_vision`; Gemini-web and ChatGPT-web models support both when configured.
-- **Per-request direct connection** — non-standard `disable_proxy: true` (top level of the request body, chat and image-generation endpoints) forces the request to skip Tor and the rotating proxy pool and connect directly. Handy for low-latency testing when you don't want a random free proxy in the path.
+- **Per-request direct connection** — non-standard `disable_proxy: true` (top level of the request body, chat and image-generation endpoints) forces the request to skip the rotating proxy pool and connect directly. Handy for low-latency testing when you don't want a random free proxy in the path.
 
 ### 6. Tool calling (agent coding)
 
@@ -425,9 +425,7 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_FALLBACKS` | *(none)* | JSON map of per-model fallback chains, e.g. `{"deepseek-chat": ["deepseek-reasoner"]}` |
 | `DSF_DEFAULT_FALLBACKS` | *(none)* | Comma-separated fallbacks applied to every route |
 | `COOKIES_DIR` | *(none)* (Docker: `/data`) | Directory where provider cookie files are persisted |
-| `DSF_PROXY_TOR` | `false` | Route provider traffic through the local Tor SOCKS5 proxy |
-| `DSF_PROXY_TOR_URL` | `socks5h://torproxy:9050` | Tor proxy URL (docker-network service name) |
-| `DSF_PROXY` / `DSF_PROXIES` | *(none)* | Single / comma-separated proxy URLs |
+| `DSF_PROXY` / `DSF_PROXIES` | *(none)* | Single / comma-separated proxy URLs (always in the pool) |
 | `DSF_PROXY_LIST_URL` | *(none)* | URL fetching a dynamic proxy list (text/JSON), TTL-refreshed |
 | `DSF_PROXY_LIST_TTL` | `3600` | Seconds between dynamic proxy list refreshes |
 | `DSF_PROXY_MODE` | `random` | Proxy selection: `random`, `round`, or `single` |
@@ -442,6 +440,10 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_PROXY_CHECK_TTL` | `1800` | Healthy-lease duration / re-check interval |
 | `DSF_PROXY_CHECK_TIMEOUT` | `8` | Per-probe timeout in seconds |
 | `DSF_PROXY_CHECK_CONCURRENCY` | `24` | Concurrent health probes |
+| `DSF_PROXY_MAX_LATENCY` | `1200` | ms — only proxies answering this fast get traffic (fast-only rotation) |
+| `DSF_PROXY_DIRECT` | `true` | Include the no-proxy route in the rotation (`round` mode: direct first) |
+| `DSF_PROXY_ENSURE_TIMEOUT` | `90` | Seconds CLI one-shots wait for the warm-up health pass |
+| `DSF_ZAI_CONTEXT_LENGTH` | `10000` | Prompt budget (tokens) for the z.ai web transport — its browser input silently fails beyond ~40k characters |
 
 ---
 
@@ -507,34 +509,30 @@ You only need this when you see Cloudflare challenges, your `cf_clearance` cooki
 All outbound provider traffic can be routed through one or more **outbound proxies** to spread requests across exit IPs and soften per-IP rate limiting. Configure in `.env`:
 
 ```bash
-# Use the local Tor proxy (the compose file attaches the container to the
-# shared "ai-mcp" docker network where the torproxy container runs):
-DSF_PROXY_TOR=true
-
-# Or any single proxy / comma-separated list:
-DSF_PROXY=socks5h://torproxy:9050
+# Any single proxy / comma-separated list (always kept in the pool):
+DSF_PROXY=socks5://1.2.3.4:1080
 DSF_PROXIES=socks5://1.2.3.4:1080,http://5.6.7.8:8080
 
 # FULLY DYNAMIC: automatically aggregate public free-proxy lists from the web
 # (TheSpeedX, monosans, proxifly, proxyscrape, roosterkid, geonode — verified
-# working sources), refreshed every 30 min and randomly sampled to 250:
+# working sources), refreshed every 30 min and randomly sampled to 400:
 DSF_PROXY_AUTO=true
-DSF_PROXY_MAX_POOL=250
+DSF_PROXY_MAX_POOL=400
 # Optional custom sources ("socks5=<url>" sets the scheme):
 DSF_PROXY_SOURCES=socks5=https://example.com/socks5.txt
 # Optional extra list URL(s) (plain text or JSON):
 DSF_PROXY_LIST_URL=https://example.com/proxy-list.txt
 ```
 
-**Health checking** (`DSF_PROXY_CHECK=true`) — strongly recommended with free lists, where typically only ~10% of published proxies are alive at any moment: a background worker probes every pooled proxy concurrently and traffic only uses the ones that answer. Combined with `DSF_PROXY_COOLDOWN`, a proxy that dies mid-session is skipped and traffic falls back to direct, so a dead pool never breaks the service.
+**Health checking** (`DSF_PROXY_CHECK=true`) — strongly recommended with free lists, where typically only ~10% of published proxies are alive at any moment: a background worker probes every pooled proxy concurrently and **only proxies that answer within `DSF_PROXY_MAX_LATENCY` (1200 ms) receive traffic** — slow exits never slow down responses. Combined with `DSF_PROXY_COOLDOWN`, a proxy that dies mid-session is skipped and traffic falls back to direct, so a dead pool never breaks the service.
 
-Selection is `random` by default (`DSF_PROXY_MODE=round|single` also available). A proxy that fails is put on cooldown (`DSF_PROXY_COOLDOWN`, 120s) and traffic falls back to direct, so a dead proxy never breaks the service. Providers that misbehave behind proxies (e.g. bot-protection false positives) can be pinned to direct with `DSF_PROXY_EXCLUDE=deepseek`.
+**Selection is `random` by default** (`DSF_PROXY_MODE=round|single` also available). The no-proxy route is a first-class rotation candidate (`DSF_PROXY_DIRECT=true`); in `round` mode the direct route comes first. A proxy that fails is put on cooldown (`DSF_PROXY_COOLDOWN`, 120s). Providers that misbehave behind proxies (e.g. bot-protection false positives) can be pinned to direct with `DSF_PROXY_EXCLUDE=deepseek`.
 
 **Per-provider randomization:** every provider (`deepseek`, `gemini`, `chatgpt`, …) gets its *own* proxy, chosen randomly and — while the pool is large enough — distinct from the proxies already used by the other providers, so concurrent providers are spread across different exit IPs instead of hammering one shared proxy. Each assignment is sticky for `DSF_PROXY_ROTATE_TTL` seconds (default 300), then the provider is re-randomized; a runtime failure releases the assignment immediately so the next request picks a fresh random proxy. `GET /health` reports current assignments (`assigned=deepseek->1.2.3.4:8080,...`).
 
-Sanity-check your setup from the host: `DSF_PROXY_TOR=true DSF_PROXY_TOR_URL=socks5h://127.0.0.1:9050 python -m dsk.proxies` — it prints each proxy and the exit IP it reaches.
+Short-lived CLI one-shots (`python -m dsk.refresher …`) start with an empty pool; `ensure_pool()` refreshes the sources and awaits one bounded health pass (`DSF_PROXY_ENSURE_TIMEOUT`, 90 s) so the first ladder already draws fast, validated exits.
 
-> Note: DeepSeek rate limits are mostly **per-account**, so Tor helps most for the Gemini/ChatGPT web providers and for IP-level throttling. Tor exit nodes are also sometimes blocked by bot protection — use `DSF_PROXY_EXCLUDE` to tune per provider.
+Sanity-check your setup from the host: `python -m dsk.proxies` — it prints each pooled proxy and the exit IP it reaches.
 
 ---
 
