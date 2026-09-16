@@ -72,7 +72,6 @@ import threading
 import time
 from datetime import date, datetime, timezone
 from email import message_from_bytes
-from email.header import decode_header
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 

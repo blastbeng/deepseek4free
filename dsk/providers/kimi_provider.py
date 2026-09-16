@@ -22,7 +22,7 @@ import logging
 import os
 import struct
 import uuid
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional
 
 from .base import (
     Provider,

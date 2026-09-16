@@ -24,7 +24,6 @@ import random
 import secrets
 import string
 import urllib.parse
-import uuid
 from typing import Any, Dict, Generator, List, Optional
 
 from .base import (

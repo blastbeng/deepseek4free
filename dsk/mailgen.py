@@ -34,7 +34,7 @@ import secrets
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 MAILTM_API = 'https://api.mail.tm'
 MAILGW_API = 'https://api.mail.gw'
