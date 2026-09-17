@@ -1684,13 +1684,13 @@ def signup_qwen() -> Tuple[bool, str]:
         raw = list(_proxies.all_proxies())
         random.shuffle(raw)
         import requests as _rq
-        for cand in raw[:8]:
+        for cand in raw[:24]:
             if len(ladder) >= 4:
                 break
             if cand in ladder:
                 continue
             try:
-                _rq.get('https://chat.qwen.ai/', timeout=8,
+                _rq.get('https://chat.qwen.ai/', timeout=12,
                         proxies={'http': cand, 'https': cand},
                         headers={'User-Agent': _UA})
                 ladder.append(cand)

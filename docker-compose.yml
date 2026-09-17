@@ -60,6 +60,11 @@ services:
       - QWEN_UMID=${QWEN_UMID:-}
       - QWEN_BX_UA=${QWEN_BX_UA:-}
       - QWEN_COOKIES=${QWEN_COOKIES:-}
+      # Operator seed for the qwen renewal rungs (HTTP re-login, no browser):
+      # register once at chat.qwen.ai and set these — renewals are then fully
+      # automatic. Without them the signup rung (Aliyun slider) is the only path.
+      - QWEN_LOGIN_EMAIL=${QWEN_LOGIN_EMAIL:-}
+      - QWEN_LOGIN_PASSWORD=${QWEN_LOGIN_PASSWORD:-}
       - KIMI_TOKEN=${KIMI_TOKEN:-}
       - KIMI_COOKIES=${KIMI_COOKIES:-}
       - COPILOT_COOKIES=${COPILOT_COOKIES:-}

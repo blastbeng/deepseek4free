@@ -414,6 +414,7 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `GROK_SSO` | *(none)* | `sso` cookie from `grok.com` (enables the Grok web provider) |
 | `MISTRAL_SESSION_TOKEN` | *(none)* | `session_token` cookie from `chat.mistral.ai` (**required** — anonymous access is account-gated) |
 | `QWEN_TOKEN` | *(none)* | Bearer token from `chat.qwen.ai` (enables the Qwen web provider) |
+| `QWEN_LOGIN_EMAIL` / `QWEN_LOGIN_PASSWORD` | *(none)* | Operator seed: enables fully automatic qwen re-login on every renewal cycle (preferred over `QWEN_TOKEN`) |
 | `QWEN_UMID` / `QWEN_BX_UA` | *(bundled)* | Override Qwen's anti-bot fingerprint headers if upstream changes them |
 | `KIMI_TOKEN` | *(none)* | `token` cookie from `kimi.com` (enables the Kimi web provider) |
 | `COPILOT_COOKIES` | *(none)* | Cookie jar JSON for `copilot.microsoft.com` (anonymous works without it) |
@@ -494,6 +495,8 @@ GEMINI_LOGIN_EMAIL=
 GEMINI_LOGIN_PASSWORD=
 CHATGPT_LOGIN_EMAIL=
 CHATGPT_LOGIN_PASSWORD=
+QWEN_LOGIN_EMAIL=              # register once at chat.qwen.ai; re-login is then automatic
+QWEN_LOGIN_PASSWORD=
 ```
 
 ---
