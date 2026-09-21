@@ -171,6 +171,49 @@
     header h1 span { display: none; }
     #health { max-width: 34vw; }
   }
+
+  /* ---------- providers (operator / credentials) panel ---------- */
+  #providers { width: min(520px, 94vw); border-right: 1px solid var(--border);
+               background: var(--panel); padding: 14px;
+               display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+  #provclose { display: none; font-size: 14px; line-height: 1; padding: 6px 10px; }
+  #providers .ph { display: flex; align-items: center; gap: 8px; justify-content: space-between; flex-wrap: wrap; }
+  #providers .ph h2 { margin: 0; font-size: 13px; }
+  .prov { border: 1px solid var(--border); border-radius: 10px; padding: 10px;
+          background: #0d111788; display: flex; flex-direction: column; gap: 8px; }
+  .prov .phead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .prov .pname { font-weight: 600; font-size: 13px; }
+  .prov .pstat { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .prov .pmeta { font-size: 11px; color: var(--muted); }
+  .prov .pactions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .prov .pactions button { padding: 3px 9px; font-size: 12px; }
+  .prov .presult { font-size: 11px; color: var(--muted); max-height: 76px;
+                   overflow-y: auto; font-family: var(--mono);
+                   border: 1px dashed var(--border); border-radius: 6px; padding: 6px 8px;
+                   white-space: pre-wrap; word-break: break-word; }
+  .prov .presult.ok { color: var(--ok); border-color: #3fb95077; }
+  .prov .presult.err { color: var(--err); border-color: #f8514977; }
+  .prov .pcreds { display: flex; flex-direction: column; gap: 6px;
+                  border-top: 1px dashed var(--border); padding-top: 8px; }
+  .kvrow { display: flex; gap: 6px; align-items: center; }
+  .kvrow .k { width: 160px; font-size: 12px; color: var(--muted); overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; }
+  .kvrow input { flex: 1; font-size: 12px; font-family: var(--mono);
+                 background: #0a0d12; border: 1px solid var(--border);
+                 border-radius: 6px; padding: 4px 8px; color: var(--text); }
+  .kvrow .del { padding: 1px 8px; font-size: 11px; line-height: 18px; }
+  .pcreds .addkv { font-size: 12px; color: var(--accent); background: none;
+                   border: 1px dashed var(--accent); border-radius: 6px;
+                   padding: 3px 8px; cursor: pointer; align-self: flex-start; }
+  .pcreds .savecreds { align-self: flex-end; }
+  .prov .pcredshint { font-size: 11px; color: var(--muted); }
+  @media (max-width: 760px) {
+    #providers { left: 0; right: auto; width: min(360px, 92vw);
+                 transform: translateX(-105%); transition: transform .18s ease;
+                 box-shadow: 10px 0 30px #000a; border-right: 0; }
+    #providers.open { transform: none; }
+    #provclose { display: inline-block; }
+  }
 </style>
 </head>
 <body>
@@ -180,6 +223,7 @@
   <span id="flags"></span>
   <span id="health" class="badge wait" title="GET /health">health…</span>
   <div class="grow"></div>
+  <button id="provtoggle" title="Providers — status, auto-renew, credentials">🛠 providers</button>
   <button id="sbtoggle" title="Toggle chat history">☰</button>
   <button id="regen" title="Regenerate the last reply" disabled>↺ retry</button>
   <button id="edit" title="Load the last user message back into the composer" disabled>✎ edit</button>
@@ -190,6 +234,27 @@
 </header>
 <main>
   <div id="backdrop" hidden></div>
+  <aside id="providers">
+    <div class="ph">
+      <h2 title="Providers: status · auto-renew · credentials">🛠 Providers</h2>
+      <button id="provclose" title="Close providers">✕</button>
+    </div>
+    <div class="pactions" style="gap:8px">
+      <button id="proverefresh" class="primary" title="Reload provider status from /providers">↻ reload</button>
+      <button id="provallrenew" title="Trigger the full credential-refresh cycle for every enabled provider">
+        ⟳ renew all</button>
+      <span id="provallstatus" class="badge">idle</span>
+    </div>
+    <div id="provlist" style="display:flex;flex-direction:column;gap:10px">
+      <div class="prov">loading providers…</div>
+    </div>
+    <div style="font-size:11px;color:var(--muted)">
+      Token = session/jwt token · cookies = raw browser cookies · login = account email/password
+      used by the auto-renew bot. Values saved here are the SAME stores the bot uses, so they
+      take effect immediately and renew automatically on the next cycle. Use <b>Clear</b> to wipe
+      a provider's saved credentials.
+    </div>
+  </aside>
   <aside id="sidebar">
     <button id="newchat" class="primary">＋ New chat</button>
     <div id="chatlist"></div>
@@ -878,11 +943,13 @@ const isSidebarMobile = () => window.matchMedia('(max-width: 900px)').matches;
 function syncBackdrop() {
   $('backdrop').hidden =
     !(isMobile() && $('settings').classList.contains('open')) &&
-    !(isSidebarMobile() && $('sidebar').classList.contains('open'));
+    !(isSidebarMobile() && $('sidebar').classList.contains('open')) &&
+    !(isMobile() && $('providers').classList.contains('open'));
 }
 function closeMobileOverlays() {
   $('settings').classList.remove('open');
   $('sidebar').classList.remove('open');
+  $('providers').classList.remove('open');
   syncBackdrop();
 }
 $('gear').onclick = () => {
@@ -1050,6 +1117,286 @@ refreshEmpty();
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeMobileOverlays();
 });
+
+// ================= Providers (status + auto-renew + credentials) ===========
+
+const prov = $('providers');
+const provList = $('provlist');
+const provAllS = $('provallstatus');
+
+async function provFetch(url, opts) {
+  const r = await fetch(url, opts || {});
+  const text = await r.text();
+  let body;
+  try { body = text ? JSON.parse(text) : {}; } catch { body = text || ''; }
+  return { ok: r.ok, code: r.status, body };
+}
+function provEl(tag, cls, text, title) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  if (title) e.title = title;
+  return e;
+}
+function provResultText(ok, code, body) {
+  const head = ok ? '' : ('HTTP ' + code + '\n');
+  try { return head + JSON.stringify(body, null, 2); }
+  catch { return head + String(body); }
+}
+function provRow(name, value, type, title, delBtn) {
+  const row = provEl('div', 'kvrow');
+  const k = provEl('span', 'k', name, title || name);
+  const inp = document.createElement('input');
+  inp.type = type || 'text';
+  inp.autocomplete = 'off';
+  inp.spellcheck = false;
+  inp.dataset.k = name;
+  inp.value = value || '';
+  row.append(k, inp);
+  if (delBtn) {
+    const del = provEl('button', 'del', '✕', 'remove');
+    del.onclick = () => row.remove();
+    row.append(del);
+  }
+  return { row, inp };
+}
+
+async function renderProviders() {
+  provList.innerHTML = '';
+  const box = provEl('div', 'prov', 'loading providers…');
+  provList.append(box);
+  const { ok, code, body } = await provFetch('/providers');
+  provList.innerHTML = '';
+  if (!ok) {
+    provList.append(provEl('div', 'prov', 'failed (HTTP ' + code + '): ' +
+      (typeof body === 'object' ? JSON.stringify(body) : body)));
+    return;
+  }
+  const providers = (body && body.providers) || [];
+  if (!providers.length) {
+    provList.append(provEl('div', 'prov', 'no providers configured'));
+    return;
+  }
+  for (const provider of providers) {
+    const el = provEl('div', 'prov');
+    el.dataset.name = provider.name;
+
+    // head: name + enabled badge + credential kind badge
+    const head = document.createElement('div'); head.className = 'phead';
+    head.append(provEl('span', 'pname', provider.name));
+    const enabled = provEl('span', 'badge' + (provider.enabled ? ' on' : ''),
+      provider.enabled ? 'enabled' : 'disabled',
+      'Enabled on this instance (DSF_PROVIDERS)');
+    head.append(enabled);
+    const cp = provider.creds_present || {};
+    const kinds = [cp.token && 'token', cp.cookies && 'cookies', cp.login && 'login']
+      .filter(Boolean).join('· ') || 'none';
+    const kindB = provEl('span', 'badge' + ((cp.token || cp.cookies || cp.login) ? ' on' : ''),
+      kinds, 'Stored credential kind(s)');
+    kindB.dataset.role = 'kinds';
+    head.append(kindB);
+    if (provider.models && provider.models.length) {
+      const mb = provEl('span', 'badge', provider.models.length + ' models');
+      mb.title = provider.models.join('\n');
+      head.append(mb);
+    }
+    el.append(head);
+
+    // refresh just this card's credential-kind badge after an action, without
+    // rebuilding the list (which would wipe the result message the user is reading)
+    const refreshKinds = async () => {
+      try {
+        const d = await provFetch('/providers');
+        const list = (d.body && d.body.providers) || [];
+        const np = list.find(x => x.name === provider.name);
+        if (!np) return;
+        const c = np.creds_present || {};
+        const k = [c.token && 'token', c.cookies && 'cookies', c.login && 'login']
+          .filter(Boolean).join('· ') || 'none';
+        kindB.textContent = k;
+        kindB.className = 'badge' + ((c.token || c.cookies || c.login) ? ' on' : '');
+      } catch (_e) { /* keep old badge */ }
+    };
+
+    // actions + result area
+    const acts = document.createElement('div'); acts.className = 'pactions';
+    const result = provEl('div', 'presult', '');
+    result.style.display = 'none';
+
+    const setBusy = (btn, on) => { btn.disabled = on; };
+    const show = (cls, text) => {
+      result.style.display = 'block';
+      result.className = 'presult ' + (cls || '');
+      result.textContent = text;
+    };
+
+    const testBtn = provEl('button', '', '↗ test', 'Quick credential check (probe, ~5-15 s)');
+    testBtn.onclick = async () => {
+      setBusy(testBtn, true); show('', 'running probe…');
+      let r;
+      try { r = await provFetch('/providers/' + provider.name + '/test', { method: 'POST' }); }
+      catch (e) { r = { ok: false, code: 0, body: String(e) }; }
+      setBusy(testBtn, false);
+      const ok2 = r.ok && r.body && r.body.status === 'ok'
+        && (!r.body.token_check || r.body.token_check === 'ok');
+      show(ok2 ? 'ok' : 'err', provResultText(r.ok, r.code, r.body));
+      await refreshKinds();
+    };
+
+    const renewBtn = provEl('button', 'primary', '⟳ renew', 'Full ladder: HTTP refresh → browser login → auto-signup (30-120 s)');
+    renewBtn.onclick = async () => {
+      setBusy(renewBtn, true); show('', 'renewing (up to ~2 min)…');
+      let r;
+      try { r = await provFetch('/providers/' + provider.name + '/renew', { method: 'POST' }); }
+      catch (e) { r = { ok: false, code: 0, body: String(e) }; }
+      setBusy(renewBtn, false);
+      const rr = (r.body && r.body.result) || r.body || {};
+      const ok2 = r.ok && rr.renewed === true;
+      show(ok2 ? 'ok' : 'err', provResultText(r.ok, r.code, r.body));
+      await refreshKinds();
+    };
+
+    const credsBtn = provEl('button', '', '🔑 creds', 'Show / edit stored credentials');
+    const clearBtn = provEl('button', '', '🗑', "Clear stored credentials (token / cookies / login)");
+    clearBtn.onclick = async () => {
+      if (!confirm('Clear stored credentials for ' + provider.name + '?')) return;
+      let r;
+      try { r = await provFetch('/providers/' + provider.name + '/credentials/clear', { method: 'POST' }); }
+      catch (e) { r = { ok: false, code: 0, body: String(e) }; }
+      show(r.ok ? 'ok' : 'err', provResultText(r.ok, r.code, r.body));
+      if (r.ok) { const pcr = el.querySelector('.pcreds'); if (pcr) pcr.remove(); }
+      await refreshKinds();
+    };
+
+    credsBtn.onclick = async () => {
+      const existing = el.querySelector('.pcreds');
+      if (existing) { existing.remove(); return; }
+      const det = await provFetch('/providers/' + provider.name);
+      const box = document.createElement('div'); box.className = 'pcreds';
+      box.append(provEl('div', 'pcredshint',
+        'Leave fields blank to keep their current value; fill them to replace. After save, a quick verify runs.'));
+
+      // token
+      if (provider.token_field && provider.token_field.key) {
+        const tk = (det.body && det.body.token) || {};
+        const ph = tk.masked ? '••• (stored, tail ' + tk.masked + ')' : (provider.token_field.env || '');
+        provider._tokenPlaceholder = ph;
+        provider._tokenHint = 'Stored ' + (tk.set ? '✓' : '·') + ' · env: ' + (provider.token_field.env || 'n/a');
+      }
+      const kvHolder = document.createElement('div');
+      kvHolder.style.cssText = 'display:flex;flex-direction:column;gap:6px';
+
+      const rows = [];
+
+      // token row (if any)
+      if (provider.token_field && provider.token_field.key) {
+        const r = provRow(provider.token_field.key, '', 'password', provider._tokenHint, true);
+        r.inp.placeholder = provider._tokenPlaceholder || '';
+        kvHolder.append(r.row); rows.push({ kind: 'token', inp: r.inp });
+      }
+
+      // kv holder for cookies
+      const addCookieRow = (name, initialValue) => {
+        const r = provRow(name, initialValue || '', 'password');
+        kvHolder.append(r.row);
+        rows.push({ kind: 'cookie', name, inp: r.inp });
+      };
+      const cookieNames = (provider.cookie_fields || [])
+        .filter(n => !(provider.token_field && provider.token_field.key === n));
+      for (const n of cookieNames) addCookieRow(n);
+      const addBtn = provEl('button', 'addkv', '＋ add cookie');
+      addBtn.onclick = () => {
+        const name = prompt('cookie name:');
+        if (!name) return;
+        const r = provRow(name, '', 'password');
+        kvHolder.append(r.row);
+        rows.push({ kind: 'cookie', name, inp: r.inp });
+      };
+      kvHolder.append(addBtn);
+      box.append(kvHolder);
+
+      // email/password
+      const emailRow = provRow('email', (det.body && det.body.login_email) || '', 'text',
+        'Login email (bot uses this to re-sign-in when the token expires)', true);
+      const passRow  = provRow('password', '', 'password', 'Login password (leave blank to keep stored)', true);
+      box.append(emailRow.row); box.append(passRow.row);
+      rows.push({ kind: 'email', inp: emailRow.inp });
+      rows.push({ kind: 'password', inp: passRow.inp });
+
+      // save row
+      const saveRow = document.createElement('div'); saveRow.className = 'kvrow';
+      saveRow.style.borderColor = 'transparent';
+      const saveBtn = provEl('button', 'primary savecreds', '💾 save', 'Save + verify');
+      saveBtn.onclick = async () => {
+        const payload = {};
+        if (provider.token_field && provider.token_field.key) {
+          const tk = rows.find(r => r.kind === 'token');
+          if (tk && tk.inp.value) payload.token = tk.inp.value;
+        }
+        const cookies = {};
+        for (const r of rows) if (r.kind === 'cookie' && r.inp.value) cookies[r.name] = r.inp.value;
+        if (Object.keys(cookies).length) payload.cookies = cookies;
+        const emailV = rows.find(r => r.kind === 'email').inp.value;
+        const passV = rows.find(r => r.kind === 'password').inp.value;
+        if (emailV) payload.email = emailV;
+        if (emailV && passV) payload.password = passV;
+
+        saveBtn.disabled = true;
+        show('', 'saving…');
+        let r;
+        try {
+          r = await provFetch('/providers/' + provider.name + '/credentials', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+        } catch (e) { r = { ok: false, code: 0, body: String(e) }; }
+        saveBtn.disabled = false;
+        const body = r.body || {};
+        const ok2 = r.ok && body.saved !== false
+          && (!body.token_check || body.token_check === 'ok');
+        show(ok2 ? 'ok' : 'err', provResultText(r.ok, r.code, r.body));
+        if (r.ok) box.remove();
+        await refreshKinds();
+      };
+      const cancelBtn = provEl('button', '', '✕ cancel', 'Hide creds editor');
+      cancelBtn.onclick = () => box.remove();
+      saveRow.append(cancelBtn, saveBtn);
+      box.append(saveRow);
+      el.append(box);
+    };
+
+    acts.append(testBtn, renewBtn, credsBtn, clearBtn);
+    el.append(acts);
+    el.append(result);
+    provList.append(el);
+  }
+}
+function provOpen() {
+  if (prov.classList.contains('open')) prov.classList.remove('open');
+  else {
+    prov.classList.add('open');
+    if (!prov.dataset.loaded) { prov.dataset.loaded = '1'; renderProviders(); }
+  }
+  syncBackdrop();
+}
+function provAllRenew() {
+  const b = $('provallrenew');
+  b.disabled = true; provAllS.textContent = 'running…';
+  provFetch('/providers/renew-all', { method: 'POST' })
+    .then(r => {
+      provAllS.textContent = r.ok ? 'done (ok)' : ('HTTP ' + r.code);
+      provAllS.className = 'badge ' + (r.ok ? 'on' : '');
+    })
+    .catch(e => { provAllS.textContent = String(e).slice(0, 60); })
+    .finally(() => { b.disabled = false; renderProviders(); });
+}
+$('provtoggle').onclick = provOpen;
+$('provclose').onclick  = () => { prov.classList.remove('open'); syncBackdrop(); };
+$('provallrenew').onclick = provAllRenew;
+$('proverefresh').onclick = () => {
+  $('proverefresh').disabled = true;
+  renderProviders().finally(() => { $('proverefresh').disabled = false; });
+};
 
 restoreAll();
 loadModels();

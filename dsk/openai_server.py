@@ -723,6 +723,307 @@ async def selfheal_refresh(request: Request):
     return {"refreshed": results}
 
 
+# ---------------------------------------------------------------------------
+# Provider management — operators UI (playground "providers" panel)
+#
+#   GET  /providers                       every provider: status, credentials,
+#                                         credential schema, models, last result
+#   POST /providers/{name}/credentials/clear
+#                                         wipe a provider's stored credentials
+#   POST /providers/renew-all             proactive refresh cycle for all
+#   GET  /providers/{name}                one provider (masked credentials)
+#   POST /providers/{name}/test           light live credential check (probe)
+#   POST /providers/{name}/renew          full renewal ladder, manual (bypasses
+#                                         the daemon's daily attempt budget)
+#   POST /providers/{name}/credentials    save token / cookie kv / email+pass
+#   POST /providers/renew-all             proactive refresh cycle for all
+#
+# Credentials are the SAME stores the credential bot uses (dsk/refresher.py),
+# so values saved here renew automatically and manual values override the bot.
+# ---------------------------------------------------------------------------
+
+# token -> (jar key, env-var name); cookie kv -> jar keys that are actually
+# read by the provider (so the UI offers the relevant field, not all 200
+# cookies from a pasted browser dump)
+_TOKEN_FIELDS: Dict[str, Tuple[str, str]] = {
+    'claude': ('sessionKey', 'CLAUDE_SESSION_KEY'),
+    'grok': ('sso', 'GROK_SSO'),
+    'kimi': ('token', 'KIMI_TOKEN'),
+    'mistral': ('session_token', 'MISTRAL_SESSION_TOKEN'),
+    'qwen': ('token', 'QWEN_TOKEN'),
+}
+_COOKIE_FIELDS: Dict[str, List[str]] = {
+    'deepseek': ['userToken', 'cf_clearance'],
+    'gemini': ['__Secure-1PSID', '__Secure-1PSIDTS'],
+    'chatgpt': ['accessToken'],
+    'claude': ['sessionKey', 'claude-statsig', 'claude-project-key'],
+    'grok': ['sso', 'sso-rw', 'grok-csrf-token'],
+    'kimi': ['token', 'jwt'],
+    'mistral': ['session_token', 'stable_anon_id'],
+    'qwen': ['token'],
+    'copilot': ['__Host-copilot-anon', 'MUID', '_EDGE_S', 'uaid', 'ANONID'],
+    'perplexity': ['pp_session', 'pp_theme', 'perplexity.csrf-token', 'cf_clearance'],
+    'glm': ['refresh_token', 'zai_token'],
+}
+
+_CRED_MASK = '__stored__'   # placeholder: value present (masked), do NOT clear
+
+
+# ---------------------------------------------------------------- qwen token
+
+def _qwen_auth_probe(timeout: float = 12.0) -> Any:
+    """Direct HTTP check of the chat.qwen.ai session token.
+
+    Returns 'ok' | 'unauth' | 'unreachable' — used to give an honest verify
+    after a credential save (qwen's list_models is static, so a plain probe
+    would pass with ANY non-empty token)."""
+    try:
+        import requests
+        from .providers import qwen_provider as qp
+        from .providers.base import proxy_kwargs_for
+        token = (qp._token() or '').strip()
+        if not token:
+            return 'unauth'
+        r = requests.get('https://chat.qwen.ai/api/v1/auths',
+                         headers={**qp._headers(), 'Authorization': f'Bearer {token}'},
+                         timeout=timeout,
+                         **proxy_kwargs_for('https://chat.qwen.ai', no_proxy=True))
+        if r.status_code == 200:
+            return 'ok'
+        if r.status_code in (401, 403):
+            return 'unauth'
+        return f'http{r.status_code}'
+    except Exception as exc:  # network unreachable etc.
+        return f'unreachable: {exc.__class__.__name__}'
+
+
+# The jar files the credential bot and the providers share are the SAME ones
+# written here (dsk/refresher.py + dsk/providers/jar.py), so values saved in
+# the UI are picked up live — no restart, and the bot renews them afterwards.
+
+
+def _resolve_provider(name: str) -> str:
+    """Return a canonical provider name or raise 404 for unknown ones."""
+    from . import refresher as _refresher
+    names = set(_refresher.REFRESH)
+    if name not in names:
+        raise HTTPException(status_code=404, detail=f'unknown provider: {name}')
+    return name
+
+
+@app.get("/providers")
+async def list_providers(request: Request):
+    from . import refresher as _refresher
+    from .providers.base import provider_enabled
+    out: List[Dict[str, Any]] = []
+    for name in list(_refresher.REFRESH):
+        p_enabled = provider_enabled(name)
+        entry: Dict[str, Any] = {
+            'name': name,
+            'enabled': p_enabled,
+            'has_credentials': _refresher._has_creds(name),
+            'token_field': {'key': _TOKEN_FIELDS[name][0], 'env': _TOKEN_FIELDS[name][1]}
+            if name in _TOKEN_FIELDS else None,
+            'cookie_fields': _COOKIE_FIELDS.get(name, []),
+            'login_email': (_refresher._creds(name)[0] or '').strip(),
+        }
+        # last result
+        last = _refresher._STATE.results.get(name)
+        if last:
+            entry['last'] = last
+        # credential presence (which fields are populated)
+        try:
+            jar = _refresher._load_jar(name)
+            tk = (_TOKEN_FIELDS.get(name) or ('',''))[0]
+            entry['creds_present'] = {
+                'token': bool(jar.get(tk)) if tk else False,
+                'cookies': bool([k for k in jar if k in _COOKIE_FIELDS.get(name, [])]),
+                'login': bool(_refresher._creds(name)[0]),
+            }
+        except Exception:
+            entry['creds_present'] = {'token': False, 'cookies': False, 'login': False}
+        # models for this provider
+        models = [r.model_id for r in ROUTER.routes.values()
+                  if r.provider_name == name]
+        entry['models'] = sorted(models)
+        out.append(entry)
+    return {"providers": out}
+
+
+@app.post("/providers/renew-all")
+async def providers_renew_all(request: Request):
+    """Proactive refresh cycle for every enabled provider (same as the daemon
+    loop). Also bootstraps providers with no credentials via auto-signup."""
+    _check_api_key(request)
+    from . import refresher as _refresher
+    results = await asyncio.get_running_loop().run_in_executor(
+        None, _refresher.refresh_cycle)
+    return {"refreshed": results}
+
+
+@app.get("/providers/{name}")
+async def provider_detail(name: str, request: Request):
+    _check_api_key(request)
+    from . import refresher as _refresher
+    canonical = _resolve_provider(name)
+    jar = _refresher._load_jar(canonical)
+    token_key = (_TOKEN_FIELDS.get(canonical) or ('',''))[0]
+    out: Dict[str, Any] = {
+        'name': canonical,
+        'token_field': {'key': _TOKEN_FIELDS[canonical][0], 'env': _TOKEN_FIELDS[canonical][1]}
+        if canonical in _TOKEN_FIELDS else None,
+        'cookie_fields': _COOKIE_FIELDS.get(canonical, []),
+        'login_email': (_refresher._creds(canonical)[0] or ''),
+        'has_credentials': _refresher._has_creds(canonical),
+        'token': {  # masked: show the tail only, so the user sees it is set
+            'set': bool(jar.get(token_key)) if token_key else False,
+            'masked': (jar.get(token_key, '')[-8:] or '') if jar.get(token_key) else '',
+        },
+        'cookies': {  # only the relevant fields, values masked (last 6)
+            **{k: bool(jar.get(k)) for k in _COOKIE_FIELDS.get(canonical, [])},
+        },
+    }
+    # last renewal/probe result
+    last = _refresher._STATE.results.get(canonical)
+    if last:
+        out['last'] = last
+    return out
+
+
+@app.post("/providers/{name}/test")
+async def provider_test(name: str, request: Request):
+    """Light live credential check: runs refresher._verify (selfheal probe).
+    Does NOT hit the full chat stream (that can be slow)."""
+    _check_api_key(request)
+    from . import refresher as _refresher
+    canonical = _resolve_provider(name)
+    status = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: _refresher._verify(canonical))
+    out = {"name": canonical, "status": status}
+    # qwen: the plain probe is optimistic (static model list) — check the
+    # token against the real auths endpoint for an honest verdict.
+    if canonical == 'qwen':
+        out['token_check'] = await asyncio.get_running_loop().run_in_executor(
+            None, _qwen_auth_probe)
+    return out
+
+
+@app.post("/providers/{name}/renew")
+async def provider_renew(name: str, request: Request):
+    """Full renewal ladder for this provider: http refresh -> browser re-login
+    -> auto-signup. Manual = bypasses the daily attempt budget."""
+    _check_api_key(request)
+    from . import refresher as _refresher
+    canonical = _resolve_provider(name)
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: _refresher.renew(canonical, reason='manual-ui'))
+    return {"name": canonical, "result": result}
+
+
+@app.post("/providers/{name}/credentials")
+async def provider_credentials_set(name: str, request: Request):
+    """Save credentials manually. Accepts any of:
+       - {"token": "..."}            (providers with a token field)
+       - {"cookies": {"k": "v"}}      (cookie kv pairs)
+       - {"email": "..", "password": ".."}  (login creds for renewal)
+       - {"clear": true}             wipe this provider's stored credentials
+       Values starting with the _CRED_MASK placeholder are skipped (the UI
+       sends them back unaltered to mean "keep as-is")."""
+    _check_api_key(request)
+    from . import refresher as _refresher
+    canonical = _resolve_provider(name)
+    body = await request.json()
+
+    token = (body.get('token') or '').strip()
+    cookies = body.get('cookies') or {}
+    if isinstance(cookies, str):  # tolerate "k=v, k2=v2" paste
+        cookies = {p.split('=', 1)[0].strip(): p.split('=', 1)[1].strip()
+                   for p in cookies.split(',') if '=' in p}
+    if not isinstance(cookies, dict):
+        cookies = {}
+    email = (body.get('email') or '').strip()
+    password = (body.get('password') or '')
+    if password == _CRED_MASK:
+        password = ''
+    token_key = (_TOKEN_FIELDS.get(canonical) or ('',''))[0]
+
+    saved = False
+    # token
+    if token and token != _CRED_MASK:
+        if token_key:
+            _refresher._save_jar(canonical, {token_key: token})
+            saved = True
+    # cookies kv
+    kv = {str(k): str(v) for k, v in (cookies or {}).items()
+          if v not in (None, '') and str(v) != _CRED_MASK}
+    if kv:
+        if canonical == 'deepseek':
+            # the deepseek provider reads a userToken / cf_clearance pair
+            _refresher._save_jar('deepseek', kv)
+        else:
+            _refresher._save_jar(canonical, kv)
+        saved = True
+    # login email/password (bot renewal source)
+    if email:
+        if password:
+            _refresher._save_account(canonical, email, password)
+        saved = True
+
+    result = {'saved': saved, 'name': canonical}
+    if saved:
+        # immediate verify so the UI can confirm the credential works
+        try:
+            st = _refresher._verify(canonical)
+            result['verify'] = st
+        except Exception as e:
+            result['verify'] = f'error: {e}'
+        # qwen: also hit the real auths endpoint (static list_models lies here)
+        if canonical == 'qwen':
+            result['token_check'] = _qwen_auth_probe()
+        # Re-run model discovery so a provider that just gained credentials
+        # exposes its models immediately (the TTL cache would otherwise hide
+        # them for up to DSF_MODELS_TTL). Fire-and-forget, off the event loop.
+        def _rediscover():
+            try:
+                ROUTER.refresh_models(force=True)
+            except Exception:  # noqa: BLE001 — discovery is best-effort
+                pass
+        threading.Thread(target=_rediscover, name='cred-rediscovery',
+                         daemon=True).start()
+    else:
+        result['hint'] = 'no writable credentials supplied in body (token/cookies/email all empty)'
+    return result
+
+
+@app.post("/providers/{name}/credentials/clear")
+async def provider_credentials_clear(name: str, request: Request):
+    _check_api_key(request)
+    from . import refresher as _refresher
+    import json as _json
+    canonical = _resolve_provider(name)
+    p = _refresher._jar_path(canonical)
+    if p.is_file():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    # remove the provider's login email/password from accounts.json
+    accs_path = _refresher._data_dir() / 'accounts.json'
+    if accs_path.is_file():
+        try:
+            accs = _json.loads(accs_path.read_text(encoding='utf-8'))
+            if isinstance(accs, dict) and canonical in accs:
+                del accs[canonical]
+                import json as _json2
+                tmp = accs_path.with_suffix('.new')
+                tmp.write_text(_json2.dumps(accs, indent=2), encoding='utf-8')
+                import os as _os
+                _os.replace(tmp, accs_path)
+        except (OSError, ValueError):
+            pass
+    return {'cleared': canonical}
+
+
 @app.get("/")
 @app.get("/playground")
 async def playground():
