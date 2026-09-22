@@ -457,58 +457,103 @@ function thinkBlock(parent) {
   return det.querySelector('.body');
 }
 
-async function loadModels() {
-  modelSel.innerHTML = '<option value="">loading…</option>';
+// Model list refresh: /v1/models answers instantly from the registry cache
+// while discovery re-runs on a background thread, so the web providers can
+// still show up seconds after the page does. Poll briefly until the list
+// settles (and re-sync on focus) instead of making the user press ↻ models.
+const MODEL_POLL_MS = 3000;
+const MODEL_POLL_MAX = 40;          // ~2 min of catch-up polling per load
+let _modelSig = '';
+let _modelStable = 0;
+let _modelPolls = 0;
+let _modelPollTimer = null;
+
+function modelSignature(data) {
+  return ((data && data.data) || []).map((m) => [
+    m.id, m.owned_by, m.context_length,
+    m.max_tokens || m.max_completion_tokens,
+    m.thinking_enabled, m.search_enabled, m.vision, m.image_gen,
+    (m.fallbacks || []).join(',')
+  ].join('|')).join('\n');
+}
+
+function renderModelList(data) {
+  const prev = modelSel.dataset.want || modelSel.value || '';
+  modelInfo = {};
+  modelSel.innerHTML = '';
+  // 'auto' smart router first, in its own group; it is the default pick.
+  const autoEntry = (data.data || []).find((m) => m.id === 'auto');
+  if (autoEntry) {
+    modelInfo['auto'] = autoEntry;
+    const og = document.createElement('optgroup');
+    og.label = '⚡ smart router';
+    const opt = document.createElement('option');
+    opt.value = 'auto';
+    opt.textContent = '⚡ auto — smart router (best model per request)';
+    og.appendChild(opt);
+    modelSel.appendChild(og);
+  }
+  const groups = {};   // owned_by -> <optgroup> (API order is provider-grouped)
+  for (const m of data.data || []) {
+    if (m.id === 'auto') continue;
+    modelInfo[m.id] = m;
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    const bits = [];
+    if (m.thinking_enabled) bits.push('🧠');
+    if (m.search_enabled) bits.push('🔍');
+    if (m.vision) bits.push('📷');
+    if (m.image_gen) bits.push('🎨');
+    opt.textContent = m.id + (bits.length ? '  ' + bits.join(' ') : '');
+    const owner = m.owned_by || 'other';
+    if (!groups[owner]) {
+      const og = document.createElement('optgroup');
+      og.label = owner;
+      groups[owner] = og;
+      modelSel.appendChild(og);
+    }
+    groups[owner].appendChild(opt);
+  }
+  if (!modelSel.options.length) {
+    modelSel.innerHTML = '<option value="">(no models available)</option>';
+  }
+  if (prev && modelInfo[prev]) modelSel.value = prev;
+  else if (modelInfo['auto']) modelSel.value = 'auto';  // default pick
+  delete modelSel.dataset.want;
+  updateFlags();
+}
+
+async function fetchModels() {
   try {
     const r = await fetch('/v1/models');
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
-    modelInfo = {};
-    modelSel.innerHTML = '';
-    // 'auto' smart router first, in its own group; it is the default pick.
-    const autoEntry = (data.data || []).find((m) => m.id === 'auto');
-    if (autoEntry) {
-      modelInfo['auto'] = autoEntry;
-      const og = document.createElement('optgroup');
-      og.label = '⚡ smart router';
-      const opt = document.createElement('option');
-      opt.value = 'auto';
-      opt.textContent = '⚡ auto — smart router (best model per request)';
-      og.appendChild(opt);
-      modelSel.appendChild(og);
-    }
-    const groups = {};   // owned_by -> <optgroup> (API order is provider-grouped)
-    for (const m of data.data || []) {
-      if (m.id === 'auto') continue;
-      modelInfo[m.id] = m;
-      const opt = document.createElement('option');
-      opt.value = m.id;
-      const bits = [];
-      if (m.thinking_enabled) bits.push('🧠');
-      if (m.search_enabled) bits.push('🔍');
-      if (m.vision) bits.push('📷');
-      if (m.image_gen) bits.push('🎨');
-      opt.textContent = m.id + (bits.length ? '  ' + bits.join(' ') : '');
-      const owner = m.owned_by || 'other';
-      if (!groups[owner]) {
-        const og = document.createElement('optgroup');
-        og.label = owner;
-        groups[owner] = og;
-        modelSel.appendChild(og);
-      }
-      groups[owner].appendChild(opt);
-    }
-    if (!modelSel.options.length) {
-      modelSel.innerHTML = '<option value="">(no models available)</option>';
-    }
-    const want = modelSel.dataset.want;
-    if (want && modelInfo[want]) modelSel.value = want;
-    else if (modelInfo['auto']) modelSel.value = 'auto';  // default pick
-    delete modelSel.dataset.want;
-    updateFlags();
+    const sig = modelSignature(data);
+    const changed = sig !== _modelSig;
+    if (changed) { _modelSig = sig; renderModelList(data); }
+    return { ok: true, changed, count: (data.data || []).length };
   } catch (e) {
-    modelSel.innerHTML = '<option value="">failed to load models</option>';
+    if (!_modelSig) modelSel.innerHTML = '<option value="">failed to load models</option>';
+    return { ok: false, changed: false, count: 0 };
   }
+}
+
+function scheduleModelPoll() {
+  clearTimeout(_modelPollTimer);
+  _modelPollTimer = setTimeout(async () => {
+    const res = await fetchModels();
+    if (res.ok && res.count > 0) _modelStable++; else _modelStable = 0;
+    _modelPolls++;
+    if (_modelStable < 2 && _modelPolls < MODEL_POLL_MAX) scheduleModelPoll();
+  }, MODEL_POLL_MS);
+}
+
+async function loadModels() {
+  if (!modelSel.options.length) modelSel.innerHTML = '<option value="">loading…</option>';
+  await fetchModels();
+  _modelStable = 0;
+  _modelPolls = 0;
+  scheduleModelPoll();
 }
 
 function updateFlags() {
@@ -1373,7 +1418,8 @@ function provOpen() {
   if (prov.classList.contains('open')) prov.classList.remove('open');
   else {
     prov.classList.add('open');
-    if (!prov.dataset.loaded) { prov.dataset.loaded = '1'; renderProviders(); }
+    renderProviders();   // fresh status on every open (on desktop the panel
+                         // is always visible and rendered at page load)
   }
   syncBackdrop();
 }
@@ -1398,8 +1444,15 @@ $('proverefresh').onclick = () => {
 
 restoreAll();
 loadModels();
+renderProviders();   // left panel: provider status on first paint, no reload needed
 refreshRegen();
 chat.addEventListener('DOMSubtreeModified', refreshRegen);
+// Re-sync the model registry when the tab regains focus (cheap now: /v1/models
+// answers instantly from the registry and only re-renders when it changed).
+window.addEventListener('focus', loadModels);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) loadModels();
+});
 </script>
 </body>
 </html>

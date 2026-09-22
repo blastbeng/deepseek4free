@@ -253,6 +253,26 @@ class Router:
                             len(self.routes))
             return changed
 
+    def stale(self) -> bool:
+        """True when the registry is older than MODELS_TTL (lock-free hint)."""
+        return time.time() - self._refreshed_at >= MODELS_TTL
+
+    def maybe_refresh_async(self) -> bool:
+        """Kick off a background re-discovery when the registry is stale.
+
+        Used by /v1/models (stale-while-revalidate): the endpoint answers
+        instantly with the current registry while a daemon thread refreshes
+        stale providers. Blocking the request on discovery instead made the
+        playground's first model load sit on ``loading…`` for up to a minute
+        (browser-warming providers) and pushed users to the reload button.
+        Concurrent calls dedupe on refresh_models' own TTL check.
+        """
+        if not self.stale():
+            return False
+        threading.Thread(target=self.refresh_models,
+                         name='model-refresh', daemon=True).start()
+        return True
+
     def _apply_provider_models(self, name: str,
                                models: List[Dict[str, Any]]) -> bool:
         """Replace one provider's routes with its discovered models."""

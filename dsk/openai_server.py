@@ -1040,9 +1040,11 @@ async def playground():
 @app.get("/v1/models")
 async def list_models(request: Request):
     _check_api_key(request)
-    # Best-effort TTL-cached re-discovery so newly available upstream models
-    # show up without a restart.
-    await asyncio.get_running_loop().run_in_executor(None, ROUTER.refresh_models)
+    # Stale-while-revalidate: answer instantly with the current registry and
+    # re-discover stale providers on a background thread. Discovery can take
+    # up to a minute (browser-warming providers), so doing it inline here made
+    # every stale first load hang on "loading…" until the manual reload.
+    ROUTER.maybe_refresh_async()
     return {"object": "list", "data": ROUTER.list_models()}
 
 
