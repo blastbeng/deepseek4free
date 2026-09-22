@@ -323,6 +323,7 @@ let pendingImages = [];     // data URLs awaiting send
 let controller = null;      // AbortController for the active stream
 let modelInfo = {};         // id -> {thinking_enabled, search_enabled, vision, ...}
 let statTimer = null, statT0 = 0, statChunks = 0, statChars = 0;
+let statThinkChars = 0, statT1 = 0, statUsage = null; // tok: reasoning chars, first-token t, server usage
 
 $('baseurl').textContent = location.origin;
 
@@ -577,24 +578,43 @@ function setBusy(busy) {
   $('stop').disabled = !busy;
 }
 
+function estTokens() {   // same chars//4 convention the server's usage uses
+  return Math.round((statChars + statThinkChars) / 4);
+}
+
+function tokPerSec(tokens, genMs) {
+  return genMs > 0 ? Math.round(tokens / (genMs / 1000)) : 0;
+}
+
 function startStatus() {
   statT0 = performance.now(); statChunks = 0; statChars = 0;
+  statThinkChars = 0; statT1 = 0; statUsage = null;
   statTimer = setInterval(() => {
-    const s = ((performance.now() - statT0) / 1000).toFixed(1);
+    const now = performance.now();
+    const s = ((now - statT0) / 1000).toFixed(1);
+    const tps = statT1 ? tokPerSec(estTokens(), now - statT1) : 0;
     $('stats').innerHTML = '<span class="pulse">●</span> ' + s + 's · ' +
-      statChunks + ' chunks · ' + statChars + ' chars';
+      statChunks + ' chunks · ' + statChars + ' chars' +
+      (statT1 ? ' · ' + tps + ' tok/s' : '');
   }, 200);
 }
 
 function stopStatus(kind) {
   if (statTimer) { clearInterval(statTimer); statTimer = null; }
-  const secs = ((performance.now() - statT0) / 1000).toFixed(1);
+  const endT = performance.now();
+  const secs = ((endT - statT0) / 1000).toFixed(1);
   const cps = secs > 0 ? Math.round(statChars / secs) : 0;
+  // tokens: server-reported usage when it arrived, chars//4 estimate otherwise;
+  // tok/s is measured from the first token so queue/discovery time is excluded
+  const tok = (statUsage && statUsage.completion_tokens) || estTokens();
+  const tps = tokPerSec(tok, statT1 ? endT - statT1 : 0);
+  const tokBit = ' · ' + tok + ' tok · ' + tps + ' tok/s';
   if (kind === 'done' && statChunks > 0) $('stats').textContent =
     'last: ' + secs + 's · ~' + statChunks + ' chunks · ' + statChars +
-    ' chars · ' + cps + ' chars/s';
+    ' chars · ' + cps + ' chars/s' + tokBit;
   else if (kind === 'stop') $('stats').textContent =
-    'stopped: ' + secs + 's · ' + statChunks + ' chunks · ' + statChars + ' chars';
+    'stopped: ' + secs + 's · ' + statChunks + ' chunks · ' + statChars +
+    ' chars' + tokBit;
   else if (kind === 'error') $('stats').textContent = 'failed: ' + secs + 's';
 }
 
@@ -889,6 +909,7 @@ async function runCompletion() {
       model: modelSel.value,
       messages: messages,
       stream: true,
+      stream_options: { include_usage: true },   // final usage chunk → real tok/s
       temperature: parseFloat($('temp').value),
     };
     if (parseInt($('maxtok').value, 10) > 0) payload.max_tokens = parseInt($('maxtok').value, 10);
@@ -931,18 +952,22 @@ async function runCompletion() {
           throw Object.assign(new Error(j.error.message || 'stream error'),
             { errType: j.error.type, errCode: j.error.code });
         }
+        if (j.usage) { statUsage = j.usage; continue; }  // final include_usage chunk (no choices)
         const delta = j.choices?.[0]?.delta || {};
         if (j.served_by) {
           const tag = b.root.querySelector('.served-by');
           if (tag) tag.textContent = '· ' + j.served_by;
         }
         if (delta.reasoning_content) {
+          if (!statT1) statT1 = performance.now();
+          statThinkChars += delta.reasoning_content.length;
           if (!think.el) think.el = thinkBlock(b.root);
           think.text += delta.reasoning_content;
           think.el.textContent = think.text;
           chat.scrollTop = chat.scrollHeight;
         }
         if (delta.content) {
+          if (!statT1) statT1 = performance.now();
           answer += delta.content;
           statChunks++; statChars += delta.content.length;
           setRaw(b.body, answer);
