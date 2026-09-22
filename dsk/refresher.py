@@ -115,6 +115,8 @@ def _jar_path(name: str) -> Path:
              'deepseek': 'cookies.json', 'claude': 'claude_cookies.json',
              'grok': 'grok_cookies.json', 'mistral': 'mistral_cookies.json',
              'qwen': 'qwen_cookies.json', 'kimi': 'kimi_cookies.json',
+             'huggingface': 'huggingface_jar.json',
+             'openrouter': 'openrouter_jar.json', 'groq': 'groq_jar.json',
              'copilot': 'copilot_cookies.json',
              'perplexity': 'perplexity_cookies.json', 'glm': 'glm_cookies.json'}
     return _data_dir() / files[name]
@@ -191,8 +193,11 @@ def _load_jar(name: str) -> Dict[str, str]:
         # it so _has_creds and the live verifiers below agree on one source.
         primary = {'claude': ('sessionKey', 'CLAUDE_SESSION_KEY'),
                    'grok': ('sso', 'GROK_SSO'),
+                   'groq': ('api_key', 'GROQ_API_KEY'),
+                   'huggingface': ('token', 'HF_TOKEN'),
                    'kimi': ('token', 'KIMI_TOKEN'),
                    'mistral': ('session_token', 'MISTRAL_SESSION_TOKEN'),
+                   'openrouter': ('api_key', 'OPENROUTER_API_KEY'),
                    'qwen': ('token', 'QWEN_TOKEN')}.get(name)
         if primary:
             jar.setdefault(primary[0], (os.getenv(primary[1], '') or '').strip())
@@ -267,9 +272,12 @@ def _has_creds(name: str) -> bool:
         if os.getenv('CHATGPT_SESSION_COOKIES', '').strip():
             return True
         return bool(_load_jar('chatgpt'))
-    if name in ('claude', 'grok', 'qwen', 'kimi'):
+    if name in ('claude', 'grok', 'groq', 'openrouter', 'qwen', 'kimi',
+                'huggingface'):
         env_key = {'claude': 'CLAUDE_SESSION_KEY', 'grok': 'GROK_SSO',
-                   'qwen': 'QWEN_TOKEN', 'kimi': 'KIMI_TOKEN'}[name]
+                   'groq': 'GROQ_API_KEY', 'openrouter': 'OPENROUTER_API_KEY',
+                   'qwen': 'QWEN_TOKEN', 'kimi': 'KIMI_TOKEN',
+                   'huggingface': 'HF_TOKEN'}[name]
         if os.getenv(env_key, '').strip():
             return True
         jar = _load_jar(name)
@@ -277,6 +285,12 @@ def _has_creds(name: str) -> bool:
             return bool(jar.get('sessionKey'))
         if name == 'grok':
             return bool(jar.get('sso') or jar.get('sso-rw'))
+        if name == 'groq':
+            return bool(jar.get('api_key') or jar.get('key')
+                        or jar.get('gsk_key'))
+        if name == 'openrouter':
+            return bool(jar.get('api_key') or jar.get('key')
+                        or jar.get('token'))
         if name == 'kimi':
             return bool(jar.get('token') or jar.get('jwt'))
         return bool(jar.get('token'))
@@ -657,11 +671,581 @@ def refresh_mistral() -> Tuple[bool, str]:
                   'token unverified (validated at request time)')
 
 
+# --------------------------------------------------------- huggingface
+_HF_VERIFY_URL = 'https://huggingface.co/api/whoami-v2'
+_HF_LOGIN_URL = 'https://huggingface.co/login'
+_HF_JOIN_URL = 'https://huggingface.co/join'
+
+
+def _hf_verify_token(token: str) -> Tuple[bool, str]:
+    """GET /api/whoami-v2 with the Bearer token (200 = valid)."""
+    import requests
+    try:
+        resp = requests.get(
+            _HF_VERIFY_URL,
+            headers={'Authorization': f'Bearer {token}', 'User-Agent': _UA},
+            timeout=20, **_proxies_kwargs(_HF_VERIFY_URL))
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code == 200:
+        return True, 'token valid'
+    if resp.status_code in (401, 403):
+        return False, 'token rejected'
+    return False, f'HTTP {resp.status_code}'
+
+
+def _hf_page_with_egress(url: str, want_css: str = 'css:input',
+                         want_wait_s: float = 60.0):
+    """Open a huggingface.co page in a real browser, egress-aware.
+
+    huggingface.co sits behind AWS WAF (goku) behind CloudFront: plain
+    HTTP POSTs get 202 challenge pages, and the container's direct egress
+    IP is often flat-out refused ('The request could not be satisfied').
+    Same medicine as the qwen signup: try direct first, then fresh pooled
+    exits; return the page that shows the expected element (or None).
+    """
+    from DrissionPage import ChromiumPage, ChromiumOptions
+
+    def _open(cand: Optional[str]):
+        opts = ChromiumOptions().auto_port()
+        opts.set_argument('--no-sandbox')
+        opts.set_argument('--disable-gpu')
+        opts.set_argument('--disable-blink-features=AutomationControlled')
+        opts.headless(True)  # WAF JS challenge passes headless; cf needs no X
+        if cand:
+            opts.set_argument(f'--proxy-server={cand}')
+        page = ChromiumPage(addr_or_opts=opts)
+        try:
+            page.get(url, timeout=40)
+        except Exception:  # noqa: BLE001 — navigation races are fine
+            pass
+        deadline = time.time() + want_wait_s
+        while time.time() < deadline:
+            try:
+                if page.ele(want_css, timeout=2):
+                    return page
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(2)
+        page.quit()
+        return None
+
+    candidates: List[Optional[str]] = [None]
+    try:
+        from . import proxies as _proxies
+        _proxies.ensure_pool()
+        raw = list(_proxies.all_proxies())
+        random.shuffle(raw)
+        candidates += raw[:6]
+    except Exception:  # noqa: BLE001 — direct remains the fallback
+        pass
+    last = ''
+    for cand in candidates:
+        try:
+            page = _open(cand)
+        except Exception as exc:  # noqa: BLE001
+            last = f'{type(exc).__name__}: {exc}'
+            continue
+        if page is not None:
+            _log_history('huggingface', 'stage',
+                         f'egress ok ({cand or "direct"})')
+            return page
+        last = f'no form with egress {cand or "direct"}'
+    _log_history('huggingface', 'stage', f'all egresses failed: {last}')
+    return None
+
+
+def _hf_session_token(page) -> str:
+    """Extract the hf_ web-session cookie after a login.
+
+    The cookie is literally named ``token`` and its value doubles as the
+    API Bearer credential (lifts anonymous ZeroGPU quotas, admits
+    'auto'-gated spaces).
+    """
+    for _ in range(20):
+        try:
+            for c in (page.cookies(all_domains=True) or []):
+                name = (c.get('name') or c.get('Name') or '') if isinstance(c, dict) else getattr(c, 'name', '')
+                value = (c.get('value') or c.get('Value') or '') if isinstance(c, dict) else getattr(c, 'value', '')
+                if name == 'token' and str(value).startswith('hf_'):
+                    return str(value)
+        except Exception:  # noqa: BLE001 — page may be mid-navigation
+            pass
+        time.sleep(2)
+    return ''
+
+
+def _hf_browser_login(email: str, password: str) -> Tuple[bool, str]:
+    """Browser re-login on huggingface.co, then persist the hf_ session.
+
+    The WAF challenge executes silently in the real browser; the form is
+    the classic username/password POST to /login. On success the session
+    cookie lands in the huggingface jar (verified via whoami-v2 first).
+    """
+    page = _hf_page_with_egress(_HF_LOGIN_URL, 'css:input[name=username]')
+    if page is None:
+        return False, 'hf login form never appeared (WAF/egress blocked)'
+    try:
+        if not _fill_first(page, ['css:input[name=username]'], email):
+            return False, 'hf login: username field unusable'
+        if not _fill_first(page, ['css:input[name=password]'], password):
+            return False, 'hf login: password field unusable'
+        try:
+            page('css:form[action="/login"] button[type=submit]').click(
+                by_js=False)
+        except Exception:  # noqa: BLE001 — Enter in the password field works too
+            try:
+                page.ele('css:input[name=password]').input('\n')
+            except Exception:  # noqa: BLE001
+                pass
+        token = _hf_session_token(page)
+        if not token:
+            return False, ('login submitted but no session token — '
+                           f'captcha or bad credentials? {_body_head(page)}')
+        ok, detail = _hf_verify_token(token)
+        if not ok:
+            return False, f'cookie captured but rejected: {detail}'
+        _save_jar('huggingface', {'token': token, 'email': email})
+        return True, 'browser re-login ok; fresh hf token saved'
+    finally:
+        try:
+            page.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def refresh_huggingface() -> Tuple[bool, str]:
+    """Verify the stored hf_ token; browser re-login when missing/rejected.
+
+    Anonymous access stays first-class for the provider itself; the
+    credential exists to lift ZeroGPU quotas and admit 'auto'-gated
+    spaces (the discovery probe list widens with a valid token).
+    """
+    token = (_load_jar('huggingface').get('token') or '').strip()
+    if token:
+        ok, detail = _hf_verify_token(token)
+        if ok:
+            return True, detail
+        if detail not in ('token rejected',) and not detail.startswith('HTTP'):
+            # transient verifier failure: keep the token (validated at
+            # request time anyway) instead of burning a browser login
+            return False, detail
+        _log_history('huggingface', 'stage', f'token rejected; re-login ({detail})')
+    email, password = _creds('huggingface')
+    if not email or not password:
+        return False, ('no huggingface credentials — set HF_TOKEN, or '
+                       'HUGGINGFACE_LOGIN_EMAIL/PASSWORD (or let the '
+                       'huggingface signup rung create an account) to '
+                       'lift anonymous quotas')
+    return _hf_browser_login(email, password)
+
+
+def _hf_mail_session(email: str) -> Optional[Dict[str, Any]]:
+    """Rebuild a mailgen session for the huggingface account's mailbox."""
+    stored = _load_accounts().get('huggingface') or {}
+    if stored.get('email') and stored.get('email') != email:
+        return None
+    ms = stored.get('mail_session')
+    if isinstance(ms, dict) and ms.get('backend') and ms.get('address'):
+        return dict(ms)
+    if (stored.get('backend') or '').strip() and email:
+        return {'backend': stored['backend'], 'address': email}
+    return None
+
+
+def signup_huggingface() -> Tuple[bool, str]:
+    """Create a huggingface.co account autonomously (email-verified).
+
+    /join runs in a real browser (AWS WAF + CloudFront egress blocks).
+    Flow: enter the mailgen address -> poll the mailbox for huggingface's
+    verification link -> open it and complete the username/password form.
+    Credentials persist in data/accounts.json; the login rung then
+    captures the hf_ session cookie into the jar. Accounts stuck before
+    verification still persist — the mailbox is rebuilt from the stored
+    session on later cycles, so activation converges autonomously.
+    """
+    email, password = _creds('huggingface')
+    session = None
+    if not email or not password:
+        if not mailgen.autogen_enabled():
+            return False, ('no HUGGINGFACE_LOGIN_EMAIL/PASSWORD and mail '
+                           'autogen off')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        password = mailgen.gen_password()
+    username = re.sub(r'[^a-z0-9-]', '',
+                      f'dsf-{email.split("@")[0][:16]}'.lower()) or 'dsf-bot'
+    _log_history('huggingface', 'stage', f'signup as {email}')
+    page = _hf_page_with_egress(
+        _HF_JOIN_URL, 'css:input[type=email],css:input[name=email]')
+    if page is None:
+        _save_account('huggingface', email, password,
+                      backend=(session or {}).get('backend', ''),
+                      extra={'mail_session': session} if session else None,
+                      username=username)
+        return False, 'hf join form never appeared (WAF/egress blocked)'
+    try:
+        if not _fill_first(page, ['css:input[type=email]',
+                                  'css:input[name=email]'], email):
+            return False, 'hf join: email field unusable'
+        try:
+            page('css:button[type=submit]').click(by_js=False)
+        except Exception:  # noqa: BLE001
+            try:
+                page.ele('css:input[type=email]').input('\n')
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(6)
+        body = _body_head(page)
+        if 'already' in body:
+            _save_account('huggingface', email, password,
+                          backend=(session or {}).get('backend', ''),
+                          extra={'mail_session': session} if session else None,
+                          username=username)
+            return False, 'email already registered — login rung should take over'
+        _save_account('huggingface', email, password,
+                      backend=(session or {}).get('backend', ''),
+                      extra={'mail_session': session} if session else None,
+                      username=username)
+        # wait out the verification mail, then follow the link
+        link = mailgen.fetch_otp(
+            session, max_wait_s=300, sender_needle='huggingface',
+            code_re=re.compile(r'(https://huggingface\.co/[^\s"\'<>]+)'))
+        if not link:
+            ms = _hf_mail_session(email)
+            if ms and ms is not session:
+                link = mailgen.fetch_otp(
+                    ms, max_wait_s=120, sender_needle='huggingface',
+                    code_re=re.compile(
+                        r'(https://huggingface\.co/[^\s"\'<>]+)'))
+        if not link:
+            return False, ('verification link not in mailbox yet — '
+                           'renews on the next cycle')
+        _log_history('huggingface', 'stage', 'verification link found; opening')
+        try:
+            page.get(link, timeout=40)
+        except Exception:  # noqa: BLE001 — the form loads on retry
+            pass
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                if page.ele('css:input[type=password]', timeout=2):
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(2)
+        if not _fill_first(page, ['css:input[name=username]',
+                                  'css:#username'], username):
+            _log_history('huggingface', 'stage',
+                         f'no username field: {_body_head(page)}')
+        _fill_first(page, ['css:input[name=password]',
+                           'css:input[type=password]'], password)
+        try:
+            page('css:button[type=submit]').click(by_js=False)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(10)
+        token = _hf_session_token(page)
+        if token:
+            ok, detail = _hf_verify_token(token)
+            if ok:
+                _save_jar('huggingface', {'token': token, 'email': email})
+                return True, 'hf account created; session token saved'
+        # account may exist but need a plain login — the next renewal
+        # cycle's browser login rung converges on it
+        return False, ('signup submitted but no session yet — login rung '
+                       'converges next cycle')
+    finally:
+        try:
+            page.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ------------------------------------- openrouter / groq (API-key rungs)
+def _or_verify_key(key: str) -> Tuple[bool, str]:
+    """GET /api/v1/auth/key with the Bearer key (200 = valid)."""
+    import requests
+    try:
+        resp = requests.get(
+            'https://openrouter.ai/api/v1/auth/key',
+            headers={'Authorization': f'Bearer {key}', 'User-Agent': _UA},
+            timeout=20, **_proxies_kwargs('https://openrouter.ai'))
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code == 200:
+        return True, 'api key valid'
+    if resp.status_code in (401, 403):
+        return False, 'api key rejected'
+    return False, f'HTTP {resp.status_code}'
+
+
+def _groq_verify_key(key: str) -> Tuple[bool, str]:
+    """GET /openai/v1/models with the Bearer key (200 = valid)."""
+    import requests
+    try:
+        resp = requests.get(
+            'https://api.groq.com/openai/v1/models',
+            headers={'Authorization': f'Bearer {key}', 'User-Agent': _UA},
+            timeout=20, **_proxies_kwargs('https://api.groq.com'))
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code == 200:
+        return True, 'api key valid'
+    if resp.status_code in (401, 403):
+        return False, 'api key rejected'
+    return False, f'HTTP {resp.status_code}'
+
+
+def _stored_api_key(name: str) -> str:
+    """First jar key-ish field, then the provider's primary env var."""
+    jar = _load_jar(name) or {}
+    for field in ('api_key', 'key', 'token'):
+        val = (jar.get(field) or '').strip()
+        if val:
+            return val
+    env = {'openrouter': 'OPENROUTER_API_KEY', 'groq': 'GROQ_API_KEY'}[name]
+    return (os.getenv(env, '') or '').strip()
+
+
+def refresh_openrouter() -> Tuple[bool, str]:
+    """Verify the stored OpenRouter key (keys don't expire like cookies)."""
+    key = _stored_api_key('openrouter')
+    if key:
+        ok, detail = _or_verify_key(key)
+        if ok:
+            return True, detail
+        if detail != 'api key rejected' and not detail.startswith('HTTP'):
+            return False, detail  # transient verifier failure
+        _log_history('openrouter', 'stage', f'key rejected ({detail})')
+    return False, ('no working OpenRouter key — set OPENROUTER_API_KEY '
+                   '(create at openrouter.ai/keys; :free models need no '
+                   'credit) or let the openrouter signup rung mint one')
+
+
+def refresh_groq() -> Tuple[bool, str]:
+    """Verify the stored Groq key."""
+    key = _stored_api_key('groq')
+    if key:
+        ok, detail = _groq_verify_key(key)
+        if ok:
+            return True, detail
+        if detail != 'api key rejected' and not detail.startswith('HTTP'):
+            return False, detail
+        _log_history('groq', 'stage', f'key rejected ({detail})')
+    return False, ('no working Groq key — set GROQ_API_KEY (create at '
+                   'console.groq.com/keys, free tier) or let the groq '
+                   'signup rung mint one')
+
+
+def _mail_session_for(name: str, email: str) -> Optional[Dict[str, Any]]:
+    """Rebuild a mailgen session for a stored account's mailbox."""
+    stored = _load_accounts().get(name) or {}
+    if stored.get('email') and stored.get('email') != email:
+        return None
+    ms = stored.get('mail_session')
+    if isinstance(ms, dict) and ms.get('backend') and ms.get('address'):
+        return dict(ms)
+    if (stored.get('backend') or '').strip() and email:
+        return {'backend': stored['backend'], 'address': email}
+    return None
+
+
+def _mint_key_via_page(page: Any, path: str, body: str) -> str:
+    """Same-origin synchronous XHR in the logged-in page; raw JSON or ''.
+
+    DrissionPage's run_js cannot await fetch(), so a sync XMLHttpRequest
+    is used instead — fine for a one-shot same-origin POST.
+    """
+    js = ("var xhr = new XMLHttpRequest();"
+          f"xhr.open('POST', {json.dumps(path)}, false);"
+          "xhr.setRequestHeader('Content-Type', 'application/json');"
+          f"xhr.send({json.dumps(body)});"
+          "return xhr.responseText;")
+    try:
+        return (page.run_js(js) or '').strip()
+    except Exception:  # noqa: BLE001
+        return ''
+
+
+def signup_openrouter() -> Tuple[bool, str]:
+    """Create an openrouter.ai account and mint a free-tier API key.
+
+    Signup runs in a real browser (WAF/egress blocks plain HTTP); after
+    the email-verified session exists, a same-origin XHR against
+    /api/v1/keys (cookie auth) mints the key saved into the jar.
+    """
+    email, password = _creds('openrouter')
+    session = None
+    if not email or not password:
+        if not mailgen.autogen_enabled():
+            return False, ('no OPENROUTER_LOGIN_EMAIL/PASSWORD and mail '
+                           'autogen off')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        password = mailgen.gen_password()
+    _log_history('openrouter', 'stage', f'signup as {email}')
+    page = _hf_page_with_egress(
+        'https://openrouter.ai/sign-up',
+        'css:input[name=email],css:input[type=email]')
+    if page is None:
+        _save_account('openrouter', email, password,
+                      backend=(session or {}).get('backend', ''),
+                      extra={'mail_session': session} if session else None)
+        return False, 'openrouter signup form never appeared (WAF/egress)'
+    try:
+        if not _fill_first(page, ['css:input[name=email]',
+                                  'css:input[type=email]'], email):
+            return False, 'openrouter signup: email field unusable'
+        _fill_first(page, ['css:input[name=password]',
+                           'css:input[type=password]'], password)
+        try:
+            page('css:button[type=submit]').click(by_js=False)
+        except Exception:  # noqa: BLE001
+            try:
+                page.ele('css:input[type=password]').input('\n')
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(8)
+        _save_account('openrouter', email, password,
+                      backend=(session or {}).get('backend', ''),
+                      extra={'mail_session': session} if session else None)
+        if session is None:
+            session = _mail_session_for('openrouter', email)
+        if session:
+            link = mailgen.fetch_otp(
+                session, max_wait_s=300, sender_needle='openrouter',
+                code_re=re.compile(r'(https://openrouter\.ai/[^\s"\'<>]+)'))
+            if link:
+                _log_history('openrouter', 'stage', 'verification link found')
+                try:
+                    page.get(link, timeout=40)
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(8)
+        raw = _mint_key_via_page(
+            page, '/api/v1/keys', json.dumps({'name': 'dsf-bot'}))
+        key = ''
+        if raw:
+            try:
+                key = ((json.loads(raw) or {}).get('data')
+                       or {}).get('key', '')
+            except Exception:  # noqa: BLE001
+                key = ''
+        if not key:
+            m = re.search(r'sk-or-v1-[A-Za-z0-9]{16,}', _body_head(page))
+            key = m.group(0) if m else ''
+        if key:
+            ok, detail = _or_verify_key(key)
+            if ok:
+                _save_jar('openrouter', {'api_key': key, 'email': email})
+                return True, 'openrouter account created; api key saved'
+            _log_history('openrouter', 'stage',
+                         f'minted key rejected: {detail}')
+        return False, ('signup submitted but no key yet — next cycle logs '
+                       'in and mints it')
+    finally:
+        try:
+            page.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def signup_groq() -> Tuple[bool, str]:
+    """Create a console.groq.com account and mint an API key.
+
+    The console is client-rendered behind Cloudflare; flow is best-effort
+    with defensive selectors: email/password signup, verification link,
+    then the /keys page — click Create API Key and scrape the gsk_ token.
+    Accounts persist in data/accounts.json so later cycles converge.
+    """
+    email, password = _creds('groq')
+    session = None
+    if not email or not password:
+        if not mailgen.autogen_enabled():
+            return False, ('no GROQ_LOGIN_EMAIL/PASSWORD and mail autogen '
+                           'off — Groq needs an account before a key can be '
+                           'minted')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        password = mailgen.gen_password()
+    _log_history('groq', 'stage', f'signup as {email}')
+    page = _hf_page_with_egress(
+        'https://console.groq.com/sign-up',
+        'css:input[type=email],css:input[name=email]')
+    if page is None:
+        _save_account('groq', email, password,
+                      backend=(session or {}).get('backend', ''),
+                      extra={'mail_session': session} if session else None)
+        return False, 'groq signup form never appeared (WAF/egress)'
+    try:
+        if not _fill_first(page, ['css:input[name=email]',
+                                  'css:input[type=email]'], email):
+            return False, 'groq signup: email field unusable'
+        _fill_first(page, ['css:input[name=password]',
+                           'css:input[type=password]'], password)
+        try:
+            page('css:button[type=submit]').click(by_js=False)
+        except Exception:  # noqa: BLE001
+            try:
+                page.ele('css:input[type=password]').input('\n')
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(8)
+        _save_account('groq', email, password,
+                      backend=(session or {}).get('backend', ''),
+                      extra={'mail_session': session} if session else None)
+        if session is None:
+            session = _mail_session_for('groq', email)
+        if session:
+            link = mailgen.fetch_otp(
+                session, max_wait_s=300, sender_needle='groq',
+                code_re=re.compile(r'(https://[^\s"\'<>]*groq[^\s"\'<>]+)'))
+            if link:
+                _log_history('groq', 'stage', 'verification link found')
+                try:
+                    page.get(link, timeout=40)
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(8)
+        # keys page: click Create, then scrape the one-time gsk_ token
+        try:
+            page.get('https://console.groq.com/keys', timeout=40)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(5)
+        _click_any(page, ['Create API Key', 'New API Key', 'Create key'])
+        time.sleep(6)
+        m = re.search(r'gsk_[A-Za-z0-9]{20,}', _body_head(page))
+        if m:
+            key = m.group(0)
+            ok, detail = _groq_verify_key(key)
+            if ok:
+                _save_jar('groq', {'api_key': key, 'email': email})
+                return True, 'groq account created; api key saved'
+            _log_history('groq', 'stage', f'minted key rejected: {detail}')
+        return False, ('signup submitted but no key yet — next cycle logs '
+                       'in and mints it')
+    finally:
+        try:
+            page.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
            'mistral': refresh_mistral, 'copilot': _anonymous('copilot'),
-           'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm')}
+           'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm'),
+           'huggingface': refresh_huggingface,
+           'openrouter': refresh_openrouter, 'groq': refresh_groq}
 
 
 # ------------------------------------------------------------------ IMAP OTP
@@ -961,7 +1545,9 @@ def _creds(name: str) -> Tuple[str, str]:
     prefix = {'deepseek': 'DEEPSEEK', 'chatgpt': 'CHATGPT', 'gemini': 'GEMINI',
               'claude': 'CLAUDE', 'grok': 'GROK', 'mistral': 'MISTRAL',
               'qwen': 'QWEN', 'kimi': 'KIMI', 'copilot': 'COPILOT',
-              'perplexity': 'PERPLEXITY', 'glm': 'GLM'}[name]
+              'perplexity': 'PERPLEXITY', 'glm': 'GLM',
+              'openrouter': 'OPENROUTER', 'groq': 'GROQ',
+              'huggingface': 'HUGGINGFACE'}.get(name, name.upper())
     email = os.getenv(f'{prefix}_LOGIN_EMAIL', '').strip()
     password = os.getenv(f'{prefix}_LOGIN_PASSWORD', '').strip()
     if email and password:
@@ -2383,6 +2969,9 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'qwen': signup_qwen,
           'kimi': signup_kimi,
           'mistral': signup_mistral,
+          'huggingface': signup_huggingface,
+          'openrouter': signup_openrouter,
+          'groq': signup_groq,
           'copilot': _anonymous('copilot'),
           'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm')}
 

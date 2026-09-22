@@ -751,6 +751,9 @@ _TOKEN_FIELDS: Dict[str, Tuple[str, str]] = {
     'kimi': ('token', 'KIMI_TOKEN'),
     'mistral': ('session_token', 'MISTRAL_SESSION_TOKEN'),
     'qwen': ('token', 'QWEN_TOKEN'),
+    'huggingface': ('token', 'HF_TOKEN'),
+    'openrouter': ('api_key', 'OPENROUTER_API_KEY'),
+    'groq': ('api_key', 'GROQ_API_KEY'),
 }
 _COOKIE_FIELDS: Dict[str, List[str]] = {
     'deepseek': ['userToken', 'cf_clearance'],

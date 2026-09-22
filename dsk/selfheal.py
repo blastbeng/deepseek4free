@@ -91,6 +91,7 @@ HEALABLE: Dict[str, Path] = {
     'copilot': _BASE / 'providers' / 'copilot_provider.py',
     'perplexity': _BASE / 'providers' / 'perplexity_provider.py',
     'glm': _BASE / 'providers' / 'glm_provider.py',
+    'huggingface': _BASE / 'providers' / 'hf_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -105,6 +106,7 @@ _MODULE_NAMES = {
     'copilot': 'dsk.providers.copilot_provider',
     'perplexity': 'dsk.providers.perplexity_provider',
     'glm': 'dsk.providers.glm_provider',
+    'huggingface': 'dsk.providers.hf_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -119,6 +121,7 @@ _PROVIDER_MODULES = {
     'copilot': 'dsk.providers.copilot_provider',
     'perplexity': 'dsk.providers.perplexity_provider',
     'glm': 'dsk.providers.glm_provider',
+    'huggingface': 'dsk.providers.hf_provider',
 }
 
 # Provider class name inside each module (used by probe/configured).
@@ -134,6 +137,7 @@ _PROVIDER_CLASSES = {
     'copilot': 'CopilotProvider',
     'perplexity': 'PerplexityProvider',
     'glm': 'GlmProvider',
+    'huggingface': 'HuggingFaceProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -161,6 +165,8 @@ _EVIDENCE_PATTERNS = {
                    r'ask_text', r'markdown_block'],
     'glm': [r'api/chat/completions', r'assistant/stream', r'refresh_token',
             r'chatglm', r'delta_content'],
+    'huggingface': [r'gradio_api/queue/[a-z]+', r'spacesSemantcSearch',
+                    r'/api/spaces', r'zerogpu'],
 }
 
 
@@ -269,6 +275,17 @@ def _probe_once(name: str) -> Tuple[str, str]:
             if verdict.startswith('unreachable'):
                 return 'network', verdict
             return 'structural', verdict
+        if name == 'huggingface':
+            # Best-effort discovery: an empty model list usually means every
+            # probe failed transiently (ZeroGPU quotas, proxy flaps) — that
+            # is NOT a structural break of the module, so never let the
+            # fixer LLM self-patch on top of it.
+            module = importlib.import_module(_PROVIDER_MODULES[name])
+            provider = getattr(module, _PROVIDER_CLASSES[name])()
+            models = provider.list_models()
+            if models:
+                return 'ok', f'{len(models)} working spaces'
+            return 'ok', '0 working spaces right now (transient, not structural)'
         module = importlib.import_module(_PROVIDER_MODULES[name])
         provider = getattr(module, _PROVIDER_CLASSES[name])()
         if not provider.available():
@@ -357,8 +374,12 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'kimi': 'https://www.kimi.com',
             'copilot': 'https://copilot.microsoft.com',
             'perplexity': 'https://www.perplexity.ai',
-            'glm': 'https://chat.z.ai'}[name]
-    patterns = [re.compile(p) for p in _EVIDENCE_PATTERNS[name]]
+            'glm': 'https://chat.z.ai',
+            'huggingface': ('https://huggingface.co/spaces'
+                            '?category=text-generation')}.get(
+            name, 'https://huggingface.co')
+    patterns = [re.compile(p) for p in
+                _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []
     seen: set = set()
     total = 0

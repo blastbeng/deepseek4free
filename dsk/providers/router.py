@@ -76,6 +76,7 @@ PROVIDER_MODULES = (
     ('copilot', '.copilot_provider', 'CopilotProvider'),
     ('perplexity', '.perplexity_provider', 'PerplexityProvider'),
     ('glm', '.glm_provider', 'GlmProvider'),
+    ('huggingface', '.hf_provider', 'HuggingFaceProvider'),
 )
 
 OWNED_BY = {
@@ -90,7 +91,44 @@ OWNED_BY = {
     'copilot': 'microsoft',
     'perplexity': 'perplexity',
     'glm': 'zai',
+    'huggingface': 'huggingface',
 }
+
+# Public model-id namespaces: every model surfaced via /v1/models and the
+# playground carries its provider prefix (deepseek/deepseek-chat,
+# z.ai/glm-4.7, alibaba/qwen-3-max, huggingface/<space>, …). Routes stay
+# keyed by the bare internal id — fallback chains, the auto router and the
+# providers themselves never see prefixed ids; resolve() maps them back.
+PUBLIC_PREFIX = {
+    'deepseek': 'deepseek',
+    'gemini': 'google',
+    'chatgpt': 'openai',
+    'claude': 'anthropic',
+    'grok': 'xai',
+    'mistral': 'mistral',
+    'qwen': 'alibaba',
+    'kimi': 'moonshot',
+    'copilot': 'microsoft',
+    'perplexity': 'perplexity',
+    'glm': 'z.ai',
+    'huggingface': 'huggingface',
+    'openrouter': 'openrouter',
+    'groq': 'groq',
+}
+
+
+def public_model_id(provider_name: str, model_id: str) -> str:
+    """Namespace a provider model id for public (API/UI) consumption.
+
+    HuggingFace ids are internal ``hf-<space>`` tags; the public form drops
+    the redundant ``hf-`` (huggingface/<space>). Unknown providers pass ids
+    through unchanged so custom setups stay visible.
+    """
+    prefix = PUBLIC_PREFIX.get(provider_name)
+    if not prefix:
+        return model_id
+    base = re.sub(r'^hf-', '', model_id) if provider_name == 'huggingface' else model_id
+    return f'{prefix}/{base}'
 
 MAX_RETRIES = int(os.getenv('DSF_MAX_RETRIES', '2'))
 RETRY_BACKOFF = float(os.getenv('DSF_RETRY_BACKOFF', '2.0'))
@@ -135,8 +173,10 @@ AUTO_CATEGORIES: Dict[str, List[str]] = {
     'vision':      ['chatgpt', 'gemini', 'glm'],
     'translation': ['gemini', 'chatgpt', 'deepseek', 'glm', 'qwen', 'mistral'],
     'summarize':   ['chatgpt', 'gemini', 'glm', 'qwen', 'mistral', 'deepseek'],
-    'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt'],
-    'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral', 'kimi'],
+    'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt',
+                    'huggingface'],
+    'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral',
+                    'kimi', 'huggingface'],
 }
 
 _RE_CODE_FENCE = re.compile(
@@ -202,7 +242,14 @@ class Router:
             if provider_enabled(name)
         }
         self.routes: Dict[str, Route] = {}
+        # provider name -> {public prefixed id -> internal route id}; rebuilt
+        # per provider in _apply_provider_models, consumed by resolve().
+        self._aliases: Dict[str, Dict[str, str]] = {}
         self._lock = threading.Lock()
+        # Serializes whole discovery runs; request paths must never wait on
+        # a slow provider's list_models (HF cold discovery takes minutes),
+        # so network I/O happens BEFORE _lock is taken below.
+        self._refresh_lock = threading.Lock()
         self._refreshed_at = 0.0
         # The DeepSeek modes are configuration-derived (no network involved),
         # so the registry is never empty, even before web discovery completes.
@@ -224,29 +271,31 @@ class Router:
         keeps its previously known routes. Returns True when the registry
         changed.
         """
-        with self._lock:
+        with self._refresh_lock:
             if not force and time.time() - self._refreshed_at < MODELS_TTL:
                 return False
             changed = False
+            discovered: Dict[str, List[Dict[str, Any]]] = {}
             for name, provider in self.providers.items():
                 try:
                     # Only DeepSeek can authenticate per-request (userToken as
                     # API key); the web providers use operator cookies.
-                    models = provider.list_models(
+                    # OUTSIDE _lock: a slow discovery (huggingface cold start)
+                    # must not stall request routing for minutes.
+                    discovered[name] = provider.list_models(
                         auth_key if name == 'deepseek' else None)
                 except ProviderAuthError as e:
                     logger.info('%s: no credentials for model discovery (%s)',
                                 name, e)
-                    continue
                 except ProviderError as e:
                     logger.warning('%s model discovery failed: %s', name, e)
-                    continue
                 except Exception as e:  # never let discovery kill the registry
                     logger.warning('%s model discovery crashed: %s', name, e)
-                    continue
-                if self._apply_provider_models(name, models):
-                    changed = True
-            self._apply_fallbacks()
+            with self._lock:
+                for name, models in discovered.items():
+                    if self._apply_provider_models(name, models):
+                        changed = True
+                self._apply_fallbacks()
             self._refreshed_at = time.time()
             if changed:
                 logger.info('model registry updated: %d models available',
@@ -278,6 +327,7 @@ class Router:
         """Replace one provider's routes with its discovered models."""
         changed = False
         wanted = set()
+        aliases: Dict[str, str] = {}
         for entry in models:
             model_id = str(entry.get('id') or '').strip()
             if not model_id:
@@ -298,6 +348,13 @@ class Router:
             if self.routes.get(model_id) != route:
                 changed = True
             self.routes[model_id] = route
+            # Public namespace alias. Both the canonical prefixed id and
+            # (for huggingface) the hf--tagged variant resolve back here.
+            pub = public_model_id(name, model_id)
+            aliases[pub] = model_id
+            if name == 'huggingface' and pub != f'huggingface/{model_id}':
+                aliases[f'huggingface/{model_id}'] = model_id
+        self._aliases[name] = aliases
         # Drop models of this provider that disappeared upstream.
         for model_id in [m for m, r in self.routes.items()
                          if r.provider_name == name and m not in wanted]:
@@ -446,24 +503,48 @@ class Router:
         route = self.routes.get(model_id)
         if route is not None:
             return route
+        route = self._resolve_alias(model_id)
+        if route is not None:
+            return route
         try:
             self.refresh_models(auth_key=auth_key)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning('re-discovery on unknown model failed: %s', e)
-        route = self.routes.get(model_id)
+        route = self.routes.get(model_id) or self._resolve_alias(model_id)
         if route is not None:
             return route
         fast_id = os.getenv('DSF_MODEL_FAST', 'deepseek-chat').strip()
         return self.routes.get(fast_id) or next(iter(self.routes.values()))
+
+    def _resolve_alias(self, model_id: str) -> Optional[Route]:
+        """Map a provider-prefixed public id (deepseek/deepseek-chat,
+        z.ai/glm-4.7, huggingface/<space>, …) back to its internal route."""
+        for aliases in self._aliases.values():
+            mid = aliases.get(model_id)
+            if mid:
+                route = self.routes.get(mid)
+                if route is not None:
+                    return route
+        return None
 
     def available(self, route: Route, auth_key: Optional[str] = None) -> bool:
         provider = self.providers.get(route.provider_name)
         return bool(provider and provider.available(auth_key))
 
     def list_models(self) -> List[Dict[str, Any]]:
-        """OpenAI-style /v1/models payload with agent-tooling metadata."""
+        """OpenAI-style /v1/models payload with agent-tooling metadata.
+
+        Every id is provider-prefixed (deepseek/deepseek-chat, z.ai/glm-4.7,
+        alibaba/qwen-3-max, huggingface/<space>, …); resolve() accepts both
+        the prefixed and the bare internal form.
+        """
         auto = self.routes.get(AUTO_MODEL_ID)
         entries: List[Dict[str, Any]] = []
+
+        def _pub(mid: str) -> str:
+            r = self.routes.get(mid)
+            return public_model_id(r.provider_name, mid) if r else mid
+
         if auto is not None:
             # Listed first: the smart router handles every capability (it
             # re-routes to a capable model at serve time), so clients must
@@ -485,7 +566,7 @@ class Router:
             })
         entries.extend(
             {
-                'id': r.model_id,
+                'id': _pub(r.model_id),
                 'object': 'model',
                 'created': 1700000000,
                 'owned_by': OWNED_BY.get(r.provider_name,
@@ -498,7 +579,7 @@ class Router:
                 'search_enabled': r.search_enabled,
                 'vision': r.vision,
                 'image_gen': r.image_gen,
-                'fallbacks': list(r.fallbacks),
+                'fallbacks': [_pub(f) for f in r.fallbacks],
             }
             for r in self.routes.values() if r.model_id != AUTO_MODEL_ID
         )

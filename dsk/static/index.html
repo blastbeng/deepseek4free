@@ -35,7 +35,25 @@
     border-radius: 6px; padding: 6px 10px; font: inherit;
   }
   select:focus, input:focus, textarea:focus { outline: 1px solid var(--accent); }
-  #model { min-width: 230px; }
+  #modelcombo { position: relative; min-width: 230px; }
+  #modelcombo input { width: 100%; min-width: 0; padding-right: 28px; }
+  #modeltoggle { position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+                 padding: 2px 8px; border: 0; background: transparent;
+                 color: var(--muted); font-size: 13px; cursor: pointer; }
+  #modeltoggle:hover { color: var(--text); }
+  .mdrop { position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+           min-width: 300px; max-height: 340px; overflow-y: auto;
+           background: var(--panel); border: 1px solid var(--border);
+           border-radius: 6px; box-shadow: 0 8px 24px #000a;
+           z-index: 80; padding: 4px; }
+  .mgroup { font-size: 10px; text-transform: uppercase; letter-spacing: .8px;
+            color: var(--muted); padding: 6px 8px 2px; }
+  .mitem { padding: 6px 8px; border-radius: 4px; cursor: pointer;
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mitem:hover { background: #21262d; }
+  .mitem.active { background: var(--accent); color: #fff; }
+  .mitem.sel::after { content: '  ✓'; }
+  .mempty { padding: 8px; color: var(--muted); font-style: italic; }
   .grow { flex: 1; }
   button {
     background: #21262d; color: var(--text); border: 1px solid var(--border);
@@ -161,7 +179,8 @@
     #settings.open { transform: none; }
     #setclose { display: inline-block; }   /* the only reliable way to close on touch */
     #flags { display: none; }              /* badges blow up the wrapped header */
-    #model { flex: 1 1 100%; min-width: 0; max-width: none; }  /* own full row */
+    #modelcombo { flex: 1 1 100%; min-width: 0; max-width: none; }  /* own full row */
+    .mdrop { min-width: 0; }
     .msg { max-width: 95%; }
     /* iOS zooms into inputs with font-size < 16px on focus — reads as glitching */
     #prompt, #system, #maxtok, select, input[type="text"], input[type="number"] {
@@ -219,7 +238,13 @@
 <body>
 <header>
   <h1>deepseek4free <span>· playground</span></h1>
-  <select id="model" title="Model (from GET /v1/models)"></select>
+  <div id="modelcombo">
+    <input id="modelfilter" type="text" autocomplete="off" spellcheck="false"
+           placeholder="model — click to browse, type to filter" title="Model (from GET /v1/models) — click for the full list, type to filter, ↑↓ + Enter to pick">
+    <button id="modeltoggle" type="button" title="Show all models" aria-label="Show all models">▾</button>
+    <div id="modeldrop" class="mdrop" hidden></div>
+  </div>
+  <select id="model" hidden></select>
   <span id="flags"></span>
   <span id="health" class="badge wait" title="GET /health">health…</span>
   <div class="grow"></div>
@@ -313,6 +338,7 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const chat = $('chat'), modelSel = $('model'), flagsEl = $('flags');
+const modelFilter = $('modelfilter'), modelDrop = $('modeldrop');
 const LS_KEY = 'dsk_pg_v2';      // multi-chat store (sidebar history)
 const LS_LEGACY = 'dsk_pg_v1';   // pre-sidebar single-conversation store
 const CHAT_TTL = 24 * 60 * 60 * 1000;  // saved chats expire after one day
@@ -426,10 +452,11 @@ function addBubble(role) {
     const cp = document.createElement('button');
     cp.className = 'copy'; cp.title = 'Copy'; cp.textContent = '⧉';
     cp.onclick = () => {
-      navigator.clipboard.writeText(body.dataset.raw || body.textContent || '').then(() => {
-        cp.textContent = '✓';
-        setTimeout(() => { cp.textContent = '⧉'; }, 1200);
-      }).catch(() => {});
+      copyText(body.dataset.raw || body.textContent || '').then((ok) => {
+        cp.textContent = ok ? '✓' : '✗';
+        cp.title = ok ? 'Copied' : 'Copy failed — select the text manually';
+        setTimeout(() => { cp.textContent = '⧉'; cp.title = 'Copy'; }, 1200);
+      });
     };
     root.appendChild(cp);
   }
@@ -463,11 +490,37 @@ function thinkBlock(parent) {
 // still show up seconds after the page does. Poll briefly until the list
 // settles (and re-sync on focus) instead of making the user press ↻ models.
 const MODEL_POLL_MS = 3000;
-const MODEL_POLL_MAX = 40;          // ~2 min of catch-up polling per load
+const MODEL_POLL_MAX = 100;         // ~5 min of catch-up polling per load:
+                                    // after a restart web discovery (qwen,
+                                    // huggingface) takes a minute or two, and
+                                    // the list must keep growing into it
 let _modelSig = '';
 let _modelStable = 0;
 let _modelPolls = 0;
 let _modelPollTimer = null;
+
+// ---------- clipboard: navigator.clipboard only exists in a secure context
+// (https or localhost). The playground is usually served over plain
+// http://host:18010, so fall back to the legacy execCommand path.
+function copyText(text) {
+  return new Promise((resolve) => {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(() => resolve(true), () => resolve(false));
+      return;
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+    document.body.appendChild(ta);
+    ta.select();
+    try { ta.setSelectionRange(0, text.length); } catch (e) { /* older engines */ }
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    ta.remove();
+    resolve(ok);
+  });
+}
 
 function modelSignature(data) {
   return ((data && data.data) || []).map((m) => [
@@ -522,7 +575,127 @@ function renderModelList(data) {
   else if (modelInfo['auto']) modelSel.value = 'auto';  // default pick
   delete modelSel.dataset.want;
   updateFlags();
+  syncModelInput();
+  renderModelDrop();
 }
+
+// ---- smart model select: type-to-search combobox over the hidden <select>
+// The <select id="model"> stays the single state holder (value, dataset.want,
+// placeholder options); the visible input + dropdown mirror it and add
+// type-to-search filtering, arrow-key navigation and free-form custom ids.
+let _dropItems = [], _dropEls = [], _dropActive = -1;
+let _filtering = false;   // false: show the FULL list (mouse/touch browse);
+                          // true: the typed text narrows it (autocomplete)
+
+function syncModelInput() {
+  if (_filtering && !modelDrop.hidden) return;   // never clobber active typing
+  modelFilter.value = modelSel.value || '';
+}
+
+function openDrop()  { renderModelDrop(); modelDrop.hidden = false; }
+function closeDrop() { modelDrop.hidden = true; }
+
+function renderModelDrop() {
+  const q = _filtering ? (modelFilter.value || '').trim().toLowerCase() : '';
+  const items = [...modelSel.options].filter((o) => o.value);
+  _dropItems = items.filter((o) => !q
+    || o.value.toLowerCase().includes(q)
+    || ((o.parentElement && o.parentElement.label) || '').toLowerCase().includes(q));
+  modelDrop.innerHTML = '';
+  _dropEls = [];
+  if (!_dropItems.length) {
+    const d = document.createElement('div');
+    d.className = 'mempty';
+    d.textContent = items.length
+      ? 'no model matches \u201c' + modelFilter.value.trim() + '\u201d — Enter uses it as a custom id'
+      : ((modelSel.options[0] && modelSel.options[0].textContent) || 'loading…');
+    modelDrop.appendChild(d);
+    _dropActive = -1;
+    return;
+  }
+  let lastGroup = null;
+  _dropItems.forEach((o) => {
+    const g = (o.parentElement && o.parentElement.label) || '';
+    if (g && g !== lastGroup) {
+      lastGroup = g;
+      const h = document.createElement('div');
+      h.className = 'mgroup';
+      h.textContent = g;
+      modelDrop.appendChild(h);
+    }
+    const it = document.createElement('div');
+    it.className = 'mitem' + (o.value === modelSel.value ? ' sel' : '');
+    it.dataset.value = o.value;
+    it.textContent = o.textContent;
+    modelDrop.appendChild(it);
+    _dropEls.push(it);
+  });
+  const selIdx = _dropItems.findIndex((o) => o.value === modelSel.value);
+  setActiveDrop(selIdx >= 0 ? selIdx : 0);
+}
+
+function setActiveDrop(i) {
+  _dropActive = Math.max(0, Math.min(i, _dropItems.length - 1));
+  _dropEls.forEach((el, j) => el.classList.toggle('active', j === _dropActive));
+  const el = _dropEls[_dropActive];
+  if (el) el.scrollIntoView({ block: 'nearest' });
+}
+
+function pickModel(v) {
+  if (!v) return;
+  if (!modelInfo[v]) {
+    // Free-form id (not in /v1/models): keep it as a transient option —
+    // the server resolves unknown ids leniently (fast-route fallback).
+    if (![...modelSel.options].some((o) => o.value === v)) {
+      const opt = document.createElement('option');
+      opt.value = v; opt.textContent = v;
+      modelSel.appendChild(opt);
+    }
+  }
+  modelSel.value = v;
+  _filtering = false;
+  syncModelInput();
+  closeDrop();
+  updateFlags();
+}
+
+modelFilter.addEventListener('focus', () => {
+  modelFilter.select();   // typing replaces the whole id at once
+  _filtering = false;     // opening shows the full list — typing filters
+  openDrop();
+});
+modelFilter.addEventListener('input', () => { _filtering = true; openDrop(); });
+modelFilter.addEventListener('blur', () => { setTimeout(closeDrop, 150); });
+$('modeltoggle').addEventListener('click', () => {
+  // pure mouse/touch affordance: browse the full list without typing
+  // (no focus() — avoids popping the on-screen keyboard on touch)
+  if (modelDrop.hidden) { _filtering = false; openDrop(); }
+  else closeDrop();
+});
+modelFilter.addEventListener('keydown', (e) => {
+  if (modelDrop.hidden) {
+    if (e.key === 'ArrowDown' || e.key === 'Enter') { openDrop(); e.preventDefault(); }
+    return;
+  }
+  if (e.key === 'ArrowDown') { setActiveDrop(_dropActive + 1); e.preventDefault(); }
+  else if (e.key === 'ArrowUp') { setActiveDrop(_dropActive - 1); e.preventDefault(); }
+  else if (e.key === 'Enter') {
+    e.preventDefault();
+    const o = _dropItems[_dropActive];
+    if (o) pickModel(o.value);
+    else if (modelFilter.value.trim()) pickModel(modelFilter.value.trim());
+  } else if (e.key === 'Escape') { closeDrop(); _filtering = false; syncModelInput(); }
+});
+// mousedown + preventDefault: pick without blurring the input (no race)
+modelDrop.addEventListener('mousedown', (e) => {
+  const it = e.target.closest('.mitem');
+  if (!it) return;
+  e.preventDefault();
+  pickModel(it.dataset.value);
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#modelcombo')) closeDrop();
+});
 
 async function fetchModels() {
   try {
@@ -535,6 +708,7 @@ async function fetchModels() {
     return { ok: true, changed, count: (data.data || []).length };
   } catch (e) {
     if (!_modelSig) modelSel.innerHTML = '<option value="">failed to load models</option>';
+    renderModelDrop();
     return { ok: false, changed: false, count: 0 };
   }
 }
@@ -543,7 +717,9 @@ function scheduleModelPoll() {
   clearTimeout(_modelPollTimer);
   _modelPollTimer = setTimeout(async () => {
     const res = await fetchModels();
-    if (res.ok && res.count > 0) _modelStable++; else _modelStable = 0;
+    if (res.ok && res.count > 0 && !res.changed) _modelStable++; else _modelStable = 0;
+    // stable only counts UNCHANGED fetches — while discovery keeps adding
+    // models the signature keeps changing and polling must continue
     _modelPolls++;
     if (_modelStable < 2 && _modelPolls < MODEL_POLL_MAX) scheduleModelPoll();
   }, MODEL_POLL_MS);
@@ -551,6 +727,7 @@ function scheduleModelPoll() {
 
 async function loadModels() {
   if (!modelSel.options.length) modelSel.innerHTML = '<option value="">loading…</option>';
+  renderModelDrop();
   await fetchModels();
   _modelStable = 0;
   _modelPolls = 0;
