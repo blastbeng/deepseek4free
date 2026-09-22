@@ -175,7 +175,7 @@ class ChatCompletionRequest(BaseModel):
     # requests several times faster.
     thinking: Optional[bool] = None
     # Per-request proxy control (non-standard extension): force a DIRECT
-    # connection for this request — skips Tor and the rotating free-proxy
+    # connection for this request — skips the rotating free-proxy
     # pool entirely. Useful for fast, low-latency testing.
     disable_proxy: bool = False
     # OpenAI params accepted for compatibility. Unknown extra fields are
@@ -203,7 +203,7 @@ class ImageGenerationRequest(BaseModel):
     response_format: Optional[str] = 'url'  # 'url' | 'b64_json'
     user: Optional[str] = None
     # Per-request proxy control (non-standard extension): force a DIRECT
-    # connection for this request — skips Tor and the rotating free-proxy
+    # connection for this request — skips the rotating free-proxy
     # pool entirely. Useful for fast, low-latency testing.
     disable_proxy: bool = False
 
@@ -817,10 +817,11 @@ async def list_providers(request: Request):
     from .providers.base import provider_enabled
     out: List[Dict[str, Any]] = []
     for name in list(_refresher.REFRESH):
-        p_enabled = provider_enabled(name)
+        if not provider_enabled(name):
+            continue  # only providers enabled via DSF_PROVIDERS are shown
         entry: Dict[str, Any] = {
             'name': name,
-            'enabled': p_enabled,
+            'enabled': True,
             'has_credentials': _refresher._has_creds(name),
             'token_field': {'key': _TOKEN_FIELDS[name][0], 'env': _TOKEN_FIELDS[name][1]}
             if name in _TOKEN_FIELDS else None,

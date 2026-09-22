@@ -86,7 +86,7 @@ services:
       - DSF_MAX_OUTPUT=${DSF_MAX_OUTPUT:-32768}
       - DSF_MAX_OUTPUT_THINKING=${DSF_MAX_OUTPUT_THINKING:-65536}
       - DSF_ZAI_MODELS_TTL=${DSF_ZAI_MODELS_TTL:-900}
-      - DSF_HTTP_CONNECT_TIMEOUT=${DSF_HTTP_CONNECT_TIMEOUT:-15}
+      - DSF_HTTP_CONNECT_TIMEOUT=${DSF_HTTP_CONNECT_TIMEOUT:-6}
       - DSF_COPILOT_HARVEST=${DSF_COPILOT_HARVEST:-true}
       # Dynamic model discovery TTL + fallback chains
       - DSF_MODELS_TTL=${DSF_MODELS_TTL:-300}
@@ -95,7 +95,7 @@ services:
       # Outbound proxy rotation (dsk/proxies.py): fast-only free proxies + direct
       - DSF_PROXY=${DSF_PROXY:-}
       - DSF_PROXIES=${DSF_PROXIES:-}
-      - DSF_PROXY_MAX_LATENCY=${DSF_PROXY_MAX_LATENCY:-1200}
+      - DSF_PROXY_MAX_LATENCY=${DSF_PROXY_MAX_LATENCY:-800}
       - DSF_PROXY_DIRECT=${DSF_PROXY_DIRECT:-true}
       - DSF_LLMTRIM=${DSF_LLMTRIM:-true}
       - DSF_PROXY_AUTO=${DSF_PROXY_AUTO:-false}
@@ -107,9 +107,9 @@ services:
       - DSF_PROXY_CHECK=${DSF_PROXY_CHECK:-false}
       - DSF_PROXY_CHECK_URL=${DSF_PROXY_CHECK_URL:-https://api.ipify.org?format=json}
       - DSF_PROXY_CHECK_TTL=${DSF_PROXY_CHECK_TTL:-1800}
-      - DSF_PROXY_CHECK_TIMEOUT=${DSF_PROXY_CHECK_TIMEOUT:-8}
+      - DSF_PROXY_CHECK_TIMEOUT=${DSF_PROXY_CHECK_TIMEOUT:-4}
       - DSF_PROXY_CHECK_CONCURRENCY=${DSF_PROXY_CHECK_CONCURRENCY:-24}
-      - DSF_PROXY_ENSURE_TIMEOUT=${DSF_PROXY_ENSURE_TIMEOUT:-90}
+      - DSF_PROXY_ENSURE_TIMEOUT=${DSF_PROXY_ENSURE_TIMEOUT:-30}
       - DSF_PROXY_MODE=${DSF_PROXY_MODE:-random}
       - DSF_PROXY_EXCLUDE=${DSF_PROXY_EXCLUDE:-}
       - DSF_PROXY_COOLDOWN=${DSF_PROXY_COOLDOWN:-120}
@@ -157,8 +157,7 @@ services:
       - DSF_MAIL_OTP_REGEX=${DSF_MAIL_OTP_REGEX:-}
       - DOCKERMODE=true
     extra_hosts:
-      # host-gateway access for host-published operator services (the
-      # proxy pool no longer uses Tor anywhere)
+      # host-gateway access for host-published operator services
       - "host.docker.internal:host-gateway"
     volumes:
       # Persist cf_clearance cookies across container restarts (local ./data dir)

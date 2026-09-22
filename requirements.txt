@@ -1,6 +1,7 @@
 curl-cffi==0.8.1b9
 wasmtime
 numpy
+pillow
 nodriver
 drissionpage
 fastapi

@@ -26,6 +26,11 @@ and deduplicated):
   DSF_PROXY_ROTATE_TTL seconds a provider keeps its assigned proxy before
                        it is re-randomized (default 300)
 
+NO-PROXY IS A FIRST-CLASS ROUTE: the direct (no-proxy) candidate is always
+part of the rotation set (DSF_PROXY_DIRECT, default true), so traffic keeps
+flowing even when every pooled proxy is unhealthy or cooling down. When the
+health pass finds ZERO fast proxies the draw reduces to no-proxy alone.
+
 Provider randomization: every provider (deepseek/gemini/chatgpt/...) gets
 its OWN proxy, picked randomly and preferably distinct from the proxies
 already assigned to other providers — concurrent providers are spread
@@ -42,8 +47,10 @@ get_proxy() prefers healthy proxies and never blocks: until the first pass
 completes (or if everything is cooling down) traffic simply goes direct.
 
 All proxy URLs must be scheme-qualified (http://, https://, socks5://,
-socks5h:// — DNS through the proxy, recommended for Tor); bare host:port
-entries are upgraded with the source's scheme or http://. Call sites splat
+socks5h:// — DNS through the proxy); bare host:port entries are upgraded
+with the source's scheme or http://. HTTP and SOCKS5 proxies are both fine
+as long as they answer within the (low) latency budget; Tor is never used
+anywhere (no torproxy / :9050 exit). Call sites splat
 ``proxies_kwargs(provider)`` into requests/curl_cffi calls; it returns {}
 when no proxy applies so traffic goes direct unchanged.
 
@@ -152,7 +159,7 @@ def _proxy_from_dict(item: Dict[str, Any]) -> Optional[str]:
     return f"{proto}://{item['ip']}:{item['port']}"
 
 
-def _fetch_direct(url: str, timeout: int = 30) -> str:
+def _fetch_direct(url: str, timeout: int = 15) -> str:
     """Fetch a source list WITHOUT going through the proxy pool (no cycles)."""
     try:
         from curl_cffi import requests as cffi
@@ -265,7 +272,7 @@ def _refresh_pool() -> None:
             collected.extend(_parse_list(_fetch_direct(url), default_scheme))
         except Exception as exc:
             errors.append(f"{url.split('//', 1)[-1][:60]}: {exc}")
-    # static proxies (env / tor) always survive, even if every source fails
+    # static proxies (env) always survive, even if every source fails
     collected.extend(_static_proxies())
 
     seen: Dict[str, str] = {}
@@ -302,7 +309,7 @@ def _refresh_pool() -> None:
 
 def _max_latency_ms() -> float:
     """Fast-proxies-only budget: a proxy slower than this never gets traffic."""
-    return max(50.0, float(os.getenv('DSF_PROXY_MAX_LATENCY', '1200') or 1200))
+    return max(50.0, float(os.getenv('DSF_PROXY_MAX_LATENCY', '800') or 800))
 
 
 def _direct_rotation() -> bool:
@@ -336,7 +343,7 @@ def _run_check_pass() -> None:
     fast proxies only, slow exits never receive traffic."""
     url = os.getenv('DSF_PROXY_CHECK_URL',
                     'https://api.ipify.org?format=json').strip()
-    timeout = float(os.getenv('DSF_PROXY_CHECK_TIMEOUT', '8') or 8)
+    timeout = float(os.getenv('DSF_PROXY_CHECK_TIMEOUT', '4') or 4)
     workers = max(1, int(os.getenv('DSF_PROXY_CHECK_CONCURRENCY', '24') or 24))
     with _STATE.lock:
         pool = list(_STATE.pool)
@@ -406,9 +413,9 @@ def all_proxies() -> List[str]:
 def _ensure_timeout() -> float:
     """Max seconds ensure_pool() waits for its warm-up health pass."""
     try:
-        return max(15.0, float(os.getenv('DSF_PROXY_ENSURE_TIMEOUT', '90')))
+        return max(15.0, float(os.getenv('DSF_PROXY_ENSURE_TIMEOUT', '30')))
     except ValueError:
-        return 90.0
+        return 30.0
 
 
 def ensure_pool() -> int:
@@ -466,8 +473,16 @@ def get_proxy(provider: Optional[str] = None, direct_ok: bool = True) -> Optiona
     now = time.time()
     direct = _direct_rotation() and direct_ok
     with _STATE.lock:
-        healthy = [p for p in pool if _STATE.healthy.get(p, 0) > now] if _check_enabled() else []
-        candidates = healthy or pool  # until first pass, try the whole pool
+        if _check_enabled():
+            # After a completed health pass ONLY validated fast proxies are
+            # eligible; if that set is empty (every proxy failed or timed
+            # out) the draw collapses to no-proxy, so traffic never rides a
+            # known-dead proxy. Before the first pass, sample the raw pool
+            # (each draw then relies on the low connect timeout + cooldown).
+            healthy = [p for p in pool if _STATE.healthy.get(p, 0) > now]
+            candidates = healthy if _STATE.checked_at else pool
+        else:
+            candidates = pool
         alive = [p for p in candidates if _STATE.cooldown.get(p, 0) <= now]
         # rotation candidate set: [no-proxy, proxy1, proxy2, proxy3, ...]
         if direct:
@@ -565,6 +580,8 @@ def active_summary() -> str:
         parts.append(f"healthy={healthy_n}"
                      + (f" (checked {time.strftime('%H:%M:%S', time.localtime(checked))})" if checked else " (not yet)"))
         parts.append(f"max-latency={_max_latency_ms():.0f}ms")
+        if checked and not healthy_n:
+            parts.append('all-proxies-failed->direct')
     if _direct_rotation():
         parts.append("direct-rotation=on")
     if _env_bool('DSF_PROXY_AUTO'):

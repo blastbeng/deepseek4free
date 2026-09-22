@@ -51,7 +51,7 @@ logger = logging.getLogger('dsk.providers.base')
 
 # Connect-phase cap for pooled proxies: free proxies die constantly and the
 # OS-level connect can otherwise hang for minutes before the total timeout.
-HTTP_CONNECT_TIMEOUT = int(os.getenv('DSF_HTTP_CONNECT_TIMEOUT', '15'))
+HTTP_CONNECT_TIMEOUT = int(os.getenv('DSF_HTTP_CONNECT_TIMEOUT', '6'))
 
 
 def provider_enabled(name: str) -> bool:

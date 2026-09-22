@@ -249,6 +249,7 @@
       <div class="prov">loading providers…</div>
     </div>
     <div style="font-size:11px;color:var(--muted)">
+      Listing only the providers enabled in <code>.env</code> (<code>DSF_PROVIDERS</code>).<br>
       Token = session/jwt token · cookies = raw browser cookies · login = account email/password
       used by the auto-renew bot. Values saved here are the SAME stores the bot uses, so they
       take effect immediately and renew automatically on the next cycle. Use <b>Clear</b> to wipe
@@ -1181,13 +1182,10 @@ async function renderProviders() {
     const el = provEl('div', 'prov');
     el.dataset.name = provider.name;
 
-    // head: name + enabled badge + credential kind badge
+    // head: name + credential kind badge (only DSF_PROVIDERS-enabled
+    // providers are returned by /providers, so no 'enabled' badge needed)
     const head = document.createElement('div'); head.className = 'phead';
     head.append(provEl('span', 'pname', provider.name));
-    const enabled = provEl('span', 'badge' + (provider.enabled ? ' on' : ''),
-      provider.enabled ? 'enabled' : 'disabled',
-      'Enabled on this instance (DSF_PROVIDERS)');
-    head.append(enabled);
     const cp = provider.creds_present || {};
     const kinds = [cp.token && 'token', cp.cookies && 'cookies', cp.login && 'login']
       .filter(Boolean).join('· ') || 'none';

@@ -64,6 +64,7 @@ CLI:
     python -m dsk.refresher mailgen   (create a throwaway mailbox as a test)
 """
 
+import base64
 import imaplib
 import json
 import os
@@ -302,11 +303,29 @@ def _load_accounts() -> Dict[str, Dict[str, str]]:
 
 
 def _save_account(name: str, email: str, password: str,
-                  backend: str = '') -> None:
-    """Persist a bot-created account so later renewals can re-login."""
+                  backend: str = '', extra: Optional[Dict[str, Any]] = None
+                  ) -> None:
+    """Persist a bot-created account so later renewals can re-login.
+
+    When the caller doesn't supply a new ``mail_session`` (e.g. a signup
+    rung that reuses a pre-existing email/password but has no fresh
+    session from ``mailgen.create_email``), the previously stored
+    ``mail_session`` / ``backend`` are PRESERVED — dropping it would
+    orphan the signup mailbox and break the activation-link polling on
+    the next cycle.
+    """
     accs = _load_accounts()
-    accs[name] = {'email': email, 'password': password, 'backend': backend,
-                  'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+    prev = dict(accs.get(name) or {})
+    entry = {'email': email, 'password': password, 'backend': backend,
+             'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+    if extra:
+        entry.update(extra)
+    same_email = (prev.get('email') or '') == (email or '')
+    if same_email and not entry.get('mail_session') and prev.get('mail_session'):
+        entry['mail_session'] = prev['mail_session']
+    if same_email and not entry.get('backend') and prev.get('backend'):
+        entry['backend'] = prev['backend']
+    accs[name] = entry
     path = _data_dir() / _ACCOUNTS_FILE
     tmp = path.with_suffix('.new')
     tmp.write_text(json.dumps(accs, indent=2, ensure_ascii=False),
@@ -444,6 +463,25 @@ def _qwen_headers() -> Dict[str, str]:
         return {'User-Agent': _UA}
 
 
+def _qwen_request(method: str, url: str, **kw) -> Tuple[Any, Optional[str]]:
+    """``requests`` with the pooled egress, retried once DIRECT on failure.
+
+    Pooled exits intermittently break TLS to chat.qwen.ai (self-signed
+    cert / SOCKS refused). The qwen auth endpoints are WAF-free, so a
+    direct connection is a safe second rung. Returns (response, note)
+    where note explains the fallback (or None); the direct attempt's
+    exception propagates if it also fails.
+    """
+    import requests
+    timeout = kw.pop('timeout', 30)
+    try:
+        return (requests.request(method, url, timeout=timeout,
+                                 **kw, **_proxies_kwargs(url)), None)
+    except Exception as pooled_exc:  # noqa: BLE001
+        note = f'direct-retry after {type(pooled_exc).__name__}'
+    return requests.request(method, url, timeout=timeout, **kw), note
+
+
 def _qwen_signin(email: str, password: str) -> Tuple[bool, str]:
     """HTTP re-login on chat.qwen.ai (OpenWebUI-style /api/v1/auths/signin).
 
@@ -453,11 +491,10 @@ def _qwen_signin(email: str, password: str) -> Tuple[bool, str]:
     """
     import requests
     try:
-        resp = requests.post(
-            'https://chat.qwen.ai/api/v1/auths/signin',
+        resp, note = _qwen_request(
+            'POST', 'https://chat.qwen.ai/api/v1/auths/signin',
             json={'email': email, 'password': password},
-            headers=_qwen_headers(), timeout=30,
-            **_proxies_kwargs('https://chat.qwen.ai'))
+            headers=_qwen_headers())
     except Exception as e:  # noqa: BLE001
         return False, f'signin failed: {type(e).__name__}: {e}'
     if resp.status_code != 200:
@@ -480,15 +517,17 @@ def _qwen_signin(email: str, password: str) -> Tuple[bool, str]:
 
 
 def refresh_qwen() -> Tuple[bool, str]:
-    import requests
+    """Verify the stored token; re-login, or converge a pending activation."""
     jar = _load_jar('qwen')
     token = (jar.get('token') or '').strip()
     if token:
         try:
-            resp = requests.get(
-                'https://chat.qwen.ai/api/v1/auths',
-                headers={**_qwen_headers(), 'Authorization': f'Bearer {token}'},
-                timeout=30, **_proxies_kwargs('https://chat.qwen.ai'))
+            resp, note = _qwen_request(
+                'GET', 'https://chat.qwen.ai/api/v1/auths',
+                headers={**_qwen_headers(),
+                         'Authorization': f'Bearer {token}'})
+            if note:
+                _log_history('qwen', 'stage', f'verify fell back to direct ({note})')
         except Exception as e:  # noqa: BLE001
             return False, f'verify failed: {type(e).__name__}: {e}'
         if resp.status_code == 200:
@@ -505,8 +544,77 @@ def refresh_qwen() -> Tuple[bool, str]:
                        'automatic re-login')
     ok, detail = _qwen_signin(email, password)
     if not ok:
+        # 'pending activation' means the account exists but was never
+        # confirmed — poll the signup mailbox and open the activation link
+        # so renewal converges autonomously across cycles.
+        if _qwen_pending(detail):
+            _log_history('qwen', 'stage',
+                         f'signin pending activation; activating ({detail})')
+            return _qwen_activate(email, password)
         return False, f'token rejected; {detail}'
     return True, detail
+
+
+def _qwen_pending(detail: str) -> bool:
+    """True when a signin failure means 'account exists but unactivated'."""
+    d = (detail or '').lower()
+    return any(n in d for n in ('pending', 'unverified', 'not verified',
+                                'verify', 'activation', 'activat'))
+
+
+def _qwen_mail_session(email: str) -> Optional[Dict[str, Any]]:
+    """Rebuild a mailgen session for the qwen account's signup mailbox."""
+    stored = _load_accounts().get('qwen') or {}
+    if stored.get('email') and stored.get('email') != email:
+        return None
+    ms = stored.get('mail_session')
+    if isinstance(ms, dict) and ms.get('backend') and ms.get('address'):
+        return dict(ms)
+    if (stored.get('backend') or '').strip() and email:
+        return {'backend': stored['backend'], 'address': email}
+    return None
+
+
+def _qwen_activate(email: str, password: str) -> Tuple[bool, str]:
+    """Finish a pending chat.qwen.ai activation autonomously.
+
+    New accounts submit to 'pending activation': the confirmation mail lands
+    in the bot's signup mailbox. Poll it for the activation URL, open the
+    link (plain GET first, then a real headed browser as fallback), and HTTP
+    re-login. Called from the login and signup rungs, so the daemon converges
+    on activation across renewal cycles with no operator action.
+    """
+    session = _qwen_mail_session(email)
+    if not session:
+        return False, 'no mailbox backend recorded for this qwen account'
+    link = mailgen.fetch_otp(session, max_wait_s=120, sender_needle='qwen',
+                             code_re=re.compile(
+                                 r'(https://chat\.qwen\.ai/[^\s"\'<>]*'
+                                 r'activate[^\s"\'<>]*)'))
+    if not link:
+        return False, 'activation link not in mailbox yet'
+    _log_history('qwen', 'stage', 'activation link found; opening')
+    try:
+        _http_get(link, cookies={}, timeout=30)
+    except Exception:  # noqa: BLE001 — the browser visit is authoritative
+        pass
+    page = None
+    try:
+        page = _browser(proxy=_pool_proxy(), headed=True)
+        page.get(link)
+        time.sleep(6)
+    except Exception:  # noqa: BLE001 — the plain GET above may have sufficed
+        pass
+    finally:
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:  # noqa: BLE001
+                pass
+    ok, detail = _qwen_signin(email, password)
+    if ok:
+        _log_history('qwen', 'stage', 'activation completed; re-login ok')
+    return ok, detail
 
 
 def refresh_kimi() -> Tuple[bool, str]:
@@ -649,37 +757,12 @@ def _signup_proxy() -> Optional[str]:
 
     DeepSeek (CloudFront) blocks some datacenter/host IPs outright, so
     signups prefer an explicit ``DSF_SIGNUP_PROXY``; otherwise the ladder
-    falls through to the dynamic pool, the local Tor exit, and finally
-    direct. Returns None = direct connection.
+    falls through to the dynamic pool and finally direct. Tor is never
+    used. Returns None = direct connection.
     """
     explicit = os.getenv('DSF_SIGNUP_PROXY', '').strip()
     if explicit:
         return explicit
-    return None
-
-
-def _tor_proxy() -> Optional[str]:
-    """Tor SOCKS5 exit for the signup ladder, two mounts.
-
-    Tor exits are often CloudFront-allowlisted where datacenter pool IPs
-    are hard-403'd. Mounts, probed in order:
-      1. docker network alias ``torproxy:9050`` (fastest, when a network
-         attach exists);
-      2. the host-published port ``host.docker.internal:9050`` — resilient
-         to compose teardowns that sever manual network attaches (torproxy
-         publishes 9050 to the host).
-    Returns None when neither answers or the exit is currently blocked.
-    """
-    import socket
-    for host in ('torproxy', 'host.docker.internal'):
-        proxy = f'socks5://{host}:9050'
-        try:
-            s = socket.create_connection((host, 9050), timeout=3)
-            s.close()
-        except OSError:
-            continue
-        if _ds_egress_ok(proxy):
-            return proxy
     return None
 
 
@@ -707,7 +790,7 @@ def _ensure_display() -> bool:
         return False
 
 
-def _browser(proxy: Optional[str] = None):
+def _browser(proxy: Optional[str] = None, headed: bool = False):
     from DrissionPage import ChromiumPage, ChromiumOptions
     options = ChromiumOptions().auto_port()
     options.set_argument('--no-sandbox')
@@ -730,7 +813,13 @@ def _browser(proxy: Optional[str] = None):
                 f'--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE {host}')
         else:
             options.set_proxy(proxy)
-    if _env_bool('DSF_REFRESHER_HEADLESS', True):
+    # headed=True forces a windowed real Chrome (anti-bot services score
+    # headless clients far lower — Aliyun slider, Cloudflare, Google) and
+    # degrades to headless only when no X server can be obtained.
+    if headed:
+        if not _ensure_display():
+            options.headless(True)  # no X server obtainable -> degrade quietly
+    elif _env_bool('DSF_REFRESHER_HEADLESS', True):
         options.headless(True)
     elif not _ensure_display():
         options.headless(True)  # no X server obtainable -> degrade quietly
@@ -756,6 +845,61 @@ def _body_head(page) -> str:
         return page.ele('tag:body').text[:300].lower()
     except Exception:  # noqa: BLE001 — detached/blank page
         return ''
+
+
+_NET_LOG_JS = r"""
+window.__dsf_log = window.__dsf_log || [];
+if (!window.__dsf_hooked) {
+  window.__dsf_hooked = true;
+  const of = window.fetch;
+  window.fetch = function(...a){
+    return of.apply(this, a).then(r => {
+      try { const c = r.clone();
+        c.text().then(t => window.__dsf_log.push(
+          [String((a[0]&&a[0].url)||a[0]), r.status, String(t).slice(0,500)])); }
+      catch(e){}
+      return r;
+    });
+  };
+  const oo = XMLHttpRequest.prototype.open;
+  const os = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(m,u){ this.__u=u; return oo.apply(this,arguments); };
+  XMLHttpRequest.prototype.send = function(b){
+    this.addEventListener('load', () => {
+      try { window.__dsf_log.push(
+        [String(this.__u), this.status, String(this.responseText).slice(0,500)]); }
+      catch(e){}
+    });
+    return os.apply(this, arguments);
+  };
+}
+"""
+
+
+def _net_log_install(page) -> None:
+    """Record fetch/XHR responses on the page (signup API verdicts)."""
+    try:
+        page.run_js(_NET_LOG_JS)
+    except Exception:  # noqa: BLE001 — diagnostics only
+        pass
+
+
+def _net_log_read(page, needle: str = '', limit: int = 6) -> str:
+    """Last few recorded request/response pairs, filtered by URL ``needle``."""
+    try:
+        log = page.run_js('return window.__dsf_log || [];') or []
+    except Exception:  # noqa: BLE001 — diagnostics only
+        return ''
+    out = []
+    for entry in log:
+        try:
+            url, status, body = entry[0], entry[1], entry[2]
+        except Exception:  # noqa: BLE001
+            continue
+        if needle and needle.lower() not in str(url).lower():
+            continue
+        out.append(f'{status} {url} -> {str(body)[:200]}')
+    return ' || '.join(out[-limit:])
 
 
 def _click_any(page, targets: List[str]) -> bool:
@@ -843,10 +987,22 @@ def browser_login(name: str) -> Tuple[bool, str]:
         # chat.qwen.ai /signin is not WAF-gated -> plain HTTP re-login,
         # no browser needed (and /signup sits behind an Aliyun slider,
         # so the API path is strictly more reliable here)
-        return _qwen_signin(email, password)
+        ok, detail = _qwen_signin(email, password)
+        if ok:
+            return ok, detail
+        if _qwen_pending(detail):
+            # account exists but is unactivated: poll the signup mailbox for
+            # the activation link, open it, then re-login — no operator needed
+            ok_a, detail_a = _qwen_activate(email, password)
+            if ok_a:
+                return _qwen_signin(email, password)
+            return False, f'{detail}; {detail_a}'
+        return ok, detail
     proxy = _deepseek_egress() if name == 'deepseek' else None
     try:
-        page = _browser(proxy=proxy)
+        # headed: CloudFront's WAF hard-403s headless clients but serves the
+        # SPA (JS challenge -> aws-waf-token) to a windowed real Chrome
+        page = _browser(proxy=proxy, headed=True)
     except Exception as e:  # noqa: BLE001
         return False, f'browser unavailable: {e}'
     try:
@@ -855,6 +1011,7 @@ def browser_login(name: str) -> Tuple[bool, str]:
             # client-side routing is not.
             page.get('https://chat.deepseek.com/')
             time.sleep(6)
+            _net_log_install(page)
             root_head = ((page.title or '') + ' ' + _body_head(page)).lower()
             if ('could not be satisfied' in root_head
                     or '403 error' in root_head):
@@ -940,16 +1097,17 @@ def _cool(proxy: Optional[str]) -> None:
 def _ds_egress_ok(proxy: Optional[str]) -> bool:
     """Cheap CloudFront reachability probe for a signup/login egress.
 
-    chat.deepseek.com hard-403s document GETs by IP reputation. A 200 on
-    the root page predicts the browser SPA entry will work; 403/challenge
-    responses mark the exit unusable before we pay browser startup cost.
+    chat.deepseek.com hard-403s document GETs by IP reputation; a *browser*
+    session (headed Chrome) solves the AWS WAF JS challenge when the IP is
+    merely challenged rather than blocked. ``proxy=None`` probes the direct
+    egress, so the ladder can prefer local traffic when the host IP passes.
     """
-    if not proxy:
-        return False
     try:
         from .providers.base import http_get
         r = http_get('https://chat.deepseek.com/',
-                     proxies={'http': proxy, 'https': proxy}, timeout=12)
+                     proxies=({'http': proxy, 'https': proxy} if proxy
+                              else None),
+                     timeout=12)
     except Exception:  # noqa: BLE001 — treat as unusable
         return False
     if r.status_code == 200:
@@ -993,10 +1151,17 @@ def _pool_egresses(limit: int = 3, samples: int = 6) -> List[str]:
 
 
 def _deepseek_egress() -> Optional[str]:
-    """Best single egress for a DeepSeek browser session (login/renewal)."""
+    """Best single egress for a DeepSeek browser session (login/renewal).
+
+    Direct traffic wins whenever the host IP passes the reachability probe
+    (a headed browser solves the AWS WAF challenge); free-proxy pool exits
+    are only consulted when direct is hard-blocked.
+    """
     explicit = _signup_proxy()
     if explicit and _ds_egress_ok(explicit):
         return explicit
+    if _ds_egress_ok(None):
+        return None
     egresses = _pool_egresses(limit=1, samples=4)
     return egresses[0] if egresses else None
 
@@ -1041,15 +1206,23 @@ def signup_deepseek() -> Tuple[bool, str]:
         generated = True
     # egress ladder: explicit DSF_SIGNUP_PROXY first, then up to 3 distinct
     # dynamic-pool exits that PASS the root-page reachability probe, then
-    # the local Tor SOCKS5 exit (torproxy:9050 — its exit IPs are not in
-    # CloudFront's datacenter blocklists, unlike pool/host IPs), then
-    # direct (duplicates dropped). Blocked exits are cooled down so the
-    # next rung samples a fresh, hopefully-working IP instead of the same
-    # blocked one.
+    # direct (duplicates dropped). Tor is never used. Blocked exits are
+    # cooled down so the next rung samples a fresh, hopefully-working IP
+    # instead of the same blocked one.
     ladder: List[Optional[str]] = []
     seen: set = set()
-    for p in (([_signup_proxy()] if _signup_proxy() else [])
-              + _pool_egresses() + [_tor_proxy(), None]):
+    # direct first when the host IP passes the (cheap) reachability probe —
+    # the free-proxy pool is unreliable and each dead rung costs a browser
+    # startup; explicit DSF_SIGNUP_PROXY and pool exits follow, direct last
+    # as the always-present fallback.
+    ordered: List[Optional[str]] = []
+    if _ds_egress_ok(None):
+        ordered.append(None)
+    if _signup_proxy():
+        ordered.append(_signup_proxy())
+    ordered += _pool_egresses()
+    ordered.append(None)
+    for p in ordered:
         if p is None or p not in seen:
             ladder.append(p)
             if p is not None:
@@ -1057,7 +1230,11 @@ def signup_deepseek() -> Tuple[bool, str]:
     for proxy in ladder or [None]:
         page = None
         try:
-            page = _browser(proxy=proxy)
+            # headed: the CloudFront WAF blocks headless clients outright
+            # (403 "request blocked") while a windowed Chrome passes the JS
+            # challenge and reaches the SPA — the direct rung is the reliable
+            # one, so run it like a real browser.
+            page = _browser(proxy=proxy, headed=True)
             # CloudFront 403s document GETs of /sign_up by IP reputation,
             # but the root SPA loads and routes to /sign_up CLIENT-SIDE
             # (no document request -> no WAF block). Root first, click
@@ -1092,7 +1269,8 @@ def signup_deepseek() -> Tuple[bool, str]:
                 last_error = 'email field not found'
                 continue
             _fill_first(page, _PASSWORD_SELECTORS, password)
-            _click_any(page, ['Send Code', 'Send code', '获取验证码'])
+            clicked_send = _click_any(page, ['Send Code', 'Send code',
+                                            '获取验证码'])
             # Capture the form's reaction to the send: a visible error means
             # the request was refused (rate limit, captcha, domain rejected
             # with a UI message); a silent accept followed by no OTP means
@@ -1105,6 +1283,11 @@ def signup_deepseek() -> Tuple[bool, str]:
                 if needle in send_feedback:
                     send_note = f' (page feedback: {needle})'
                     break
+            send_api = _net_log_read(page, needle='code')
+            _log_history('deepseek', 'stage',
+                         f'send-code seen ({email}) clicked={clicked_send} '
+                         + (send_api or 'no code API call recorded')
+                         + ' || ALL: ' + (_net_log_read(page) or 'none'))
             if 'exist' in send_feedback and generated and session:
                 # shared gmail dot/plus variants may already be registered —
                 # mint a fresh mailbox and resend on this rung
@@ -1186,7 +1369,7 @@ def signup_chatgpt() -> Tuple[bool, str]:
     # password: mint a form password independent of the mailbox creds.
     password = session.get('password') or mailgen.gen_password()
     try:
-        page = _browser()
+        page = _browser(headed=True)
     except Exception as e:  # noqa: BLE001
         return False, f'browser unavailable: {e}'
     try:
@@ -1250,7 +1433,7 @@ def signup_gemini() -> Tuple[bool, str]:
     # password: mint a form password independent of the mailbox creds.
     password = session.get('password') or mailgen.gen_password()
     try:
-        page = _browser()
+        page = _browser(headed=True)
     except Exception as e:  # noqa: BLE001
         return False, f'browser unavailable: {e}'
     try:
@@ -1337,7 +1520,7 @@ def signup_claude() -> Tuple[bool, str]:
     password = session.get('password') or mailgen.gen_password()
     page = None
     try:
-        page = _browser()
+        page = _browser(headed=True)
         page.get('https://claude.ai/login')
         time.sleep(6)
         if not _click_any(page, ['Sign up', 'Create account']):
@@ -1395,7 +1578,7 @@ def signup_grok() -> Tuple[bool, str]:
     password = session.get('password') or mailgen.gen_password()
     page = None
     try:
-        page = _browser()
+        page = _browser(headed=True)
         page.get('https://accounts.x.ai/sign-up')
         time.sleep(6)
         if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
@@ -1459,7 +1642,7 @@ def signup_kimi() -> Tuple[bool, str]:
     password = session.get('password') or mailgen.gen_password()
     page = None
     try:
-        page = _browser()
+        page = _browser(headed=True)
         page.get('https://www.kimi.com/')
         time.sleep(6)
         if not _click_any(page, ['Sign up', 'Sign Up', '注册', 'Log in', '登录']):
@@ -1525,7 +1708,7 @@ def signup_mistral() -> Tuple[bool, str]:
     password = session.get('password') or mailgen.gen_password()
     page = None
     try:
-        page = _browser()
+        page = _browser(headed=True)
         page.get('https://auth.mistral.ai/ui/registration')
         time.sleep(6)
         if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
@@ -1580,74 +1763,334 @@ _QWEN_NAME_SELECTORS = ['@placeholder:Full Name', 'css:input[type=text]']
 _QWEN_EMAIL_SELECTORS = ['@placeholder:Email', 'css:input[type=email]']
 
 
-def _qwen_slider_pass(page, attempts: int = 10) -> bool:
-    """Solve Aliyun's noCaptcha slider with humanized drags.
+def _largest_component(mask):
+    """Bounding box + size of the largest 4-connected True region."""
+    import numpy as np
+    from collections import deque
+    H, W = mask.shape
+    lbl = np.zeros(mask.shape, dtype=int)
+    best, bestn = None, 0
+    cur = 0
+    for y in range(H):
+        for x in range(W):
+            if mask[y, x] and lbl[y, x] == 0:
+                cur += 1
+                q = deque([(y, x)])
+                lbl[y, x] = cur
+                n = 0
+                x0 = x1 = x
+                y0 = y1 = y
+                while q:
+                    cy, cx = q.popleft()
+                    n += 1
+                    x0, x1 = min(x0, cx), max(x1, cx)
+                    y0, y1 = min(y0, cy), max(y1, cy)
+                    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        ny, nx = cy + dy, cx + dx
+                        if (0 <= ny < H and 0 <= nx < W and mask[ny, nx]
+                                and lbl[ny, nx] == 0):
+                            lbl[ny, nx] = cur
+                            q.append((ny, nx))
+                if n > bestn:
+                    bestn, best = n, (x0, x1, y0, y1, n)
+    return best
+
+
+def _masked_ncc(gray_b, gray_p, mask):
+    """Best normalized cross-correlation of the masked piece patch over the
+    background. Returns [(score, bx, by), ...] best-first."""
+    import numpy as np
+    ph, pw = gray_p.shape
+    bh, bw = gray_b.shape
+    m = mask.astype(float)
+    n = m.sum()
+    sp = (gray_p * m).sum()
+    sp2 = (gray_p * gray_p * m).sum()
+    var_p = max(sp2 - sp * sp / n, 1e-9)
+    out = []
+    for by in range(0, bh - ph + 1):
+        for bx in range(0, bw - pw + 1):
+            win = gray_b[by:by + ph, bx:bx + pw]
+            sw = (win * m).sum()
+            sw2 = (win * win * m).sum()
+            var_w = max(sw2 - sw * sw / n, 1e-9)
+            num = (win * gray_p * m).sum() - sp * sw / n
+            out.append((num / np.sqrt(var_w * var_p), bx, by))
+    out.sort(reverse=True)
+    return out
+
+
+# piece element-left as a function of handle travel D on the 300px embed
+# track: left(D) = A*D^2 + B*D  (accelerating slider easing, measured)
+_QWEN_TRACK = (0.0035503, 0.0769223)
+
+
+def _qwen_widget_state(page) -> Optional[dict]:
+    """Locate the Aliyun slider widget and dump what the solver needs.
+
+    Returns None when no widget is on the page (not armed, or already
+    solved and gone). The piece/bg <img> elements are found by displayed
+    size; their src is either an inline data: URI or a static-captcha CDN
+    URL — both are handled by _qwen_fetch_challenge_images. The knob has
+    no DOM node (CSS-drawn); it sits at the left edge of the text-box.
+    """
+    js = (
+        'const pick=(lo,hi,hlo,hhi)=>{'
+        'for(const im of document.querySelectorAll("img")){'
+        'const r=im.getBoundingClientRect();'
+        'if(r.width>=lo&&r.width<=hi&&r.height>=hlo&&r.height<=hhi)'
+        'return [im.src,r.x,r.y,r.width,r.height];}return null;};'
+        'const bg=pick(285,315,185,215), piece=pick(45,60,100,220);'
+        'const box=document.querySelector(".aliyunCaptcha-sliding-text-box");'
+        'const br=box?box.getBoundingClientRect():null;'
+        'const tx=document.querySelector(".aliyunCaptcha-sliding-text");'
+        'return JSON.stringify({bg:bg,piece:piece,'
+        'box:br?[br.x,br.y,br.width,br.height]:null,'
+        'state:tx?tx.textContent:null});')
+    try:
+        raw = page.run_js(js)
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    if not d.get('bg') or not d.get('piece') or not d.get('box'):
+        return None
+    return d
+
+
+def _qwen_fetch_challenge_images(state: dict) -> Tuple[bytes, bytes]:
+    """Raw PNG bytes for (background, piece sprite) from widget state."""
+    out = []
+    for key in ('bg', 'piece'):
+        src = state[key][0]
+        if src.startswith('data:'):
+            out.append(base64.b64decode(src.split(',', 1)[1]))
+        else:
+            import requests as _rq
+            # public static CDN — no WAF, no cookies, egress irrelevant
+            r = _rq.get(src, timeout=20, headers={'User-Agent': _UA})
+            r.raise_for_status()
+            out.append(r.content)
+    return out[0], out[1]
+
+
+def _qwen_solve_challenge(bg_bytes: bytes,
+                          piece_bytes: bytes,
+                          disp_w: float = 300.0) -> Optional[Tuple[float, str]]:
+    """Closed-form slide target for one challenge.
+
+    Handles both observed styles — a white ghost piece baked into the
+    background (whiteness-blob detection) and a dark hole cut out of it
+    (masked NCC of the piece sprite) — and arbitrates between them.
+    Returns (L_star, method): L* is the piece element-left target on the
+    DISPLAYED background in px, or None when the challenge is unsolvable.
+    """
+    try:
+        import io as _io
+        import numpy as np
+        from PIL import Image
+        bg = np.asarray(
+            Image.open(_io.BytesIO(bg_bytes)).convert('RGB'), float)
+        pc = np.asarray(
+            Image.open(_io.BytesIO(piece_bytes)).convert('RGBA'), float)
+    except Exception:  # noqa: BLE001
+        return None
+    A, B = _QWEN_TRACK
+    alpha = pc[:, :, 3]
+    pys, pxs = np.where(alpha > 128)
+    if not len(pxs):
+        return None
+    px0, py0 = int(pxs.min()), int(pys.min())
+    pw = int(pxs.max() - pxs.min() + 1)
+    ph = int(pys.max() - pys.min() + 1)
+    patch = pc[py0:py0 + ph, px0:px0 + pw, :3]
+    pmask = alpha[py0:py0 + ph, px0:px0 + pw] > 128
+    gray_p = patch.mean(axis=2)
+    gray_b = bg.mean(axis=2)
+    sx = disp_w / bg.shape[1]  # displayed/natural scale (300/296)
+    # style 1: white ghost blob (largest bright low-saturation component)
+    R, G, Bl = bg[:, :, 0], bg[:, :, 1], bg[:, :, 2]
+    mx = np.maximum(np.maximum(R, G), Bl)
+    mn = np.minimum(np.minimum(R, G), Bl)
+    white = (mx > 150) & ((mx - mn) < 40)
+    white[py0 + 3:py0 + ph - 3, px0 + 3:px0 + pw - 3] = False
+    ghost = None
+    try:
+        comp = _largest_component(white)
+        if comp and comp[4] > 200:
+            x0, x1, y0, y1, _n = comp
+            ghost = (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    except Exception:  # noqa: BLE001
+        ghost = None
+    # style 2: masked NCC of the piece sprite
+    try:
+        top = _masked_ncc(gray_b, gray_p, pmask)
+        score, ndx, ndy = top[0]
+    except Exception:  # noqa: BLE001
+        return None
+    if score >= 0.6:
+        dx, dy, method = ndx, ndy, 'ncc'
+    elif ghost and abs(ghost[2] - pw) < 14 and abs(ghost[3] - ph) < 14:
+        dx, dy, method = ghost[0], ghost[1], 'ghost'
+    elif score >= 0.35:
+        dx, dy, method = ndx, ndy, 'ncc-weak'
+    elif ghost:
+        dx, dy, method = ghost[0], ghost[1], 'ghost-weak'
+    else:
+        return None
+    return (dx * sx - px0, method)
+
+
+def _qwen_drag_closed_loop(page, state: dict,
+                           l_star: float) -> Optional[float]:
+    """Humanized glide + vision-corrected micro-creep to the target.
+
+    The piece <img> is read live from the DOM; each correction inverts the
+    calibrated piece-left(D) easing, so the landing error converges below
+    a pixel regardless of where the glide phase stopped. Returns the final
+    piece element-left error in px (None if the piece could not be read).
+    """
+    A, B = _QWEN_TRACK
+    bx = state['bg'][1]
+    box = state['box']
+    gx, gy = box[0] + 20, box[1] + box[3] / 2  # knob at the box's left edge
+    d_est = (-B + (B * B + 4 * A * l_star) ** 0.5) / (2 * A)
+    js = ('for(const im of document.querySelectorAll("img")){'
+          'const r=im.getBoundingClientRect();'
+          'if(r.width>=45&&r.width<=60&&r.height>=100)return r.x;}'
+          'return null;')
+    ac = page.actions
+    # human approach: stray hovers before grabbing the knob
+    ac.move(gx - random.randint(15, 35), gy + random.randint(15, 40),
+            duration=.3)
+    ac.move(gx - random.randint(3, 8), gy + random.randint(1, 4),
+            duration=.2)
+    time.sleep(random.uniform(.2, .5))
+    ac.move_to((gx, gy)).hold()
+    time.sleep(random.uniform(.15, .4))
+    x = gx
+    # glide to ~92% on a smoothstep velocity profile with jitter
+    d1 = d_est * .92
+    segs = random.randint(7, 10)
+    for i in range(1, segs + 1):
+        u = i / segs
+        e = (3 * u * u - 2 * u * u * u) * d1
+        nx = gx + e + random.uniform(-1, 1)
+        ac.move(nx - x, random.uniform(-1.5, 1.5),
+                duration=random.uniform(.04, .12))
+        x = nx
+        if random.random() < .25:
+            time.sleep(random.uniform(.02, .09))
+    time.sleep(random.uniform(.05, .2))
+    # vision-corrected creep: read the piece, invert the easing, land
+    err = None
+    for _ in range(22):
+        try:
+            p = page.run_js(js)
+        except Exception:  # noqa: BLE001
+            p = None
+        if p is None:
+            break
+        err = (bx + l_star) - p
+        if abs(err) <= 0.8:
+            break
+        gain = 2 * A * (x - gx) + B
+        dh = max(-12.0, min(12.0, err / gain))
+        if abs(dh) < .25:
+            dh = -0.25 if dh < 0 else 0.25
+        x += dh
+        ac.move(dh, 0, duration=random.uniform(.03, .08))
+        time.sleep(random.uniform(.12, .25))
+    time.sleep(random.uniform(.2, .45))
+    ac.release()
+    time.sleep(random.uniform(.8, 1.4))
+    return err
+
+
+def _qwen_rearm(page) -> None:
+    """Click the slider's text area to fetch a fresh challenge (this also
+    restarts the 20-minute init clock that expires with VerifyCode F014)."""
+    try:
+        el = page.ele('.aliyunCaptcha-sliding-text-box', timeout=3)
+        if el:
+            el.click(by_js=False)
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        page.run_js('const e=document.querySelector('
+                    '".aliyunCaptcha-sliding-text-box");if(e)e.click();')
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _qwen_last_verify_code(page) -> str:
+    """VerifyCode from the newest -verify.captcha response in the net log
+    (T001 = pass; F001 = behavioral reject; F015 = wrong position; F014 =
+    init expired)."""
+    try:
+        body = _net_log_read(page, needle='-verify.captcha')
+        if body:
+            last = body.split(' || ')[-1]
+            raw = last.split(' -> ', 1)[1] if ' -> ' in last else ''
+            return str((json.loads(raw).get('Result') or {})
+                       .get('VerifyCode') or '')
+    except Exception:  # noqa: BLE001
+        pass
+    return ''
+
+
+def _qwen_slider_pass(page, attempts: int = 6) -> bool:
+    """Solve Aliyun's noCaptcha slider with a closed-loop vision drag.
 
     chat.qwen.ai's signup POST is replayed by the WAF once the slider is
-    solved. Scoring is probabilistic — each attempt gets a freshly
-    randomized trajectory; the widget resets in place after a rejection.
-    Returns True when no widget is present (already passed) or a drag was
-    accepted; False when every attempt was rejected.
+    solved. The widget's piece/background images are read straight from
+    the DOM, the slide target is computed offline (_qwen_solve_challenge:
+    ghost-blob / masked-NCC arbitration), and a humanized glide lands the
+    piece within a pixel of the target (_qwen_drag_closed_loop). The whole
+    arm-solve-drag cycle runs in seconds — well inside the challenge's
+    20-minute init validity (an expired init fails with VerifyCode F014
+    no matter how accurate the landing was).
+
+    Position is never the bottleneck once landed accurately; the residual
+    F001 rejects are behavioral/device-trust scoring, so each failed drag
+    is followed by a re-arm (fresh challenge + fresh init clock) instead
+    of grinding on one widget.
+    Returns True when no widget is present (already passed / not armed) or
+    a drag was accepted; False when every attempt was rejected.
     """
     for _ in range(attempts):
-        slider = None
+        state = _qwen_widget_state(page)
+        if not state:
+            return True  # no widget — the signup POST went through
+        time.sleep(random.uniform(.4, 1.0))
+        sol = None
         try:
-            slider = page.ele('#aliyunCaptcha-sliding-slider', timeout=4)
+            bg_b, piece_b = _qwen_fetch_challenge_images(state)
+            sol = _qwen_solve_challenge(bg_b, piece_b)
         except Exception:  # noqa: BLE001
-            slider = None
-        if not slider:
+            sol = None
+        if not sol:
+            _qwen_rearm(page)
+            time.sleep(1.5)
+            continue
+        try:
+            err = _qwen_drag_closed_loop(page, state, sol[0])
+        except Exception:  # noqa: BLE001
+            err = None
+        time.sleep(2.0)  # verify POST + verdict
+        code = _qwen_last_verify_code(page)
+        _log_history('qwen', 'stage',
+                     f'slider method={sol[1]} err={err} verify={code or "?"}')
+        if code == 'T001' or not _qwen_widget_state(page):
+            time.sleep(3)  # let the WAF replay the original POST
             return True
-        time.sleep(random.uniform(1.5, 3.0))  # let the widget settle
-        try:
-            ac = page.actions
-            mid = slider.rect.midpoint
-            # human approach: two stray hovers before grabbing the handle
-            ac.move(mid[0] - random.randint(18, 40),
-                    mid[1] - random.randint(10, 25), duration=.3)
-            ac.move(mid[0] - random.randint(4, 10),
-                    mid[1] - random.randint(2, 6), duration=.25)
-            time.sleep(random.uniform(.3, .6))
-            ac.move_to(slider).hold()
-            covered = 0
-            # slow start
-            for dx in (random.randint(5, 8), random.randint(8, 12),
-                       random.randint(10, 15), random.randint(12, 18)):
-                ac.move(dx, random.randint(-2, 2),
-                        duration=random.uniform(.07, .15))
-                covered += dx
-            time.sleep(random.uniform(.05, .15))
-            # fast middle until near the track end (~300px)
-            while covered < 235:
-                dx = random.randint(28, 52)
-                ac.move(dx, random.randint(-3, 3),
-                        duration=random.uniform(.04, .08))
-                covered += dx
-            # careful end: creep, overshoot, then correct back
-            for dx in (random.randint(10, 18), random.randint(6, 12),
-                       random.randint(3, 8)):
-                ac.move(dx, random.randint(-2, 2),
-                        duration=random.uniform(.07, .16))
-                covered += dx
-            time.sleep(random.uniform(.1, .25))
-            back = random.randint(10, 20)
-            ac.move(-back, 0, duration=.2)
-            time.sleep(.1)
-            ac.move(-random.randint(2, 6), 0, duration=.25)
-            time.sleep(random.uniform(.2, .4))
-            ac.release()
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(3)
-        try:
-            done = page.run_js(
-                'return !!document.querySelector(".nc_ok,[class*=success]")'
-                ' || !document.querySelector("#aliyunCaptcha-sliding-slider");')
-        except Exception:  # noqa: BLE001
-            done = False
-        if done:
-            time.sleep(4)  # let the WAF replay the original POST
-            return True
-        time.sleep(random.uniform(1.5, 3.0))  # widget resets before retry
+        _qwen_rearm(page)
+        time.sleep(random.uniform(1.0, 2.0))
     return False
 
 
@@ -1656,14 +2099,21 @@ def signup_qwen() -> Tuple[bool, str]:
 
     chat.qwen.ai is an OpenWebUI-style deployment; the signup form asks for
     name/email/password (no phone). The signup API sits behind an Aliyun
-    slide-captcha, so this runs in the real browser and solves the slider
-    with humanized drags. The mailbox comes from dsk/mailgen (emailnator's
-    real gmail.com inboxes first). On success the JWT lands in the qwen jar
-    and the credentials in data/accounts.json — every later renewal is then
-    a plain HTTP re-login (see _qwen_signin/refresh_qwen).
+    slide-captcha, so this runs in a real (windowed, humanized-warmup)
+    browser and solves the slider with a closed-loop vision drag
+    (_qwen_slider_pass: DOM image dump -> offline target solve ->
+    humanized glide + sub-pixel creep). The mailbox comes
+    from dsk/mailgen (emailnator's real gmail.com inboxes first). On success
+    the JWT lands in the qwen jar and the credentials in data/accounts.json
+    — every later renewal is then a plain HTTP re-login (see
+    _qwen_signin/refresh_qwen). Accounts that only reach 'pending
+    activation' still persist their credentials (never orphaned): the
+    login rung polls the signup mailbox for the activation link on every
+    later cycle, so activation converges with no operator action.
     """
     email, password = _creds('qwen')
     session = None
+    preexisting = bool(_load_accounts().get('qwen'))
     if not email or not password:
         if not mailgen.autogen_enabled():
             return False, 'no QWEN_LOGIN_EMAIL/PASSWORD and mail autogen off'
@@ -1674,6 +2124,7 @@ def signup_qwen() -> Tuple[bool, str]:
         password = mailgen.gen_password()
     name = f'DSF {email.split("@")[0][:8]}'.strip()
     last_error = ''
+    typed_pw: Dict[str, str] = {}  # password value actually in the form
     ladder: List[Optional[str]] = [None]
     try:
         # slider verdicts are per-IP-reputation: a burned direct IP never
@@ -1713,6 +2164,14 @@ def signup_qwen() -> Tuple[bool, str]:
         pw_fields[1].clear()
         pw_fields[1].input(password)
         try:
+            # keep what the form actually holds: page JS may normalize the
+            # typed value, and re-login later must use the POSTed password
+            v0 = str(pw_fields[0].attr('value') or '')
+            v1 = str(pw_fields[1].attr('value') or '')
+            typed_pw['v'] = v0 or v1
+        except Exception:  # noqa: BLE001 — best-effort observation
+            pass
+        try:
             # the agree control is a custom widget: ARIA role=checkbox
             # (element-plus style) — no real input[type=checkbox] exists
             agreed = False
@@ -1748,24 +2207,69 @@ def signup_qwen() -> Tuple[bool, str]:
     for proxy in ladder:
         page = None
         try:
-            page = _browser(proxy=proxy)
+            page = _browser(proxy=proxy, headed=True)
+            # WAF reputation warmup: browse like a human before touching the
+            # challenge (headless + cold single-page sessions score lowest)
+            try:
+                page.get('https://chat.qwen.ai/')
+                time.sleep(random.uniform(6, 10))
+                ac = page.actions
+                for _ in range(random.randint(2, 4)):
+                    ac.move(random.randint(150, 900),
+                            random.randint(120, 500),
+                            duration=random.uniform(.2, .5))
+                page.run_js('window.scrollBy(0, 400);')
+                time.sleep(1)
+            except Exception:  # noqa: BLE001 — best-effort warmup
+                pass
             # slider scoring accumulates per WAF session: a few failed drags
             # poison the page — so limit drags per load and RELOAD for a
             # fresh verdict instead of grinding on one widget
+            submitted = False
             for round_no in range(3):
                 page.get(_QWEN_SIGNUP_URL)
                 time.sleep(5)
                 if 'qwen' not in (page.url or ''):
                     page.get(_QWEN_SIGNUP_URL)
                     time.sleep(4)
+                _net_log_install(page)
                 if not _fill_signup_form(page):
                     last_error = 'qwen signup form unusable (fields/agree)'
                     break
+                submitted = True
                 time.sleep(3)
                 # the signup POST may be intercepted by Aliyun's slider
                 slider_ok = _qwen_slider_pass(page, attempts=4)
+                signup_resp = _net_log_read(page, needle='/signup')
                 _log_history('qwen', 'stage',
-                             f'round={round_no} slider_pass={slider_ok}')
+                             f'round={round_no} slider_pass={slider_ok}'
+                             + (f' api={signup_resp}' if signup_resp else ''))
+            # never orphan a submitted account: persist the credentials now
+            # so later cycles re-login (and poll the activation mail) instead
+            # of minting yet another mailbox
+            if submitted:
+                stored_pw = password
+                obs = (typed_pw.get('v') or '').strip()
+                if obs and obs != password:
+                    # The form holds a different password than generated —
+                    # keep whichever one actually re-logins (INVALID_CRED on
+                    # the generated value was the historical root cause of
+                    # un-renewable qwen accounts).
+                    ok_g, _d = _qwen_signin(email, password)
+                    if not ok_g:
+                        ok_o, det_o = _qwen_signin(email, obs)
+                        if ok_o:
+                            _log_history('qwen', 'stage',
+                                         're-login works with the '
+                                         'form-observed password; saving it')
+                            stored_pw = obs
+                        else:
+                            _log_history('qwen', 'stage',
+                                         f'observed-password signin failed: '
+                                         f'{det_o}')
+                _save_account('qwen', email, stored_pw,
+                              (session or {}).get('backend', ''),
+                              {'mail_session': session} if session else None)
             # the session JWT: scan localStorage for any JWT-shaped value
             # (the storage key name is fork-specific) and fall back to the
             # conventional 'token' key / cookies
@@ -1814,7 +2318,9 @@ def signup_qwen() -> Tuple[bool, str]:
                     _log_history('qwen', 'stage', 'pending-activation detected')
                     link = mailgen.fetch_otp(
                         session, max_wait_s=180, sender_needle='qwen',
-                        code_re=re.compile(r'(https://[^\s"\'<>]+)'))
+                        code_re=re.compile(
+                            r'(https://chat\.qwen\.ai/[^\s"\'<>]*'
+                            r'activate[^\s"\'<>]*)'))
                     _log_history('qwen', 'stage',
                                  'activation link '
                                  + ('found' if link else 'MISSING'))
@@ -1838,6 +2344,15 @@ def signup_qwen() -> Tuple[bool, str]:
                                 verified = vcheck.status_code == 200
                             except Exception:  # noqa: BLE001
                                 verified = False
+            if not verified and preexisting:
+                # the account likely already exists (this signup POST was a
+                # duplicate): its activation mail is the missing piece — poll
+                # the recorded mailbox, open the link, re-login
+                _log_history('qwen', 'stage',
+                             'preexisting creds; activation retry')
+                if _qwen_activate(email, password)[0]:
+                    token = (_load_jar('qwen').get('token') or '')
+                    verified = bool(token)
             if not verified:
                 last_error = ('qwen signup submitted but no working session '
                               f'captured via {proxy or "direct"} '
@@ -1846,8 +2361,9 @@ def signup_qwen() -> Tuple[bool, str]:
                 continue
             _save_jar('qwen', {'token': token, 'email': email})
             _save_account('qwen', email, password,
-                          (session or {}).get('backend', ''))
-            return True, (f'qwen account created for {email} (mailbox: '
+                          (session or {}).get('backend', ''),
+                          {'mail_session': session} if session else None)
+            return True, (f'qwen account ready for {email} (mailbox: '
                           f'{(session or {}).get("backend", "stored creds")})')
         except Exception as e:  # noqa: BLE001
             last_error = f'qwen signup failed: {type(e).__name__}: {e}'

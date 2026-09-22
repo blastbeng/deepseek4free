@@ -255,6 +255,20 @@ def _probe_once(name: str) -> Tuple[str, str]:
                 return 'auth', 'no DeepSeek credentials configured'
             api._get_pow_challenge()
             return 'ok', 'pow challenge ok'
+        if name == 'qwen':
+            # The model picker is anonymous, so listing models proves
+            # nothing — validate the session token against /api/v1/auths.
+            from .providers import qwen_provider as qp
+            verdict = qp.validate_token()
+            if verdict == 'ok':
+                return 'ok', 'session token valid'
+            if verdict == 'unauth':
+                if qp._relay_enabled():
+                    return 'ok', 'no token; guest browser relay serves qwen'
+                return 'auth', 'no working chat.qwen.ai session token'
+            if verdict.startswith('unreachable'):
+                return 'network', verdict
+            return 'structural', verdict
         module = importlib.import_module(_PROVIDER_MODULES[name])
         provider = getattr(module, _PROVIDER_CLASSES[name])()
         if not provider.available():
